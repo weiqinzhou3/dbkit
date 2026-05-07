@@ -8,6 +8,9 @@ model:
   extra_body:
     thinking:
       type: enabled
+agent:
+  tool_calling: true
+  tool_calling_thinking_type: disabled
 runtime:
   artifact_dir: .dbkit/artifacts
   invoke_llm: true

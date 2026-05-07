@@ -32,8 +32,15 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True)
+class AgentConfig:
+    tool_calling: bool = True
+    tool_calling_thinking_type: str | None = "disabled"
+
+
+@dataclass(frozen=True)
 class AppConfig:
     model: ModelConfig
+    agent: AgentConfig
     runtime: RuntimeConfig
 
 
@@ -45,6 +52,7 @@ def load_app_config(config_path: str | Path | None = None) -> AppConfig:
     document = _load_yaml_document(path)
     return AppConfig(
         model=_load_model_config(_require_mapping(document, "model")),
+        agent=_load_agent_config(_optional_mapping(document, "agent")),
         runtime=_load_runtime_config(_require_mapping(document, "runtime")),
     )
 
@@ -72,6 +80,17 @@ def _load_runtime_config(data: dict[str, Any]) -> RuntimeConfig:
     return RuntimeConfig(
         artifact_dir=Path(_require_string(data, "artifact_dir", "runtime")),
         invoke_llm=_optional_bool(data, "invoke_llm", True),
+    )
+
+
+def _load_agent_config(data: dict[str, Any] | None) -> AgentConfig:
+    data = data or {}
+    return AgentConfig(
+        tool_calling=_optional_bool(data, "tool_calling", True),
+        tool_calling_thinking_type=_optional_string(
+            data, "tool_calling_thinking_type"
+        )
+        or "disabled",
     )
 
 

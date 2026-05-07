@@ -12,11 +12,13 @@ class DeepAgentsRuntimeFactory:
         self,
         create_deep_agent: Callable[..., Any] | None = None,
         model: Any | None = None,
+        tools_enabled: bool = True,
     ) -> None:
         self._create_deep_agent = create_deep_agent
         if model is None:
             raise ValueError("DeepAgentsRuntimeFactory requires a configured LLM model")
         self.model = model
+        self.tools_enabled = tools_enabled
 
     def create_intake_runtime(self, skill_text: str) -> Any:
         create_deep_agent = self._create_deep_agent or self._load_create_deep_agent()
@@ -24,7 +26,7 @@ class DeepAgentsRuntimeFactory:
             warnings.simplefilter("ignore")
             return create_deep_agent(
                 model=self.model,
-                tools=[normalize_request_tool],
+                tools=[normalize_request_tool] if self.tools_enabled else [],
                 system_prompt=self._system_prompt(skill_text),
                 name="dbkit-intake",
             )

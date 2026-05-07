@@ -38,10 +38,20 @@ model:
   extra_body:
     thinking:
       type: enabled
+agent:
+  tool_calling: true
+  tool_calling_thinking_type: disabled
 runtime:
   artifact_dir: .dbkit/artifacts
   invoke_llm: true
 ```
+
+`model` is the default OpenAI-compatible connection config and is passed through
+as configured. `agent.tool_calling_thinking_type` controls the DeepAgents
+tool-calling runtime. It defaults to `disabled` when a `thinking` body is present,
+because DeepSeek V4 thinking-mode tool calls require `reasoning_content` to be
+passed back in later turns, and the current LangChain/DeepAgents path does not
+preserve that provider-specific field.
 
 Run the root entrypoint:
 

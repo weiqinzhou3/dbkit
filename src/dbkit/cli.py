@@ -5,7 +5,7 @@ from pathlib import Path
 
 from dbkit import __version__
 from dbkit.config import DEFAULT_CONFIG_PATH, load_app_config
-from dbkit.model_provider import build_model
+from dbkit.model_provider import build_agent_model
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.deepagents_runtime import DeepAgentsRuntimeFactory
 from dbkit.runtime.observability import TelemetryRecorder
@@ -21,12 +21,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     repo_root = Path.cwd()
     artifact_root = config.runtime.artifact_dir
-    model = build_model(config.model)
+    model = build_agent_model(config.model, config.agent)
     orchestrator = Orchestrator(
         repo_root=repo_root,
         artifact_store=ArtifactStore(artifact_root),
         telemetry=TelemetryRecorder(),
-        deepagents_runtime_factory=DeepAgentsRuntimeFactory(model=model),
+        deepagents_runtime_factory=DeepAgentsRuntimeFactory(
+            model=model,
+            tools_enabled=config.agent.tool_calling,
+        ),
         invoke_llm=config.runtime.invoke_llm,
     )
     result = orchestrator.run(user_input)

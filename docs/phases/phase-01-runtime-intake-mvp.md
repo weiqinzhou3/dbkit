@@ -76,6 +76,10 @@ Model configuration must support provider-driven OpenAI-compatible parameters, i
 
 These parameters must be passed through from configuration without provider-specific hardcoding.
 
+The default model connection must preserve configured OpenAI-compatible parameters.
+
+The DeepAgents tool-calling runtime may use a separate provider-config-driven compatibility setting for thinking mode because some OpenAI-compatible providers require provider-specific reasoning metadata to be returned across tool-call turns.
+
 ---
 
 # 4. Explicitly Out of Scope

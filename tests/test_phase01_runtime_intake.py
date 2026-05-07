@@ -1,12 +1,13 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from dbkit.agents.intake import IntakeAgent
 from dbkit.config import ProviderKind, load_app_config
-from dbkit.model_provider import build_model
+from dbkit.model_provider import build_agent_model, build_model
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.deepagents_runtime import DeepAgentsRuntimeFactory
 from dbkit.runtime.guardrails import Guardrails
@@ -34,6 +35,9 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
                         "  extra_body:",
                         "    thinking:",
                         "      type: enabled",
+                        "agent:",
+                        "  tool_calling: true",
+                        "  tool_calling_thinking_type: disabled",
                         "runtime:",
                         "  artifact_dir: .dbkit/test-artifacts",
                         "  invoke_llm: true",
@@ -54,6 +58,8 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
             self.assertEqual(config.model.temperature, 0.1)
             self.assertEqual(config.model.reasoning_effort, "high")
             self.assertEqual(config.model.extra_body, {"thinking": {"type": "enabled"}})
+            self.assertTrue(config.agent.tool_calling)
+            self.assertEqual(config.agent.tool_calling_thinking_type, "disabled")
             self.assertEqual(config.runtime.artifact_dir, Path(".dbkit/test-artifacts"))
             self.assertTrue(config.runtime.invoke_llm)
 
@@ -82,6 +88,54 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
                 "extra_body": {"thinking": {"type": "enabled"}},
             },
         )
+
+    def test_build_agent_model_disables_configured_thinking_for_tool_calling_runtime(self) -> None:
+        config = load_app_config(_write_config_file())
+        calls = []
+
+        class FakeChatOpenAI:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+
+        with patch("dbkit.model_provider.ChatOpenAI", FakeChatOpenAI):
+            model = build_agent_model(config.model, config.agent)
+
+        self.assertIsInstance(model, FakeChatOpenAI)
+        self.assertEqual(calls[0]["model"], "qwen3.5-flash")
+        self.assertEqual(calls[0]["extra_body"], {"thinking": {"type": "disabled"}})
+        self.assertNotIn("reasoning_effort", calls[0])
+
+    def test_build_agent_model_disables_thinking_by_default_for_tool_calling_runtime(self) -> None:
+        config = load_app_config(_write_config_file_without_agent_section())
+        calls = []
+
+        class FakeChatOpenAI:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+
+        with patch("dbkit.model_provider.ChatOpenAI", FakeChatOpenAI):
+            build_agent_model(config.model, config.agent)
+
+        self.assertEqual(config.agent.tool_calling_thinking_type, "disabled")
+        self.assertEqual(calls[0]["extra_body"], {"thinking": {"type": "disabled"}})
+        self.assertNotIn("reasoning_effort", calls[0])
+
+    def test_build_agent_model_preserves_default_connection_when_tool_calling_disabled(
+        self,
+    ) -> None:
+        config = load_app_config(_write_config_file())
+        agent = replace(config.agent, tool_calling=False)
+        calls = []
+
+        class FakeChatOpenAI:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+
+        with patch("dbkit.model_provider.ChatOpenAI", FakeChatOpenAI):
+            build_agent_model(config.model, agent)
+
+        self.assertEqual(calls[0]["reasoning_effort"], "high")
+        self.assertEqual(calls[0]["extra_body"], {"thinking": {"type": "enabled"}})
 
     def test_redactor_removes_english_chinese_headers_and_database_uri_secrets(self) -> None:
         raw = (
@@ -302,6 +356,35 @@ def _write_config_file() -> Path:
                 "  provider_kind: openai_compatible",
                 "  model_name: qwen3.5-flash",
                 "  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "  api_key: sk-test",
+                "  reasoning_effort: high",
+                "  extra_body:",
+                "    thinking:",
+                "      type: enabled",
+                "agent:",
+                "  tool_calling: true",
+                "  tool_calling_thinking_type: disabled",
+                "runtime:",
+                "  artifact_dir: .dbkit/test-artifacts",
+                "  invoke_llm: true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _TEMP_CONFIGS.append(tmpdir)
+    return path
+
+
+def _write_config_file_without_agent_section() -> Path:
+    tmpdir = tempfile.TemporaryDirectory()
+    path = Path(tmpdir.name) / "config.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "model:",
+                "  provider_kind: openai_compatible",
+                "  model_name: deepseek-v4-pro",
+                "  base_url: https://api.deepseek.com",
                 "  api_key: sk-test",
                 "  reasoning_effort: high",
                 "  extra_body:",
