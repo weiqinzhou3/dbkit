@@ -209,6 +209,31 @@ agents/mysql-analyzer/system.md
 
 Only `agents/intake/system.md` must be actively used in Phase-01.1. Others may be placeholders.
 
+## 4.7.1 Runtime Filesystem Configuration
+
+DeepAgents filesystem roots must be configured, not hardcoded.
+
+Required runtime config fields:
+
+```yaml
+runtime:
+  repo_dir: .
+  workspace_dir: .
+  skills_dir: skills
+  agents_dir: agents
+```
+
+The Intake Agent must use DBKit virtual paths:
+
+```text
+/repo/
+/workspace/
+/skills/
+/agents/
+```
+
+Host absolute paths such as `/tmp/...` are not valid agent-visible paths unless the runtime maps that host directory into `/workspace/`.
+
 ## 4.8 Artifact Readability
 
 All JSON artifacts must use:

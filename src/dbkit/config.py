@@ -29,6 +29,10 @@ class ModelConfig:
 class RuntimeConfig:
     artifact_dir: Path = Path(".dbkit") / "artifacts"
     invoke_llm: bool = True
+    repo_dir: Path = Path(".")
+    workspace_dir: Path = Path(".")
+    skills_dir: Path = Path("skills")
+    agents_dir: Path = Path("agents")
 
 
 @dataclass(frozen=True)
@@ -80,6 +84,10 @@ def _load_runtime_config(data: dict[str, Any]) -> RuntimeConfig:
     return RuntimeConfig(
         artifact_dir=Path(_require_string(data, "artifact_dir", "runtime")),
         invoke_llm=_optional_bool(data, "invoke_llm", True),
+        repo_dir=Path(_optional_string(data, "repo_dir") or "."),
+        workspace_dir=Path(_optional_string(data, "workspace_dir") or "."),
+        skills_dir=Path(_optional_string(data, "skills_dir") or "skills"),
+        agents_dir=Path(_optional_string(data, "agents_dir") or "agents"),
     )
 
 

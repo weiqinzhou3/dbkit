@@ -14,3 +14,7 @@ agent:
 runtime:
   artifact_dir: .dbkit/artifacts
   invoke_llm: true
+  repo_dir: .
+  workspace_dir: .
+  skills_dir: skills
+  agents_dir: agents

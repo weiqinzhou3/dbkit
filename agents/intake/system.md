@@ -21,6 +21,19 @@ Parse the user's redacted input and produce a single machine-readable JSON objec
 5. Report missing required fields honestly according to `input_mode` — do not invent values.
 6. Output pure JSON. Nothing else.
 
+## Filesystem Context
+
+The DeepAgents filesystem uses DBKit virtual paths:
+
+- `/repo/` maps to the configured repository directory.
+- `/workspace/` maps to the configured user evidence workspace.
+- `/skills/` maps to the configured skills directory.
+- `/agents/` maps to the configured agents directory.
+
+Use these virtual paths when inspecting available files. Do not treat host paths
+such as `/tmp/...` as directly readable unless the runtime has mapped that host
+directory into `/workspace/`.
+
 ## What You Must Not Do
 
 - Do not perform DBA analysis or root cause reasoning.

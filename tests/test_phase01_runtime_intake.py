@@ -42,6 +42,10 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
                         "runtime:",
                         "  artifact_dir: .dbkit/test-artifacts",
                         "  invoke_llm: true",
+                        "  repo_dir: .",
+                        "  workspace_dir: /tmp/dbkit-workspace",
+                        "  skills_dir: skills",
+                        "  agents_dir: agents",
                     ]
                 ),
                 encoding="utf-8",
@@ -63,6 +67,10 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
             self.assertEqual(config.agent.tool_calling_thinking_type, "disabled")
             self.assertEqual(config.runtime.artifact_dir, Path(".dbkit/test-artifacts"))
             self.assertTrue(config.runtime.invoke_llm)
+            self.assertEqual(config.runtime.repo_dir, Path("."))
+            self.assertEqual(config.runtime.workspace_dir, Path("/tmp/dbkit-workspace"))
+            self.assertEqual(config.runtime.skills_dir, Path("skills"))
+            self.assertEqual(config.runtime.agents_dir, Path("agents"))
 
     def test_build_model_uses_openai_compatible_config(self) -> None:
         config = load_app_config(_write_config_file())
@@ -446,6 +454,20 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
         self.assertIn("Output Contract", agent.skill_text)
         self.assertIn("Missing Field Rules", agent.skill_text)
 
+    def test_intake_agent_loads_skill_from_configured_skills_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skills_dir = Path(tmpdir) / "custom-skills"
+            (skills_dir / "intake").mkdir(parents=True)
+            (skills_dir / "intake" / "SKILL.md").write_text(
+                "# Custom Intake Skill\n\n## Output Contract\n",
+                encoding="utf-8",
+            )
+
+            agent = IntakeAgent.from_skills_dir(skills_dir)
+
+        self.assertEqual(agent.name, "intake")
+        self.assertIn("Custom Intake Skill", agent.skill_text)
+
     # --- Guardrails ---
 
     def test_guardrails_passes_complete_request(self) -> None:
@@ -715,10 +737,14 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
 
         self.assertIsNotNone(runtime)
         self.assertIs(calls[0]["model"], model)
-        self.assertEqual(len(calls[0]["tools"]), 1)
-        self.assertEqual(calls[0]["tools"][0].__name__, "normalize_request_tool")
+        self.assertEqual(calls[0]["tools"], [])
         self.assertIn("DBKit Intake Skill", calls[0]["system_prompt"])
         self.assertEqual(calls[0]["name"], "dbkit-intake")
+        self.assertEqual(calls[0]["skills"], ["/skills/intake/"])
+        self.assertNotIn(
+            "normalize_request_tool",
+            ",".join(getattr(tool, "__name__", "") for tool in calls[0]["tools"]),
+        )
 
     def test_deepagents_runtime_factory_loads_system_prompt_from_agents_dir(self) -> None:
         calls = []
@@ -739,6 +765,59 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
         # agents/intake/system.md must be reflected in the system prompt
         self.assertIn("DBKit Intake Agent", calls[0]["system_prompt"])
         self.assertIn("SKILL_CONTENT", calls[0]["system_prompt"])
+        self.assertEqual(calls[0]["skills"], ["/skills/intake/"])
+        self.assertEqual(len(calls[0]["tools"]), 0)
+        self.assertIn("backend", calls[0])
+
+    def test_deepagents_runtime_factory_uses_configured_virtual_filesystem_roots(self) -> None:
+        calls = []
+
+        def fake_create_deep_agent(**kwargs):
+            calls.append(kwargs)
+            return object()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_dir = root / "repo"
+            workspace_dir = root / "workspace"
+            skills_dir = repo_dir / "skills"
+            agents_dir = repo_dir / "agents"
+            (skills_dir / "intake" / "references").mkdir(parents=True)
+            (skills_dir / "intake" / "references" / "input-modes.md").write_text(
+                "# Input Modes\n",
+                encoding="utf-8",
+            )
+            agents_dir.mkdir(parents=True)
+            (agents_dir / "intake").mkdir()
+            (agents_dir / "intake" / "system.md").write_text(
+                "System prompt", encoding="utf-8"
+            )
+
+            factory = DeepAgentsRuntimeFactory(
+                create_deep_agent=fake_create_deep_agent,
+                model=object(),
+                tools_enabled=False,
+                repo_dir=repo_dir,
+                workspace_dir=workspace_dir,
+                skills_dir=skills_dir,
+                agents_dir=agents_dir,
+            )
+
+            factory.create_intake_runtime(skill_text="SKILL_CONTENT")
+
+            backend = calls[0]["backend"]
+            self.assertIn("/repo/", backend.routes)
+            self.assertIn("/workspace/", backend.routes)
+            self.assertIn("/skills/", backend.routes)
+            self.assertIn("/agents/", backend.routes)
+            refs = backend.ls("/skills/intake/references/")
+            self.assertIsNone(refs.error)
+            self.assertEqual(
+                [entry["path"] for entry in refs.entries],
+                ["/skills/intake/references/input-modes.md"],
+            )
+            self.assertEqual(calls[0]["skills"], ["/skills/intake/"])
+            self.assertEqual(calls[0]["tools"], [])
 
     # --- Orchestrator ---
 

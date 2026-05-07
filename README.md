@@ -44,6 +44,10 @@ agent:
 runtime:
   artifact_dir: .dbkit/artifacts
   invoke_llm: true
+  repo_dir: .
+  workspace_dir: .
+  skills_dir: skills
+  agents_dir: agents
 ```
 
 `model` is the default OpenAI-compatible connection config and is passed through
@@ -52,6 +56,18 @@ tool-calling runtime. It defaults to `disabled` when a `thinking` body is presen
 because DeepSeek V4 thinking-mode tool calls require `reasoning_content` to be
 passed back in later turns, and the current LangChain/DeepAgents path does not
 preserve that provider-specific field.
+
+Runtime directories are explicit config values:
+
+- `repo_dir`: DBKit repository root exposed to the agent as `/repo/`
+- `workspace_dir`: user evidence workspace exposed as `/workspace/`
+- `skills_dir`: skill directory exposed as `/skills/`
+- `agents_dir`: system prompt directory exposed as `/agents/`
+
+If local evidence is stored in `/tmp/mysql_conn_full_mock`, set
+`runtime.workspace_dir: /tmp/mysql_conn_full_mock` and refer to it through the
+agent-visible `/workspace/` path. Host absolute paths such as `/tmp/...` are not
+the same as DeepAgents virtual filesystem paths.
 
 Run the root entrypoint:
 

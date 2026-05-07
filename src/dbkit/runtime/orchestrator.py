@@ -27,6 +27,7 @@ class Orchestrator:
     router: Router
     invoke_llm: bool
     redactor: Redactor
+    skills_dir: Path
 
     def __init__(
         self,
@@ -39,8 +40,10 @@ class Orchestrator:
         router: Router | None = None,
         invoke_llm: bool = True,
         redactor: Redactor | None = None,
+        skills_dir: Path | None = None,
     ) -> None:
         self.repo_root = repo_root
+        self.skills_dir = skills_dir or repo_root / "skills"
         self.artifact_store = artifact_store
         self.telemetry = telemetry
         self.deepagents_runtime_factory = (
@@ -77,7 +80,7 @@ class Orchestrator:
         )
 
         # --- Intake Agent ---
-        intake_agent = IntakeAgent.from_repo_root(self.repo_root)
+        intake_agent = IntakeAgent.from_skills_dir(self.skills_dir)
         intake_runtime = self.deepagents_runtime_factory.create_intake_runtime(
             intake_agent.skill_text
         )

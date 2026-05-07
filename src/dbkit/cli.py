@@ -19,17 +19,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     user_input = (
         " ".join(prompt_args) if prompt_args else "MySQL runtime intake smoke test"
     )
-    repo_root = Path.cwd()
+    repo_root = config.runtime.repo_dir
     artifact_root = config.runtime.artifact_dir
     model = build_agent_model(config.model, config.agent)
     orchestrator = Orchestrator(
         repo_root=repo_root,
+        skills_dir=config.runtime.skills_dir,
         artifact_store=ArtifactStore(artifact_root),
         telemetry=TelemetryRecorder(),
         deepagents_runtime_factory=DeepAgentsRuntimeFactory(
             model=model,
             tools_enabled=False,
-            repo_root=repo_root,
+            repo_dir=config.runtime.repo_dir,
+            workspace_dir=config.runtime.workspace_dir,
+            skills_dir=config.runtime.skills_dir,
+            agents_dir=config.runtime.agents_dir,
         ),
         invoke_llm=config.runtime.invoke_llm,
     )

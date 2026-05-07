@@ -60,6 +60,16 @@ References:
 - `skills/intake/references/input-modes.md`
 - `skills/intake/references/missing-fields-policy.md`
 
+When using filesystem tools, use DBKit virtual paths:
+
+- `/skills/intake/references/` for intake references.
+- `/skills/intake/examples/` for intake examples.
+- `/workspace/` for user-provided evidence workspaces.
+
+Do not assume host absolute paths such as `/tmp/...` are readable. If the user
+stores files in a host directory, runtime must map that host directory to
+`/workspace/` via config.
+
 ## Target Agent Selection
 
 `target_agent` must be a domain analyzer route target:
