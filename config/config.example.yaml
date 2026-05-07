@@ -1,0 +1,9 @@
+model:
+  provider_kind: openai_compatible
+  model_name: qwen3.5-flash
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key: replace-with-your-api-key
+  temperature: 0.0
+runtime:
+  artifact_dir: .dbkit/artifacts
+  invoke_llm: true

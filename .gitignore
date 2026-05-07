@@ -20,7 +20,8 @@ htmlcov/
 # Local environment
 .env
 .env.*
+.dbkit/
+config/config.yaml
 
 # macOS
 .DS_Store
-
