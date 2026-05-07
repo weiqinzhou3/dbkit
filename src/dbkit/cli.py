@@ -28,7 +28,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         telemetry=TelemetryRecorder(),
         deepagents_runtime_factory=DeepAgentsRuntimeFactory(
             model=model,
-            tools_enabled=config.agent.tool_calling,
+            tools_enabled=False,
             repo_root=repo_root,
         ),
         invoke_llm=config.runtime.invoke_llm,

@@ -17,8 +17,11 @@ class NormalizedRequest:
     target_agent: str | None = None
     task_type: str | None = None
     routing_confidence: float | None = None
+    input_mode: str = "unknown"
     target: dict[str, Any] | None = None
     ssh_target: dict[str, Any] | None = None
+    provided_evidence: dict[str, Any] | None = None
+    collection_policy: dict[str, bool] | None = None
     event: dict[str, Any] | None = None
     evidence_plan: dict[str, Any] | None = None
     redaction_summary: dict[str, Any] | None = None

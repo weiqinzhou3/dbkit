@@ -83,8 +83,11 @@ class Orchestrator:
         )
 
         llm_json: dict[str, Any] | None = None
+        fallback_reason: str | None = None
         if self.invoke_llm:
-            llm_json = self._invoke_intake_runtime(intake_runtime, redacted_input, request_id)
+            llm_json, fallback_reason = self._invoke_intake_runtime(
+                intake_runtime, redacted_input, request_id
+            )
 
         # --- Normalize ---
         self.telemetry.emit_normalize_request_started(request_id=request_id)
@@ -93,6 +96,8 @@ class Orchestrator:
             redacted_input,
             llm_json=llm_json,
             redaction_summary=redaction_result.redaction_summary,
+            llm_intake_failed=self.invoke_llm and llm_json is None,
+            fallback_reason=fallback_reason,
         )
         tool_latency_ms = (perf_counter() - tool_started_at) * 1000
         self.telemetry.emit_normalize_request_completed(
@@ -127,13 +132,13 @@ class Orchestrator:
             blocked_artifact = self.artifact_store.persist_blocked_request(
                 normalized_request, guardrails_result.blocking_issues
             )
-            telemetry_artifact = self.artifact_store.persist_telemetry(
-                normalized_request.request_id, self.telemetry.events
-            )
             self.telemetry.emit_artifact_written(
                 request_id=normalized_request.request_id,
                 kind="BlockedRequest",
                 path=str(blocked_artifact.path),
+            )
+            telemetry_artifact = self.artifact_store.persist_telemetry(
+                normalized_request.request_id, self.telemetry.events
             )
             return RuntimeResult(
                 normalized_request=normalized_request,
@@ -182,7 +187,7 @@ class Orchestrator:
         intake_runtime: object,
         user_input: str,
         request_id: str,
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any] | None, str | None]:
         invoke = getattr(intake_runtime, "invoke", None)
         if not callable(invoke):
             raise TypeError("DeepAgents intake runtime must expose invoke()")
@@ -207,36 +212,126 @@ class Orchestrator:
 
     def _extract_llm_json(
         self, invoke_result: object, request_id: str
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any] | None, str | None]:
         if not isinstance(invoke_result, dict):
+            reason = "invoke result is not a dict"
             self.telemetry.emit_intake_json_parse_failed(
                 request_id=request_id,
-                reason="invoke result is not a dict",
+                reason=reason,
             )
-            return None
+            return None, reason
 
         messages = invoke_result.get("messages", [])
         for msg in reversed(messages):
-            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            role = _message_role(msg)
+            if role not in {"assistant", "ai"}:
                 continue
-            content = msg.get("content") or ""
+            content = _message_content(msg)
             if not content:
                 continue
-            try:
-                parsed = json.loads(content.strip())
-                if isinstance(parsed, dict):
-                    return parsed
-            except (json.JSONDecodeError, ValueError):
-                pass
+            parsed = _parse_json_object(content)
+            if parsed is not None:
+                return parsed, None
 
+        reason = "no parseable JSON found in assistant messages"
         self.telemetry.emit_intake_json_parse_failed(
             request_id=request_id,
-            reason="no parseable JSON found in assistant messages",
+            reason=reason,
         )
-        return None
+        return None, reason
 
 
 def _ratio(numerator: int, denominator: int) -> float:
     if denominator == 0:
         return 1.0
     return round(numerator / denominator, 6)
+
+
+def _message_role(message: object) -> str | None:
+    if isinstance(message, dict):
+        role = message.get("role") or message.get("type")
+    else:
+        role = getattr(message, "role", None) or getattr(message, "type", None)
+    return str(role).lower() if role else None
+
+
+def _message_content(message: object) -> str:
+    if isinstance(message, dict):
+        content = message.get("content") or ""
+    else:
+        content = getattr(message, "content", "") or ""
+
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(parts)
+    return str(content)
+
+
+def _parse_json_object(content: str) -> dict[str, Any] | None:
+    candidates = [content.strip()]
+    fenced = _extract_fenced_json(content)
+    if fenced:
+        candidates.append(fenced)
+    braced = _extract_balanced_json_object(content)
+    if braced:
+        candidates.append(braced)
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _extract_fenced_json(content: str) -> str | None:
+    marker = "```"
+    start = content.find(marker)
+    if start < 0:
+        return None
+    body_start = content.find("\n", start + len(marker))
+    if body_start < 0:
+        return None
+    end = content.find(marker, body_start + 1)
+    if end < 0:
+        return None
+    return content[body_start + 1 : end].strip()
+
+
+def _extract_balanced_json_object(content: str) -> str | None:
+    start = content.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(content)):
+        char = content[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return content[start : index + 1]
+    return None

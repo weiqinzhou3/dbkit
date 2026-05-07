@@ -15,10 +15,11 @@ Parse the user's redacted input and produce a single machine-readable JSON objec
 ## What You Must Do
 
 1. Read the user input carefully.
-2. Extract all available structured fields: target agent, target domain, task type, connection info, event time, alerts.
-3. Infer time window from event time when no explicit window is given (per skill policy).
-4. Report missing required fields honestly — do not invent values.
-5. Output pure JSON. Nothing else.
+2. Extract all available structured fields: target agent, target domain, task type, input mode, connection info, provided evidence, event time, alerts.
+3. Classify `input_mode` from user intent using the Intake Skill contract.
+4. Infer time window from event time when no explicit window is given (per skill policy).
+5. Report missing required fields honestly according to `input_mode` — do not invent values.
+6. Output pure JSON. Nothing else.
 
 ## What You Must Not Do
 

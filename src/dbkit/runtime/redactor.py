@@ -20,7 +20,7 @@ class RedactionResult:
 class Redactor:
     # English keyword assignments: password=val, token: val, api_key：val
     _SECRET_ASSIGNMENT = re.compile(
-        r"(?i)\b(password|passwd|pwd|token|secret|api_key)\b(\s*[:=：]\s*)([^\s,;]+)"
+        r"(?i)\b(password|passwd|pwd|token|secret|api_key)\b(\s*(?::|=|：|\bis\b)\s*)([^\s,;]+)"
     )
     # Chinese password / passphrase keyword assignments: 密码是val, 口令为val
     _CHINESE_PASSWORD = re.compile(

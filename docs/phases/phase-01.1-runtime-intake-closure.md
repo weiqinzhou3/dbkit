@@ -127,8 +127,11 @@ target_agent
 target_domain
 task_type
 routing_confidence
+input_mode
 target
 ssh_target
+provided_evidence
+collection_policy
 event
 evidence_plan
 missing_fields
@@ -291,6 +294,7 @@ Required example shape:
   "target_domain": "mysql",
   "task_type": "alert_analysis",
   "routing_confidence": 0.92,
+  "input_mode": "live_collection",
   "target": {
     "type": "mysql",
     "host": "192.168.1.1",
@@ -303,6 +307,18 @@ Required example shape:
     "port": 22,
     "username": "root",
     "password_ref": "<SECRET_REF:ssh_password_001>"
+  },
+  "provided_evidence": {
+    "mode": "unknown",
+    "files": [],
+    "pasted_text": false,
+    "description": ""
+  },
+  "collection_policy": {
+    "allow_live_collection": true,
+    "allow_mysql_login": true,
+    "allow_ssh": true,
+    "allow_metrics_query": false
   },
   "event": {
     "event_time": "2026-05-07T17:00:00+08:00",
@@ -404,10 +420,13 @@ Output Contract
 Target Agent Selection
 Target Domain Extraction
 Task Type Extraction
+Input Mode Classification
 Time Understanding
 Default Time Window Policy
 Target Extraction
 SSH Target Extraction
+Provided Evidence Extraction
+Collection Policy
 Alert Parsing
 Evidence Plan Guidance
 Missing Field Rules

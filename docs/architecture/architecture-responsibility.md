@@ -243,8 +243,11 @@ skills/intake/SKILL.md
 Responsibilities:
 
 - intent understanding
+- input mode classification
 - alert parsing
 - time understanding
+- provided evidence extraction
+- collection permission extraction
 - missing field detection
 - normalized request generation
 

@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -142,11 +143,20 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
     def test_redactor_removes_english_secrets_with_secret_refs(self) -> None:
         raw = (
             "password=abc123 passwd: def456 token=tok-1 "
-            "secret: sec-value api_key=api-value Authorization: Bearer auth-token"
+            "secret: sec-value api_key=api-value Authorization: Bearer auth-token "
+            "password is EnglishSecret"
         )
         result = Redactor().redact(raw)
 
-        for secret in ("abc123", "def456", "tok-1", "sec-value", "api-value", "auth-token"):
+        for secret in (
+            "abc123",
+            "def456",
+            "tok-1",
+            "sec-value",
+            "api-value",
+            "auth-token",
+            "EnglishSecret",
+        ):
             self.assertNotIn(secret, result.redacted_text)
         self.assertIn("<SECRET_REF:", result.redacted_text)
         self.assertGreater(len(result.secret_refs), 0)
@@ -165,6 +175,12 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
         # Usernames and hosts are preserved
         self.assertIn("root:", result.redacted_text)
         self.assertIn("@db:3306", result.redacted_text)
+
+    def test_redactor_removes_password_is_assignment(self) -> None:
+        result = Redactor().redact("password is EnglishSecret")
+
+        self.assertNotIn("EnglishSecret", result.redacted_text)
+        self.assertIn("<SECRET_REF:password_", result.redacted_text)
 
     def test_redactor_removes_chinese_password_patterns(self) -> None:
         for raw in [
@@ -217,6 +233,11 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
             "ssh_target": None,
             "event": {
                 "event_time": "2026-05-07T17:00:00+08:00",
+                "time_window": {
+                    "before": "6h",
+                    "after": "1h",
+                    "source": "skill_default_from_event_time",
+                },
                 "alerts": [{"raw": "mysql cpu > 85%", "semantic_hint": "high_cpu"}],
                 "symptoms": ["high_cpu"],
             },
@@ -281,6 +302,140 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
         self.assertIn("target.host", request.missing_fields)
         self.assertIn("target.username", request.missing_fields)
 
+    def test_normalize_request_provided_evidence_does_not_require_live_target(self) -> None:
+        llm_json = {
+            "target_agent": "mysql_analyzer",
+            "target_domain": "mysql",
+            "task_type": "alert_analysis",
+            "routing_confidence": 0.91,
+            "input_mode": "provided_evidence",
+            "target": None,
+            "ssh_target": None,
+            "provided_evidence": {
+                "mode": "local_files",
+                "files": [],
+                "pasted_text": False,
+                "description": "只需要分析本地文件",
+            },
+            "collection_policy": {
+                "allow_live_collection": False,
+                "allow_mysql_login": False,
+                "allow_ssh": False,
+                "allow_metrics_query": False,
+            },
+            "event": {
+                "event_time": "2026-05-07T17:00:00+08:00",
+                "time_window": {
+                    "before": "6h",
+                    "after": "1h",
+                    "source": "skill_default_from_event_time",
+                },
+                "alerts": [{"raw": "mysql cpu usage > 85%"}],
+                "symptoms": ["high_cpu"],
+            },
+            "evidence_plan": {
+                "required_evidence": ["mysql.processlist", "metrics.cpu"],
+                "provided_evidence": [],
+                "missing_evidence": ["provided_evidence.files"],
+            },
+            "missing_fields": ["provided_evidence.files"],
+        }
+
+        request = normalize_request(
+            "请帮我分析这个 MySQL，今天17:00触发 mysql cpu usage > 85%，只需要分析本地文件。",
+            llm_json=llm_json,
+        )
+
+        self.assertEqual(request.input_mode, "provided_evidence")
+        self.assertIsNone(request.target)
+        self.assertIsNone(request.ssh_target)
+        self.assertFalse(request.collection_policy["allow_live_collection"])
+        self.assertFalse(request.collection_policy["allow_mysql_login"])
+        self.assertFalse(request.collection_policy["allow_ssh"])
+        self.assertNotIn("target.host", request.missing_fields)
+        self.assertNotIn("target.username", request.missing_fields)
+        self.assertIn("provided_evidence.files", request.missing_fields)
+
+    def test_normalize_request_live_collection_requires_live_target_fields(self) -> None:
+        llm_json = {
+            "target_agent": "mysql_analyzer",
+            "target_domain": "mysql",
+            "task_type": "alert_analysis",
+            "routing_confidence": 0.93,
+            "input_mode": "live_collection",
+            "target": {"type": "mysql", "host": "192.168.1.1", "port": 3306, "username": "root"},
+            "collection_policy": {
+                "allow_live_collection": True,
+                "allow_mysql_login": True,
+                "allow_ssh": False,
+                "allow_metrics_query": False,
+            },
+            "event": {"event_time": "2026-05-07T17:00:00+08:00", "symptoms": ["high_cpu"]},
+            "missing_fields": ["target.password_ref"],
+        }
+
+        request = normalize_request(
+            "请连接 192.168.1.1 的 MySQL 分析今天17:00的 CPU 告警，用户 root。",
+            llm_json=llm_json,
+        )
+
+        self.assertEqual(request.input_mode, "live_collection")
+        self.assertEqual(request.target["host"], "192.168.1.1")
+        self.assertEqual(request.target["username"], "root")
+        self.assertIn("target.password_ref", request.missing_fields)
+
+    def test_normalize_request_hybrid_only_requires_allowed_collection_fields(self) -> None:
+        llm_json = {
+            "target_agent": "mysql_analyzer",
+            "target_domain": "mysql",
+            "task_type": "incident_analysis",
+            "routing_confidence": 0.88,
+            "input_mode": "hybrid",
+            "target": None,
+            "provided_evidence": {
+                "mode": "local_files",
+                "files": ["/tmp/mysql-slow.log"],
+                "pasted_text": False,
+                "description": "我有慢日志文件",
+            },
+            "collection_policy": {
+                "allow_live_collection": True,
+                "allow_mysql_login": True,
+                "allow_ssh": False,
+                "allow_metrics_query": False,
+            },
+            "event": {"event_time": "2026-05-07T17:00:00+08:00", "symptoms": ["slow_query"]},
+            "missing_fields": ["target.host", "target.username"],
+        }
+
+        request = normalize_request(
+            "我有慢日志文件 /tmp/mysql-slow.log，也可以连数据库补充看 processlist。",
+            llm_json=llm_json,
+        )
+
+        self.assertEqual(request.input_mode, "hybrid")
+        self.assertTrue(request.collection_policy["allow_mysql_login"])
+        self.assertEqual(request.provided_evidence["files"], ["/tmp/mysql-slow.log"])
+        self.assertIn("target.host", request.missing_fields)
+        self.assertNotIn("ssh_target.host", request.missing_fields)
+
+    def test_normalize_request_extracts_redacted_mysql_uri_target(self) -> None:
+        redacted = "mysql://root:<SECRET_REF:uri_password_001>@192.168.1.1:3306"
+        request = normalize_request(
+            redacted,
+            redaction_summary={
+                "redacted": True,
+                "secret_refs": ["<SECRET_REF:uri_password_001>"],
+                "redacted_patterns": ["database_uri"],
+            },
+        )
+
+        self.assertEqual(request.target["host"], "192.168.1.1")
+        self.assertEqual(request.target["port"], 3306)
+        self.assertEqual(request.target["username"], "root")
+        self.assertEqual(request.target["password_ref"], "<SECRET_REF:uri_password_001>")
+        self.assertNotIn("Root", json.dumps(request.to_dict(), ensure_ascii=False))
+
     # --- Intake Agent ---
 
     def test_intake_agent_loads_skill_from_repo(self) -> None:
@@ -320,6 +475,41 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
         self.assertTrue(
             any("target.host" in i for i in result.blocking_issues)
         )
+
+    def test_guardrails_provided_evidence_blocks_on_evidence_not_live_target(self) -> None:
+        request = normalize_request(
+            "只需要分析本地文件",
+            llm_json={
+                "target_agent": "mysql_analyzer",
+                "target_domain": "mysql",
+                "task_type": "alert_analysis",
+                "routing_confidence": 0.86,
+                "input_mode": "provided_evidence",
+                "target": None,
+                "ssh_target": None,
+                "provided_evidence": {
+                    "mode": "local_files",
+                    "files": [],
+                    "pasted_text": False,
+                    "description": "只需要分析本地文件",
+                },
+                "collection_policy": {
+                    "allow_live_collection": False,
+                    "allow_mysql_login": False,
+                    "allow_ssh": False,
+                    "allow_metrics_query": False,
+                },
+                "event": {"event_time": "2026-05-07T17:00:00+08:00", "symptoms": []},
+                "missing_fields": ["provided_evidence.files"],
+            },
+        )
+
+        result = Guardrails().validate(request)
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("provided_evidence.files" in i for i in result.blocking_issues))
+        self.assertFalse(any("target.host" in i for i in result.blocking_issues))
+        self.assertFalse(any("target.username" in i for i in result.blocking_issues))
 
     def test_guardrails_blocks_invalid_target_agent(self) -> None:
         llm_json = {
@@ -576,6 +766,11 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
                                 "ssh_target": None,
                                 "event": {
                                     "event_time": "2026-05-07T17:00:00+08:00",
+                                    "time_window": {
+                                        "before": "6h",
+                                        "after": "1h",
+                                        "source": "skill_default_from_event_time",
+                                    },
                                     "alerts": [],
                                     "symptoms": ["high_cpu"],
                                 },
@@ -608,6 +803,10 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
             self.assertFalse(result.blocked)
             self.assertTrue(result.deepagents_runtime_ready)
             self.assertEqual(result.route_decision.target_agent_name, "mysql_analyzer")
+            self.assertEqual(result.normalized_request.metadata["normalizer"], "llm_intake_plus_normalize_request")
+            self.assertEqual(result.normalized_request.task_type, "alert_analysis")
+            self.assertIsNotNone(result.normalized_request.event)
+            self.assertIn("time_window", result.normalized_request.event)
             self.assertEqual(len(result.artifacts), 2)
             self.assertTrue(result.artifacts[0].path.exists())
 
@@ -629,6 +828,224 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
                 "artifact_written",
             ]:
                 self.assertIn(expected, event_types, msg=f"Missing event: {expected}")
+
+    def test_orchestrator_consumes_langchain_message_object_json(self) -> None:
+        class FakeIntakeRuntime:
+            def invoke(self, payload):
+                return {
+                    "messages": [
+                        SimpleNamespace(
+                            type="ai",
+                            content=json.dumps({
+                                "target_agent": "mysql_analyzer",
+                                "target_domain": "mysql",
+                                "task_type": "alert_analysis",
+                                "routing_confidence": 0.92,
+                                "input_mode": "provided_evidence",
+                                "target": None,
+                                "ssh_target": None,
+                                "provided_evidence": {
+                                    "mode": "local_files",
+                                    "files": ["/tmp/mysql-error.log"],
+                                    "pasted_text": False,
+                                    "description": "只分析本地文件",
+                                },
+                                "collection_policy": {
+                                    "allow_live_collection": False,
+                                    "allow_mysql_login": False,
+                                    "allow_ssh": False,
+                                    "allow_metrics_query": False,
+                                },
+                                "event": {
+                                    "event_time": "2026-05-07T17:00:00+08:00",
+                                    "time_window": {
+                                        "before": "6h",
+                                        "after": "1h",
+                                        "source": "skill_default_from_event_time",
+                                    },
+                                    "alerts": [{"raw": "mysql cpu usage > 85%"}],
+                                    "symptoms": ["high_cpu"],
+                                },
+                                "missing_fields": [],
+                            }),
+                        )
+                    ]
+                }
+
+        class FakeFactory:
+            def create_intake_runtime(self, skill_text: str):
+                return FakeIntakeRuntime()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = Orchestrator(
+                repo_root=Path.cwd(),
+                artifact_store=ArtifactStore(Path(tmpdir) / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                deepagents_runtime_factory=FakeFactory(),
+            ).run(
+                "请帮我分析这个 MySQL，今天17:00触发 mysql cpu usage > 85%，只需要分析本地文件。"
+            )
+
+            self.assertFalse(result.blocked)
+            self.assertEqual(result.normalized_request.input_mode, "provided_evidence")
+            self.assertEqual(
+                result.normalized_request.metadata["normalizer"],
+                "llm_intake_plus_normalize_request",
+            )
+            self.assertEqual(result.normalized_request.task_type, "alert_analysis")
+            self.assertIn("time_window", result.normalized_request.event)
+
+    def test_orchestrator_extracts_json_from_fenced_assistant_content(self) -> None:
+        class FakeIntakeRuntime:
+            def invoke(self, payload):
+                return {
+                    "messages": [
+                        SimpleNamespace(
+                            type="ai",
+                            content=(
+                                "Here is the JSON.\n```json\n"
+                                + json.dumps({
+                                    "target_agent": "mysql_analyzer",
+                                    "target_domain": "mysql",
+                                    "task_type": "alert_analysis",
+                                    "routing_confidence": 0.9,
+                                    "input_mode": "provided_evidence",
+                                    "target": None,
+                                    "ssh_target": None,
+                                    "provided_evidence": {
+                                        "mode": "local_files",
+                                        "files": [],
+                                        "pasted_text": False,
+                                        "description": "只需要分析本地文件",
+                                    },
+                                    "collection_policy": {
+                                        "allow_live_collection": False,
+                                        "allow_mysql_login": False,
+                                        "allow_ssh": False,
+                                        "allow_metrics_query": False,
+                                    },
+                                    "event": {
+                                        "event_time": "2026-05-07T17:00:00+08:00",
+                                        "time_window": {
+                                            "before": "6h",
+                                            "after": "1h",
+                                            "source": "skill_default_from_event_time",
+                                        },
+                                    },
+                                    "missing_fields": ["provided_evidence.files"],
+                                })
+                                + "\n```"
+                            ),
+                        )
+                    ]
+                }
+
+        class FakeFactory:
+            def create_intake_runtime(self, skill_text: str):
+                return FakeIntakeRuntime()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = Orchestrator(
+                repo_root=Path.cwd(),
+                artifact_store=ArtifactStore(Path(tmpdir) / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                deepagents_runtime_factory=FakeFactory(),
+            ).run("只需要分析本地文件")
+
+            self.assertTrue(result.blocked)
+            self.assertEqual(result.normalized_request.input_mode, "provided_evidence")
+            self.assertEqual(
+                result.normalized_request.metadata["normalizer"],
+                "llm_intake_plus_normalize_request",
+            )
+            self.assertEqual(result.normalized_request.missing_fields, ("provided_evidence.files",))
+
+    def test_orchestrator_records_visible_fallback_metadata_when_llm_json_invalid(self) -> None:
+        class FakeIntakeRuntime:
+            def invoke(self, payload):
+                return {"messages": [SimpleNamespace(type="ai", content="not json")]}
+
+        class FakeFactory:
+            def create_intake_runtime(self, skill_text: str):
+                return FakeIntakeRuntime()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = Orchestrator(
+                repo_root=Path.cwd(),
+                artifact_store=ArtifactStore(Path(tmpdir) / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                deepagents_runtime_factory=FakeFactory(),
+            ).run("MySQL latency")
+
+            self.assertTrue(result.blocked)
+            self.assertTrue(result.normalized_request.metadata["llm_intake_failed"])
+            self.assertIn("fallback_reason", result.normalized_request.metadata)
+
+    def test_orchestrator_keeps_chinese_secret_out_of_llm_artifact_and_telemetry(self) -> None:
+        class FakeIntakeRuntime:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def invoke(self, payload):
+                self.calls.append(payload)
+                return {
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": json.dumps({
+                                "target_agent": "mysql_analyzer",
+                                "target_domain": "mysql",
+                                "task_type": "general_question",
+                                "routing_confidence": 0.91,
+                                "input_mode": "provided_evidence",
+                                "target": None,
+                                "ssh_target": None,
+                                "provided_evidence": {
+                                    "mode": "pasted_text",
+                                    "files": [],
+                                    "pasted_text": True,
+                                    "description": "用户提供了文本",
+                                },
+                                "collection_policy": {
+                                    "allow_live_collection": False,
+                                    "allow_mysql_login": False,
+                                    "allow_ssh": False,
+                                    "allow_metrics_query": False,
+                                },
+                                "event": None,
+                                "missing_fields": [],
+                            }),
+                        }
+                    ]
+                }
+
+        class FakeFactory:
+            def __init__(self) -> None:
+                self.runtime = FakeIntakeRuntime()
+
+            def create_intake_runtime(self, skill_text: str):
+                return self.runtime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            factory = FakeFactory()
+            result = Orchestrator(
+                repo_root=Path.cwd(),
+                artifact_store=ArtifactStore(Path(tmpdir) / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                deepagents_runtime_factory=factory,
+            ).run("MySQL密码是Root")
+
+            llm_payload = json.dumps(factory.runtime.calls, ensure_ascii=False)
+            artifact_text = "\n".join(
+                artifact.path.read_text(encoding="utf-8") for artifact in result.artifacts
+            )
+            telemetry_text = "\n".join(
+                json.dumps(event.to_dict(), ensure_ascii=False) for event in result.telemetry
+            )
+            self.assertNotIn("Root", llm_payload)
+            self.assertNotIn("Root", artifact_text)
+            self.assertNotIn("Root", telemetry_text)
+            self.assertIn("<SECRET_REF:chinese_password_", artifact_text)
 
     def test_orchestrator_blocks_and_writes_blocked_artifact_for_missing_fields(self) -> None:
         class FakeIntakeRuntime:

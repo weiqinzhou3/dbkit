@@ -11,6 +11,9 @@ _ALLOWED_TARGET_DOMAINS = frozenset({"mysql", "redis", "unknown"})
 _ALLOWED_TASK_TYPES = frozenset(
     {"alert_analysis", "incident_analysis", "general_question", "unknown"}
 )
+_ALLOWED_INPUT_MODES = frozenset(
+    {"live_collection", "provided_evidence", "hybrid", "unknown"}
+)
 _ROUTING_CONFIDENCE_THRESHOLD = 0.5
 
 _LEAKAGE_PATTERN = re.compile(
@@ -41,6 +44,9 @@ class Guardrails:
         if request.task_type and request.task_type not in _ALLOWED_TASK_TYPES:
             issues.append(f"task_type '{request.task_type}' is not recognized")
 
+        if request.input_mode not in _ALLOWED_INPUT_MODES:
+            issues.append(f"input_mode '{request.input_mode}' is not recognized")
+
         if (
             request.routing_confidence is not None
             and request.routing_confidence < _ROUTING_CONFIDENCE_THRESHOLD
@@ -55,6 +61,9 @@ class Guardrails:
 
         if _LEAKAGE_PATTERN.search(request.redacted_input):
             issues.append("secret leakage detected in redacted_input")
+
+        if _request_contains_secret_leakage(request.to_dict()):
+            issues.append("secret leakage detected in normalized_request")
 
         if request.event:
             tw = request.event.get("time_window")
@@ -92,3 +101,8 @@ def _validate_time_window(tw: dict) -> str | None:
     except (ValueError, TypeError):
         return f"time_window contains unparseable timestamps"
     return None
+
+
+def _request_contains_secret_leakage(payload: dict) -> bool:
+    text = str(payload)
+    return bool(_LEAKAGE_PATTERN.search(text))
