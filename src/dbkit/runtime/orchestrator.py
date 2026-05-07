@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
+from typing import Any
 
 from dbkit.agents.intake import IntakeAgent
 from dbkit.runtime.artifacts import ArtifactStore
@@ -50,97 +52,188 @@ class Orchestrator:
         self.redactor = redactor or Redactor()
 
     def run(self, user_input: str) -> RuntimeResult:
-        self._start("redactor")
-        redacted_input = self._redact(user_input)
-        self._complete("redactor")
+        # --- Redaction ---
+        redaction_result = self.redactor.redact(user_input)
+        redacted_input = redaction_result.redacted_text
 
-        self._start("intake")
+        # Generate a provisional request_id from the original input for telemetry
+        from dbkit.tools.normalize_request import _request_id
+        request_id = _request_id(user_input.strip())
+
+        self.telemetry.emit_redaction_completed(
+            request_id=request_id,
+            secret_count=len(redaction_result.secret_refs),
+            patterns=redaction_result.redaction_summary.get("redacted_patterns", []),
+            raw_bytes=redaction_result.raw_bytes,
+            filtered_bytes=redaction_result.filtered_bytes,
+        )
+        self.telemetry.emit_runtime_cost(
+            stage="redactor",
+            raw_bytes=redaction_result.raw_bytes,
+            filtered_bytes=redaction_result.filtered_bytes,
+            compression_ratio=redaction_result.compression_ratio,
+            estimated_tokens=redaction_result.estimated_tokens,
+            tool_latency_ms=0.0,
+        )
+
+        # --- Intake Agent ---
         intake_agent = IntakeAgent.from_repo_root(self.repo_root)
         intake_runtime = self.deepagents_runtime_factory.create_intake_runtime(
             intake_agent.skill_text
         )
+
+        llm_json: dict[str, Any] | None = None
         if self.invoke_llm:
-            self._invoke_intake_runtime(intake_runtime, redacted_input)
+            llm_json = self._invoke_intake_runtime(intake_runtime, redacted_input, request_id)
+
+        # --- Normalize ---
+        self.telemetry.emit_normalize_request_started(request_id=request_id)
         tool_started_at = perf_counter()
-        normalized_request = normalize_request(redacted_input)
+        normalized_request = normalize_request(
+            redacted_input,
+            llm_json=llm_json,
+            redaction_summary=redaction_result.redaction_summary,
+        )
+        tool_latency_ms = (perf_counter() - tool_started_at) * 1000
+        self.telemetry.emit_normalize_request_completed(
+            request_id=normalized_request.request_id,
+            missing_fields=list(normalized_request.missing_fields),
+        )
         self.telemetry.emit_runtime_cost(
             stage="normalize_request",
             raw_bytes=len(redacted_input.encode("utf-8")),
-            filtered_bytes=len(str(normalized_request.to_dict()).encode("utf-8")),
+            filtered_bytes=len(
+                json.dumps(normalized_request.to_dict(), ensure_ascii=False).encode("utf-8")
+            ),
             compression_ratio=_ratio(
-                len(str(normalized_request.to_dict()).encode("utf-8")),
+                len(json.dumps(normalized_request.to_dict(), ensure_ascii=False).encode("utf-8")),
                 len(redacted_input.encode("utf-8")),
             ),
             estimated_tokens=estimate_tokens(redacted_input),
-            tool_latency_ms=(perf_counter() - tool_started_at) * 1000,
+            tool_latency_ms=tool_latency_ms,
         )
-        self._complete("intake")
 
-        self._start("guardrails")
-        validated_request = self.guardrails.validate_normalized_request(
-            normalized_request
+        # --- Guardrails ---
+        self.telemetry.emit_guardrails_started(
+            request_id=normalized_request.request_id
         )
-        self._complete("guardrails")
+        guardrails_result = self.guardrails.validate(normalized_request)
 
-        self._start("router")
-        route_decision = self.router.route(validated_request)
-        artifact = self.artifact_store.persist_request(validated_request)
-        self._complete("router")
+        if not guardrails_result.passed:
+            self.telemetry.emit_guardrails_blocked(
+                request_id=normalized_request.request_id,
+                blocking_issues=list(guardrails_result.blocking_issues),
+            )
+            blocked_artifact = self.artifact_store.persist_blocked_request(
+                normalized_request, guardrails_result.blocking_issues
+            )
+            telemetry_artifact = self.artifact_store.persist_telemetry(
+                normalized_request.request_id, self.telemetry.events
+            )
+            self.telemetry.emit_artifact_written(
+                request_id=normalized_request.request_id,
+                kind="BlockedRequest",
+                path=str(blocked_artifact.path),
+            )
+            return RuntimeResult(
+                normalized_request=normalized_request,
+                route_decision=None,
+                artifacts=(blocked_artifact, telemetry_artifact),
+                telemetry=tuple(self.telemetry.events),
+                deepagents_runtime_ready=intake_runtime is not None,
+                blocked=True,
+                blocking_issues=guardrails_result.blocking_issues,
+            )
+
+        self.telemetry.emit_guardrails_passed(
+            request_id=normalized_request.request_id
+        )
+
+        # --- Route ---
+        route_decision = self.router.route(normalized_request)
+        self.telemetry.emit_route_selected(
+            request_id=normalized_request.request_id,
+            target_agent=route_decision.target_agent_name,
+            target_domain=route_decision.target_domain,
+        )
+
+        # --- Persist ---
+        request_artifact = self.artifact_store.persist_request(normalized_request)
+        self.telemetry.emit_artifact_written(
+            request_id=normalized_request.request_id,
+            kind="NormalizedRequest",
+            path=str(request_artifact.path),
+        )
+        telemetry_artifact = self.artifact_store.persist_telemetry(
+            normalized_request.request_id, self.telemetry.events
+        )
 
         return RuntimeResult(
-            normalized_request=validated_request,
+            normalized_request=normalized_request,
             route_decision=route_decision,
-            artifacts=(artifact,),
+            artifacts=(request_artifact, telemetry_artifact),
             telemetry=tuple(self.telemetry.events),
             deepagents_runtime_ready=intake_runtime is not None,
+            blocked=False,
         )
 
-    def _redact(self, user_input: str) -> str:
-        started_at = perf_counter()
-        result = self.redactor.redact(user_input)
-        self.telemetry.emit_runtime_cost(
-            stage="redactor",
-            raw_bytes=result.raw_bytes,
-            filtered_bytes=result.filtered_bytes,
-            compression_ratio=result.compression_ratio,
-            estimated_tokens=result.estimated_tokens,
-            tool_latency_ms=(perf_counter() - started_at) * 1000,
-        )
-        return result.redacted_text
-
-    def _invoke_intake_runtime(self, intake_runtime: object, user_input: str) -> None:
+    def _invoke_intake_runtime(
+        self,
+        intake_runtime: object,
+        user_input: str,
+        request_id: str,
+    ) -> dict[str, Any] | None:
         invoke = getattr(intake_runtime, "invoke", None)
         if not callable(invoke):
             raise TypeError("DeepAgents intake runtime must expose invoke()")
-        invoke(
+
+        self.telemetry.emit_intake_agent_started(request_id=request_id)
+        invoke_result = invoke(
             {
                 "messages": [
                     {
                         "role": "user",
                         "content": (
-                            "Normalize this DBKit Phase 01 intake request with the "
-                            f"available normalize_request tool: {user_input}"
+                            "Parse this DBKit intake request and output structured JSON: "
+                            f"{user_input}"
                         ),
                     }
                 ]
             }
         )
+        self.telemetry.emit_intake_agent_completed(request_id=request_id)
 
-    def _start(self, stage: str) -> None:
-        self.telemetry.emit(
-            event_type="stage_started",
-            stage=stage,
-            message=f"{stage} stage started",
-            attributes={"phase": "phase-01"},
-        )
+        return self._extract_llm_json(invoke_result, request_id)
 
-    def _complete(self, stage: str) -> None:
-        self.telemetry.emit(
-            event_type="stage_completed",
-            stage=stage,
-            message=f"{stage} stage completed",
-            attributes={"phase": "phase-01"},
+    def _extract_llm_json(
+        self, invoke_result: object, request_id: str
+    ) -> dict[str, Any] | None:
+        if not isinstance(invoke_result, dict):
+            self.telemetry.emit_intake_json_parse_failed(
+                request_id=request_id,
+                reason="invoke result is not a dict",
+            )
+            return None
+
+        messages = invoke_result.get("messages", [])
+        for msg in reversed(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            content = msg.get("content") or ""
+            if not content:
+                continue
+            try:
+                parsed = json.loads(content.strip())
+                if isinstance(parsed, dict):
+                    return parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        self.telemetry.emit_intake_json_parse_failed(
+            request_id=request_id,
+            reason="no parseable JSON found in assistant messages",
         )
+        return None
 
 
 def _ratio(numerator: int, denominator: int) -> float:

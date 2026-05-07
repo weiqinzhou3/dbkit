@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
-from dbkit.schemas.runtime import ArtifactRecord, NormalizedRequest
+from dbkit.schemas.runtime import ArtifactRecord, NormalizedRequest, TelemetryEvent
 
 
 class ArtifactStore:
@@ -14,7 +15,37 @@ class ArtifactStore:
     def persist_request(self, request: NormalizedRequest) -> ArtifactRecord:
         path = self.root / f"{request.request_id}.normalized-request.json"
         path.write_text(
-            json.dumps(request.to_dict(), indent=2, sort_keys=True),
+            json.dumps(request.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
         return ArtifactRecord(kind="NormalizedRequest", path=path)
+
+    def persist_blocked_request(
+        self,
+        request: NormalizedRequest,
+        blocking_issues: tuple[str, ...],
+    ) -> ArtifactRecord:
+        payload: dict[str, Any] = {
+            "status": "blocked",
+            "blocking_issues": list(blocking_issues),
+            "normalized_request": request.to_dict(),
+        }
+        path = self.root / f"{request.request_id}.blocked-request.json"
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return ArtifactRecord(kind="BlockedRequest", path=path)
+
+    def persist_telemetry(
+        self,
+        request_id: str,
+        events: list[TelemetryEvent],
+    ) -> ArtifactRecord:
+        path = self.root / f"{request_id}.telemetry.jsonl"
+        lines = [
+            json.dumps(e.to_dict(), ensure_ascii=False, sort_keys=True)
+            for e in events
+        ]
+        path.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
+        return ArtifactRecord(kind="Telemetry", path=path)

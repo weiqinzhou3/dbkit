@@ -29,13 +29,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         deepagents_runtime_factory=DeepAgentsRuntimeFactory(
             model=model,
             tools_enabled=config.agent.tool_calling,
+            repo_root=repo_root,
         ),
         invoke_llm=config.runtime.invoke_llm,
     )
     result = orchestrator.run(user_input)
 
     print(f"DBKit {__version__}")
+
+    if result.blocked:
+        missing = [
+            i.removeprefix("missing required field: ")
+            for i in result.blocking_issues
+            if i.startswith("missing required field: ")
+        ]
+        other_issues = [
+            i for i in result.blocking_issues
+            if not i.startswith("missing required field: ")
+        ]
+
+        print("status=blocked")
+        print("reason=missing_required_fields" if missing else "reason=guardrails_failed")
+        if missing:
+            print(f"missing_fields={','.join(missing)}")
+        for issue in other_issues:
+            print(f"issue={issue}")
+        if result.artifacts:
+            print(f"artifact={result.artifacts[0].path}")
+        return 1
+
+    print(f"phase={result.normalized_request.phase}")
     print(f"target_agent={result.route_decision.target_agent_name}")
+    print(f"target_domain={result.normalized_request.target_domain}")
+    print(f"task_type={result.normalized_request.task_type}")
     print(f"artifact={result.artifacts[0].path}")
     return 0
 

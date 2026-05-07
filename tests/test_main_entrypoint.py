@@ -6,7 +6,8 @@ from pathlib import Path
 
 
 class MainEntrypointTest(unittest.TestCase):
-    def test_main_entrypoint_delegates_to_dbkit_cli(self) -> None:
+    def test_main_entrypoint_blocks_when_target_info_missing(self) -> None:
+        """Without LLM and without target info, CLI must block and exit non-zero."""
         import main
 
         output = io.StringIO()
@@ -34,9 +35,11 @@ class MainEntrypointTest(unittest.TestCase):
                     ["--config", str(config_path), "MySQL connection spike"]
                 )
 
-        self.assertEqual(exit_code, 0)
+        # Phase-01.1: missing target info → blocked → exit 1
+        self.assertEqual(exit_code, 1)
         self.assertIn("DBKit", output.getvalue())
-        self.assertIn("target_agent=mysql_analyzer", output.getvalue())
+        self.assertIn("status=blocked", output.getvalue())
+        self.assertIn("missing_fields=", output.getvalue())
         self.assertIn("artifact=", output.getvalue())
 
 

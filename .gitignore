@@ -28,3 +28,7 @@ config/config.yaml
 
 # Editor swap files
 *.swp
+
+# Claude Code
+AGENTS.md
+CLAUDE.md

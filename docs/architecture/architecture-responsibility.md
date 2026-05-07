@@ -37,7 +37,23 @@ The runtime layer is responsible for:
 - observability
 - artifact persistence
 
+Runtime Layer may enforce schemas, safety, routing validity, tool permissions, and artifact lifecycle.
+
+Runtime Layer MUST NOT define business policies.
+
 The runtime layer must NOT perform DBA reasoning.
+
+Business policies include but are not limited to:
+- default incident time windows
+- evidence selection rules
+- domain analysis heuristics
+- alert interpretation rules
+- DBA troubleshooting SOPs
+- confidence interpretation rules
+
+All business policies MUST live in Skills.
+
+Runtime may execute, validate, and enforce Skill-derived outputs, but must not silently redefine them in code.
 
 ## Runtime Components
 

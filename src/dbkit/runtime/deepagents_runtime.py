@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from dbkit.tools.normalize_request import normalize_request_tool
@@ -13,12 +14,14 @@ class DeepAgentsRuntimeFactory:
         create_deep_agent: Callable[..., Any] | None = None,
         model: Any | None = None,
         tools_enabled: bool = True,
+        repo_root: Path | None = None,
     ) -> None:
         self._create_deep_agent = create_deep_agent
         if model is None:
             raise ValueError("DeepAgentsRuntimeFactory requires a configured LLM model")
         self.model = model
         self.tools_enabled = tools_enabled
+        self.repo_root = repo_root
 
     def create_intake_runtime(self, skill_text: str) -> Any:
         create_deep_agent = self._create_deep_agent or self._load_create_deep_agent()
@@ -39,9 +42,15 @@ class DeepAgentsRuntimeFactory:
         return create_deep_agent
 
     def _system_prompt(self, skill_text: str) -> str:
+        if self.repo_root:
+            system_md = self.repo_root / "agents" / "intake" / "system.md"
+            if system_md.exists():
+                agent_prompt = system_md.read_text(encoding="utf-8")
+                return f"{agent_prompt}\n\n---\n\n{skill_text}"
+
         return "\n\n".join(
             [
-                "DBKit Phase 01 Intake Agent.",
+                "DBKit Phase 01.1 Intake Agent.",
                 "Normalize requests only. Do not perform DBA reasoning.",
                 skill_text,
             ]
