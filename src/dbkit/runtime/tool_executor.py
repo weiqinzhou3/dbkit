@@ -1,0 +1,2 @@
+"""Deterministic tool execution boundary."""
+
