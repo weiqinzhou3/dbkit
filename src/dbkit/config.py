@@ -21,6 +21,8 @@ class ModelConfig:
     base_url: str
     api_key: str
     temperature: float = 0.0
+    reasoning_effort: str | None = None
+    extra_body: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,8 @@ def _load_model_config(data: dict[str, Any]) -> ModelConfig:
         base_url=_require_string(data, "base_url", "model"),
         api_key=_require_string(data, "api_key", "model"),
         temperature=float(data.get("temperature", 0.0)),
+        reasoning_effort=_optional_string(data, "reasoning_effort"),
+        extra_body=_optional_mapping(data, "extra_body"),
     )
 
 
@@ -78,6 +82,15 @@ def _require_mapping(document: dict[str, Any], field: str) -> dict[str, Any]:
     return value
 
 
+def _optional_mapping(document: dict[str, Any], field: str) -> dict[str, Any] | None:
+    value = document.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"Config section {field} must be a mapping.")
+    return value
+
+
 def _require_string(data: dict[str, Any], field: str, section: str) -> str:
     value = data.get(field)
     if value is None:
@@ -87,6 +100,14 @@ def _require_string(data: dict[str, Any], field: str, section: str) -> str:
     if not text:
         raise ValueError(f"Config field {section}.{field} is required.")
     return text
+
+
+def _optional_string(data: dict[str, Any], field: str) -> str | None:
+    value = data.get(field)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _optional_bool(data: dict[str, Any], field: str, default: bool) -> bool:

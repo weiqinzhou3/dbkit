@@ -44,6 +44,7 @@ The runtime layer must NOT perform DBA reasoning.
 ```text
 Runtime Layer
   ├── Orchestrator
+  ├── Redactor
   ├── Router
   ├── Tool Executor
   ├── Guardrails
@@ -74,6 +75,24 @@ The Orchestrator MUST NOT:
 - decide root causes
 - hardcode DBA reasoning flows
 - replace agent reasoning
+
+## Redactor
+
+The Redactor is the deterministic secret isolation boundary before any LLM context is created.
+
+Responsibilities:
+
+- redact secrets from user input
+- redact secrets from runtime inputs before agent invocation
+- support deterministic regex-based redaction
+- emit structured redaction telemetry
+- prevent secrets from entering LLM context
+
+The Redactor MUST NOT:
+
+- perform free-form reasoning
+- persist redaction telemetry as artifacts
+- pass raw secrets to agents or tools
 
 ## Router
 
@@ -157,13 +176,11 @@ Responsibilities:
 
 Runtime Cost Telemetry must make the cost and reduction profile visible, including:
 
-- raw data volume
-- post-filter data volume
-- compression ratio
-- evidence shrink ratio
-- estimated LLM context tokens
-- tool latency
-- stage latency
+- raw_bytes
+- filtered_bytes
+- compression_ratio
+- estimated_tokens
+- tool_latency_ms
 
 Structured Analysis Telemetry must describe reasoning support without dumping free-form chain-of-thought.
 

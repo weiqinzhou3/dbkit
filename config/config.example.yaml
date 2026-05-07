@@ -1,9 +1,13 @@
 model:
   provider_kind: openai_compatible
-  model_name: qwen3.5-flash
-  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-  api_key: replace-with-your-api-key
+  model_name: deepseek-v4-pro
+  base_url: https://api.deepseek.com
+  api_key: replace-with-your-deepseek-api-key
   temperature: 0.0
+  reasoning_effort: high
+  extra_body:
+    thinking:
+      type: enabled
 runtime:
   artifact_dir: .dbkit/artifacts
   invoke_llm: true

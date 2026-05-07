@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 from dbkit.agents.intake import IntakeAgent
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.deepagents_runtime import DeepAgentsRuntimeFactory
 from dbkit.runtime.guardrails import Guardrails
 from dbkit.runtime.observability import TelemetryRecorder
+from dbkit.runtime.redactor import Redactor, estimate_tokens
 from dbkit.runtime.router import Router
 from dbkit.schemas.runtime import RuntimeResult
 from dbkit.tools.normalize_request import normalize_request
@@ -22,6 +24,7 @@ class Orchestrator:
     guardrails: Guardrails
     router: Router
     invoke_llm: bool
+    redactor: Redactor
 
     def __init__(
         self,
@@ -33,6 +36,7 @@ class Orchestrator:
         guardrails: Guardrails | None = None,
         router: Router | None = None,
         invoke_llm: bool = True,
+        redactor: Redactor | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.artifact_store = artifact_store
@@ -43,6 +47,7 @@ class Orchestrator:
         self.guardrails = guardrails or Guardrails()
         self.router = router or Router()
         self.invoke_llm = invoke_llm
+        self.redactor = redactor or Redactor()
 
     def run(self, user_input: str) -> RuntimeResult:
         self._start("redactor")
@@ -56,7 +61,19 @@ class Orchestrator:
         )
         if self.invoke_llm:
             self._invoke_intake_runtime(intake_runtime, redacted_input)
+        tool_started_at = perf_counter()
         normalized_request = normalize_request(redacted_input)
+        self.telemetry.emit_runtime_cost(
+            stage="normalize_request",
+            raw_bytes=len(redacted_input.encode("utf-8")),
+            filtered_bytes=len(str(normalized_request.to_dict()).encode("utf-8")),
+            compression_ratio=_ratio(
+                len(str(normalized_request.to_dict()).encode("utf-8")),
+                len(redacted_input.encode("utf-8")),
+            ),
+            estimated_tokens=estimate_tokens(redacted_input),
+            tool_latency_ms=(perf_counter() - tool_started_at) * 1000,
+        )
         self._complete("intake")
 
         self._start("guardrails")
@@ -79,7 +96,17 @@ class Orchestrator:
         )
 
     def _redact(self, user_input: str) -> str:
-        return user_input
+        started_at = perf_counter()
+        result = self.redactor.redact(user_input)
+        self.telemetry.emit_runtime_cost(
+            stage="redactor",
+            raw_bytes=result.raw_bytes,
+            filtered_bytes=result.filtered_bytes,
+            compression_ratio=result.compression_ratio,
+            estimated_tokens=result.estimated_tokens,
+            tool_latency_ms=(perf_counter() - started_at) * 1000,
+        )
+        return result.redacted_text
 
     def _invoke_intake_runtime(self, intake_runtime: object, user_input: str) -> None:
         invoke = getattr(intake_runtime, "invoke", None)
@@ -114,3 +141,9 @@ class Orchestrator:
             message=f"{stage} stage completed",
             attributes={"phase": "phase-01"},
         )
+
+
+def _ratio(numerator: int, denominator: int) -> float:
+    if denominator == 0:
+        return 1.0
+    return round(numerator / denominator, 6)

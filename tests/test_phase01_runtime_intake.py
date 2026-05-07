@@ -12,6 +12,7 @@ from dbkit.runtime.deepagents_runtime import DeepAgentsRuntimeFactory
 from dbkit.runtime.guardrails import Guardrails
 from dbkit.runtime.observability import TelemetryRecorder
 from dbkit.runtime.orchestrator import Orchestrator
+from dbkit.runtime.redactor import Redactor
 from dbkit.runtime.router import Router
 from dbkit.tools.normalize_request import normalize_request
 
@@ -29,6 +30,10 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
                         "  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1",
                         "  api_key: sk-test",
                         "  temperature: 0.1",
+                        "  reasoning_effort: high",
+                        "  extra_body:",
+                        "    thinking:",
+                        "      type: enabled",
                         "runtime:",
                         "  artifact_dir: .dbkit/test-artifacts",
                         "  invoke_llm: true",
@@ -47,6 +52,8 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
             )
             self.assertEqual(config.model.api_key, "sk-test")
             self.assertEqual(config.model.temperature, 0.1)
+            self.assertEqual(config.model.reasoning_effort, "high")
+            self.assertEqual(config.model.extra_body, {"thinking": {"type": "enabled"}})
             self.assertEqual(config.runtime.artifact_dir, Path(".dbkit/test-artifacts"))
             self.assertTrue(config.runtime.invoke_llm)
 
@@ -71,8 +78,38 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
                 "temperature": 0.0,
                 "stream_usage": False,
                 "max_retries": 5,
+                "reasoning_effort": "high",
+                "extra_body": {"thinking": {"type": "enabled"}},
             },
         )
+
+    def test_redactor_removes_english_chinese_headers_and_database_uri_secrets(self) -> None:
+        raw = (
+            "password=abc123 passwd: def456 pwd：中文密码 token=tok-1 "
+            "secret: sec-value api_key=api-value Authorization: Bearer auth-token "
+            "mysql://root:rootpass@db:3306/app redis://:redispass@cache:6379 "
+            "mongodb://u:mongopass@mongo/db postgres://pg:pgpass@pg/db"
+        )
+
+        result = Redactor().redact(raw)
+
+        for secret in (
+            "abc123",
+            "def456",
+            "中文密码",
+            "tok-1",
+            "sec-value",
+            "api-value",
+            "auth-token",
+            "rootpass",
+            "redispass",
+            "mongopass",
+            "pgpass",
+        ):
+            self.assertNotIn(secret, result.redacted_text)
+        self.assertIn("<REDACTED>", result.redacted_text)
+        self.assertGreater(result.raw_bytes, result.filtered_bytes)
+        self.assertLess(result.compression_ratio, 1.0)
 
     def test_normalize_request_creates_phase01_request(self) -> None:
         request = normalize_request("MySQL connection spike on prod-db-1")
@@ -183,7 +220,9 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
                 deepagents_runtime_factory=factory,
             )
 
-            result = orchestrator.run("MySQL connection spike on prod-db-1")
+            result = orchestrator.run(
+                "MySQL connection spike password=abc token=secret-token"
+            )
 
             self.assertTrue(result.deepagents_runtime_ready)
             self.assertEqual(result.route_decision.target_agent_name, "mysql_analyzer")
@@ -192,11 +231,33 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
             self.assertIn("Intake Skill", factory.skill_text)
             self.assertEqual(len(factory.runtime.calls), 1)
             self.assertIn(
-                "MySQL connection spike on prod-db-1",
+                "MySQL connection spike",
                 factory.runtime.calls[0]["messages"][0]["content"],
             )
+            self.assertNotIn("abc", factory.runtime.calls[0]["messages"][0]["content"])
+            self.assertNotIn(
+                "secret-token",
+                factory.runtime.calls[0]["messages"][0]["content"],
+            )
+            cost_events = [
+                event for event in result.telemetry if event.event_type == "runtime_cost"
+            ]
             self.assertEqual(
-                [event.event_type for event in result.telemetry],
+                [event.attributes["stage"] for event in cost_events],
+                ["redactor", "normalize_request"],
+            )
+            self.assertEqual(cost_events[0].attributes["stage"], "redactor")
+            self.assertIn("raw_bytes", cost_events[0].attributes)
+            self.assertIn("filtered_bytes", cost_events[0].attributes)
+            self.assertIn("compression_ratio", cost_events[0].attributes)
+            self.assertIn("estimated_tokens", cost_events[0].attributes)
+            self.assertIn("tool_latency_ms", cost_events[0].attributes)
+            self.assertEqual(
+                [
+                    event.event_type
+                    for event in result.telemetry
+                    if event.event_type != "runtime_cost"
+                ],
                 [
                     "stage_started",
                     "stage_completed",
@@ -242,6 +303,10 @@ def _write_config_file() -> Path:
                 "  model_name: qwen3.5-flash",
                 "  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1",
                 "  api_key: sk-test",
+                "  reasoning_effort: high",
+                "  extra_body:",
+                "    thinking:",
+                "      type: enabled",
                 "runtime:",
                 "  artifact_dir: .dbkit/test-artifacts",
                 "  invoke_llm: true",

@@ -31,11 +31,14 @@ This phase validates:
 - Tool registration model
 - Intake flow
 - NormalizedRequest generation
+- deterministic Redactor behavior
 - Guardrails foundation
 - Artifact foundation
 - Observability foundation
 
 This phase does NOT perform real DBA analysis.
+
+DBKit runtime requires models that fully support OpenAI-compatible tool calling and multi-turn agent runtime.
 
 ---
 
@@ -56,6 +59,7 @@ User Input
 # 3. Included Scope
 
 - Orchestrator skeleton
+- Redactor foundation
 - Router skeleton
 - Tool Executor skeleton
 - Guardrails foundation
@@ -64,6 +68,13 @@ User Input
 - Intake Agent
 - Intake Skill
 - normalize_request tool
+
+Model configuration must support provider-driven OpenAI-compatible parameters, including:
+
+- reasoning_effort
+- extra_body.thinking.type
+
+These parameters must be passed through from configuration without provider-specific hardcoding.
 
 ---
 
@@ -83,7 +94,10 @@ User Input
 - DeepAgents SDK runtime is wired
 - Intake Agent can load its skill
 - normalize_request tool works
+- Redactor runs before any LLM invocation
+- Redactor prevents secrets from entering LLM context
 - Guardrails validate NormalizedRequest
 - Router can select target agent name
 - Artifacts are persisted
-- Logs/traces exist
+- structured telemetry exists
+- Runtime Cost Telemetry includes raw_bytes, filtered_bytes, compression_ratio, estimated_tokens, and tool_latency_ms

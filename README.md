@@ -13,7 +13,7 @@ This phase builds the runnable runtime skeleton, root entrypoint, package struct
 ## Requirements
 
 - Python 3.11+
-- A DBKit config file with OpenAI-compatible LLM settings
+- A DBKit config file with an OpenAI-compatible model that supports tool calling and multi-turn agent runtime
 
 ## Entry Point
 
@@ -24,6 +24,24 @@ cp config/config.example.yaml config/config.yaml
 ```
 
 Edit `config/config.yaml` with your model name, base URL, and API key.
+
+Example DeepSeek V4 settings:
+
+```yaml
+model:
+  provider_kind: openai_compatible
+  model_name: deepseek-v4-pro
+  base_url: https://api.deepseek.com
+  api_key: replace-with-your-deepseek-api-key
+  temperature: 0.0
+  reasoning_effort: high
+  extra_body:
+    thinking:
+      type: enabled
+runtime:
+  artifact_dir: .dbkit/artifacts
+  invoke_llm: true
+```
 
 Run the root entrypoint:
 
