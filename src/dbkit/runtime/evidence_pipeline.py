@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from dbkit.runtime.artifacts import ArtifactStore
+from dbkit.runtime.collection_preflight import (
+    INSTALL_HINT,
+    find_missing_collection_dependencies,
+)
 from dbkit.runtime.collection_guardrails import CollectionGuardrails
 from dbkit.runtime.json_extraction import extract_json_from_invoke_result
 from dbkit.runtime.observability import TelemetryRecorder
@@ -31,6 +35,7 @@ class EvidencePipeline:
     time_provider: Any
     guardrails: CollectionGuardrails
     mysql_analyzer_runtime: Any | None
+    collection_dependency_checker: Callable[[CollectionPlan], tuple[str, ...]] | None
 
     def __init__(
         self,
@@ -41,6 +46,7 @@ class EvidencePipeline:
         time_provider: Any | None = None,
         guardrails: CollectionGuardrails | None = None,
         mysql_analyzer_runtime: Any | None = None,
+        collection_dependency_checker: Callable[[CollectionPlan], tuple[str, ...]] | None = None,
     ) -> None:
         self.artifact_store = artifact_store
         self.telemetry = telemetry
@@ -48,6 +54,7 @@ class EvidencePipeline:
         self.time_provider = time_provider or TimeProvider()
         self.guardrails = guardrails or CollectionGuardrails()
         self.mysql_analyzer_runtime = mysql_analyzer_runtime
+        self.collection_dependency_checker = collection_dependency_checker
 
     def run(
         self,
@@ -185,6 +192,59 @@ class EvidencePipeline:
             attributes={"request_id": request.request_id},
         )
         plan_artifact = self.artifact_store.persist_collection_plan(plan)
+
+        missing_dependencies = self._missing_collection_dependencies(plan, request)
+        if missing_dependencies:
+            self.telemetry.emit(
+                event_type="missing_collection_dependency",
+                stage="collection_preflight",
+                message="Collection dependencies are missing",
+                attributes={
+                    "request_id": request.request_id,
+                    "missing_dependencies": list(missing_dependencies),
+                    "install_hint": INSTALL_HINT,
+                },
+            )
+            blocked_artifact = self.artifact_store.persist_collection_blocked(
+                request,
+                plan,
+                reason="missing_collection_dependencies",
+                missing_dependencies=list(missing_dependencies),
+                install_hint=INSTALL_HINT,
+            )
+            self.telemetry.emit(
+                event_type="artifact_written",
+                stage="artifacts",
+                message="Artifact written: CollectionBlocked",
+                attributes={
+                    "request_id": request.request_id,
+                    "kind": "CollectionBlocked",
+                    "path": str(blocked_artifact.path),
+                },
+            )
+            telemetry_artifact = self.artifact_store.persist_collection_telemetry(
+                request.request_id, self.telemetry.events
+            )
+            return EvidencePipelineResult(
+                request_id=request.request_id,
+                phase=request.phase if request.phase.startswith("phase-02.1") else "phase-02",
+                status="missing_collection_dependencies",
+                evidence_request=evidence_request,
+                collection_plan=plan,
+                raw_evidence=(),
+                artifacts=(
+                    evidence_artifact,
+                    plan_artifact,
+                    blocked_artifact,
+                    telemetry_artifact,
+                ),
+                telemetry=tuple(self.telemetry.events),
+                blocking_issues=("missing_collection_dependencies",),
+                metadata={
+                    "missing_dependencies": list(missing_dependencies),
+                    "install_hint": INSTALL_HINT,
+                },
+            )
 
         raw_items: list[RawEvidence] = []
         raw_root = self.artifact_store.root / "raw"
@@ -351,6 +411,15 @@ class EvidencePipeline:
             }
         )
         return extract_json_from_invoke_result(result)
+
+    def _missing_collection_dependencies(
+        self,
+        plan: CollectionPlan,
+        request: NormalizedRequest,
+    ) -> tuple[str, ...]:
+        if self.collection_dependency_checker is not None:
+            return self.collection_dependency_checker(plan)
+        return find_missing_collection_dependencies(plan, request)
 
 
 def _source_paths_for_step(

@@ -168,6 +168,7 @@ class EvidencePipelineResult:
     artifacts: tuple[Any, ...]
     telemetry: tuple[Any, ...]
     blocking_issues: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def collection_summary(raw_evidence: tuple[RawEvidence, ...]) -> dict[str, int]:

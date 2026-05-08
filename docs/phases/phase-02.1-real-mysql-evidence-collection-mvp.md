@@ -79,6 +79,13 @@ Core rules:
 MySQL Analyzer Agent decides what evidence is needed.
 Collector Tools execute deterministic collection.
 Runtime executes tools through Tool Executor and Guardrails.
+Collector tools must be exposed in the MySQL Analyzer skill/tool contract.
+The MySQL Analyzer Agent must select collector tools through structured EvidenceRequest.tool_hint or tool calls.
+Runtime may validate and execute the selected tools, but must not independently invent collection steps.
+All real collection capabilities must be registered as tools.
+They must be discoverable by the MySQL Analyzer Agent through skill/tool documentation.
+Runtime must not invent collection steps that were not requested by EvidenceRequest or selected via allowed tool hints.
+Runtime may normalize aliases and reject invalid tool requests.
 Evidence Agent does not decide what to collect.
 Evidence Agent does not structure RawEvidence in this phase.
 ```
@@ -564,6 +571,10 @@ collection:
     read_timeout_seconds: 30
 ```
 
+Runtime must run a dependency preflight before executing live MySQL collectors.
+If `pymysql` is unavailable, collection must block once with
+`reason=missing_collection_dependencies` instead of letting each collector fail.
+
 ## 11.2 SSH Connection
 
 Preferred implementation:
@@ -584,6 +595,10 @@ collection:
     connect_timeout_seconds: 5
     command_timeout_seconds: 30
 ```
+
+Runtime must run a dependency preflight before executing SSH collectors. If
+`paramiko` is unavailable, collection must block once with
+`reason=missing_collection_dependencies` instead of letting each collector fail.
 
 ---
 

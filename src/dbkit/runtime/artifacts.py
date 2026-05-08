@@ -107,6 +107,32 @@ class ArtifactStore:
         )
         return ArtifactRecord(kind="CollectionPlan", path=path)
 
+    def persist_collection_blocked(
+        self,
+        request: NormalizedRequest,
+        plan: CollectionPlan,
+        *,
+        reason: str,
+        missing_dependencies: list[str] | None = None,
+        install_hint: str | None = None,
+    ) -> ArtifactRecord:
+        path = self.root / f"{request.request_id}.collection-blocked.json"
+        payload: dict[str, Any] = {
+            "request_id": request.request_id,
+            "phase": request.phase,
+            "status": "blocked",
+            "reason": reason,
+            "missing_dependencies": missing_dependencies or [],
+            "install_hint": install_hint,
+            "collection_plan": plan.to_dict(),
+            "normalized_request": request.to_dict(),
+        }
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return ArtifactRecord(kind="CollectionBlocked", path=path)
+
     def persist_raw_evidence_index(
         self,
         request_id: str,

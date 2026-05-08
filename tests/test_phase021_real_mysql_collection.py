@@ -18,6 +18,59 @@ from dbkit.tools.normalize_request import normalize_request
 
 
 class Phase021RealMySQLCollectionTest(unittest.TestCase):
+    def test_pyproject_declares_collection_dependencies_and_extra(self) -> None:
+        import tomllib
+
+        pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+        dependencies = pyproject["project"]["dependencies"]
+        collection_extra = pyproject["project"]["optional-dependencies"]["collection"]
+
+        self.assertTrue(any(dep.startswith("PyMySQL") for dep in dependencies))
+        self.assertTrue(any(dep.startswith("paramiko") for dep in dependencies))
+        self.assertTrue(any(dep.startswith("PyMySQL") for dep in collection_extra))
+        self.assertTrue(any(dep.startswith("paramiko") for dep in collection_extra))
+
+    def test_missing_collection_dependencies_block_before_collectors_run(self) -> None:
+        request = _live_request(with_ssh=True)
+        evidence_request_json = _evidence_request(
+            request,
+            [
+                ("collect_mysql_runtime_status", "mysql.runtime_status", "mysql"),
+                ("collect_os_cpu_snapshot", "metrics.cpu", "ssh"),
+            ],
+        )
+        collectors = CountingCollectorRegistry(workspace_root=Path("/tmp/workspace"))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = EvidencePipeline(
+                artifact_store=ArtifactStore(root / "artifacts"),
+                telemetry=_telemetry(),
+                collectors=collectors,
+                time_provider=_time_provider(),
+                collection_dependency_checker=lambda _plan: ("pymysql", "paramiko"),
+            ).run(request, evidence_request_json=evidence_request_json)
+
+            artifact = [item for item in result.artifacts if item.kind == "CollectionBlocked"][0]
+            payload = json.loads(artifact.path.read_text(encoding="utf-8"))
+
+        self.assertEqual(collectors.calls, 0)
+        self.assertEqual(result.status, "missing_collection_dependencies")
+        self.assertEqual(result.blocking_issues, ("missing_collection_dependencies",))
+        self.assertEqual(payload["reason"], "missing_collection_dependencies")
+        self.assertEqual(payload["missing_dependencies"], ["pymysql", "paramiko"])
+        self.assertIn(
+            "missing_collection_dependency",
+            [event.event_type for event in result.telemetry],
+        )
+
+    def test_mysql_analyzer_skill_lists_available_collector_tools(self) -> None:
+        skill_text = Path("skills/mysql-analyzer/SKILL.md").read_text(encoding="utf-8")
+
+        self.assertIn("Available Collector Tools", skill_text)
+        self.assertIn("mysql.runtime_status -> collect_mysql_runtime_status", skill_text)
+        self.assertIn("metrics.cpu -> collect_os_cpu_snapshot", skill_text)
+
     def test_mysql_service_collectors_execute_read_only_sql(self) -> None:
         fake_mysql = FakeMySQLClient(
             {
@@ -287,6 +340,16 @@ class FakeSSHClient:
         return self.results.get(("tail", lines, path), "")
 
 
+class CountingCollectorRegistry(CollectorRegistry):
+    def __init__(self, *, workspace_root: Path) -> None:
+        super().__init__(workspace_root=workspace_root)
+        self.calls = 0
+
+    def collect(self, **kwargs):
+        self.calls += 1
+        return super().collect(**kwargs)
+
+
 def _live_request(*, with_ssh: bool = False):
     return normalize_request(
         "连接 MySQL 分析 CPU 告警",
@@ -337,7 +400,7 @@ def _step(index: int, tool_name: str, evidence_type: str) -> CollectionStep:
     )
 
 
-def _evidence_request(request, tools: list[tuple[str, str]]) -> dict:
+def _evidence_request(request, tools: list[tuple[str, str] | tuple[str, str, str]]) -> dict:
     return {
         "request_id": request.request_id,
         "phase": "phase-02",
@@ -353,10 +416,11 @@ def _evidence_request(request, tools: list[tuple[str, str]]) -> dict:
                     "evidence_type": evidence_type,
                     "priority": "required",
                     "purpose": "collect evidence",
-                    "source": "mysql",
+                    "source": source[0] if source else "mysql",
                     "tool_hint": tool_name,
                 }
-                for tool_name, evidence_type in tools
+                for item in tools
+                for tool_name, evidence_type, *source in [item]
             ],
             "optional_evidence": [],
             "not_required_evidence": [],

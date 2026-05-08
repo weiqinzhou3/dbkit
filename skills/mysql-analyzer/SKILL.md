@@ -124,6 +124,29 @@ Tool source mapping:
 - `read_provided_evidence_file` -> `provided_evidence`
 - `read_provided_evidence_directory` -> `provided_evidence`
 
+## Available Collector Tools
+
+Use `EvidenceRequest.evidence_request.required_evidence[].tool_hint` to select
+one of these collector tools. Runtime only validates and executes the
+`tool_hint` values you output; it does not invent collection steps.
+
+- `mysql.runtime_status -> collect_mysql_runtime_status`
+- `mysql.processlist -> collect_mysql_processlist`
+- `mysql.innodb_status -> collect_mysql_innodb_status`
+- `mysql.variables -> collect_mysql_variables`
+- `mysql.service_metadata -> collect_mysql_service_metadata`
+- `mysql.log_paths -> discover_mysql_log_paths`
+- `mysql.error_log -> collect_mysql_error_log`
+- `mysql.slow_log -> collect_mysql_slow_log`
+- `metrics.mysql -> collect_mysql_metrics_snapshot`
+- `metrics.mysql_status -> collect_mysql_status_metrics`
+- `metrics.mysql_variables -> collect_mysql_variable_metrics`
+- `metrics.cpu -> collect_os_cpu_snapshot`
+- `metrics.memory -> collect_os_memory_snapshot`
+- `metrics.disk -> collect_os_disk_snapshot`
+- `os.mysql_service_status -> collect_os_service_status`
+- `provided.file -> read_provided_evidence_file`
+
 ## Input Mode Guidance
 
 For `provided_evidence`, prefer file readers:

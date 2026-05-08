@@ -104,9 +104,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     ).run(result.normalized_request)
 
     print(f"phase={evidence_result.phase}")
-    if evidence_result.status == "evidence_request_parse_failed":
+    if evidence_result.status in {
+        "evidence_request_parse_failed",
+        "missing_collection_dependencies",
+    }:
         print("status=blocked")
-        print("reason=evidence_request_parse_failed")
+        print(f"reason={evidence_result.status}")
+        if evidence_result.status == "missing_collection_dependencies":
+            missing_dependencies = evidence_result.metadata.get("missing_dependencies") or []
+            install_hint = evidence_result.metadata.get("install_hint")
+            print(f"missing_dependencies={','.join(missing_dependencies)}")
+            print(f"install_hint={install_hint}")
     else:
         print(f"status={evidence_result.status}")
     print(f"input_mode={result.normalized_request.input_mode}")
@@ -135,6 +143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "collection_failed",
         "collection_not_implemented",
         "evidence_request_parse_failed",
+        "missing_collection_dependencies",
     }:
         return 1
     return 0

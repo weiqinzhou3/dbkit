@@ -17,6 +17,36 @@ It does not produce findings, root cause, validation verdicts, or summaries.
 - Python 3.11+
 - A DBKit config file with an OpenAI-compatible model that supports tool calling and multi-turn agent runtime
 
+## Installation
+
+Install DBKit from the repo root:
+
+```bash
+python3.11 -m pip install -e .
+```
+
+The default install includes Phase-02.1 live collection dependencies:
+
+- `PyMySQL` for MySQL read-only collection
+- `paramiko` for SSH read-only collection
+
+The same dependencies are also exposed as the `collection` extra, so this is
+equivalent and explicit for collection environments:
+
+```bash
+python3.11 -m pip install -e ".[collection]"
+```
+
+If live collection dependencies are missing, DBKit blocks before executing
+collectors and prints:
+
+```text
+status=blocked
+reason=missing_collection_dependencies
+missing_dependencies=pymysql,paramiko
+install_hint=pip install -e ".[collection]"
+```
+
 ## Entry Point
 
 Create a local config from the example:
