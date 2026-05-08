@@ -143,6 +143,38 @@ class EvidencePipeline:
             attributes={"request_id": request.request_id},
         )
         guardrails_result = self.guardrails.validate(plan, request)
+        if not guardrails_result.passed and self._should_revise_evidence_request(
+            guardrails_result.blocking_issues
+        ):
+            revised = self._revise_evidence_request(
+                request=request,
+                evidence_request=evidence_request,
+                blocking_issues=guardrails_result.blocking_issues,
+            )
+            if revised is not None:
+                evidence_request = revised
+                evidence_artifact = self.artifact_store.persist_evidence_request(
+                    evidence_request
+                )
+                plan = self.create_collection_plan(evidence_request, request)
+                self.telemetry.emit(
+                    event_type="collection_plan_created",
+                    stage="collection_planning",
+                    message="Collection plan created from revised evidence request",
+                    attributes={
+                        "request_id": request.request_id,
+                        "collection_plan_id": plan.collection_plan_id,
+                        "step_count": len(plan.steps),
+                        "revision": 1,
+                    },
+                )
+                self.telemetry.emit(
+                    event_type="collection_guardrails_started",
+                    stage="collection_guardrails",
+                    message="Collection guardrails started for revised evidence request",
+                    attributes={"request_id": request.request_id, "revision": 1},
+                )
+                guardrails_result = self.guardrails.validate(plan, request)
         if not guardrails_result.passed:
             self.telemetry.emit(
                 event_type="collection_guardrails_blocked",
@@ -411,6 +443,96 @@ class EvidencePipeline:
             }
         )
         return extract_json_from_invoke_result(result)
+
+    def _revise_evidence_request(
+        self,
+        *,
+        request: NormalizedRequest,
+        evidence_request: EvidenceRequest,
+        blocking_issues: tuple[str, ...],
+    ) -> EvidenceRequest | None:
+        if self.mysql_analyzer_runtime is None:
+            return None
+        invoke = getattr(self.mysql_analyzer_runtime, "invoke", None)
+        if not callable(invoke):
+            return None
+
+        self.telemetry.emit(
+            event_type="evidence_request_revision_requested",
+            stage="evidence_planning",
+            message="Evidence request revision requested after guardrail block",
+            attributes={
+                "request_id": request.request_id,
+                "blocking_issues": list(blocking_issues),
+            },
+        )
+        context = {
+            "mode": "evidence_planning_revision",
+            "normalized_request": request.to_dict(),
+            "collection_policy": request.collection_policy or {},
+            "previous_evidence_request": evidence_request.to_dict(),
+            "blocking_issues": list(blocking_issues),
+            "instruction": (
+                "Output revised DBKit EvidenceRequest JSON only. Remove tools "
+                "blocked by collection_policy. Do not add collection tools that "
+                "are not permitted by the collection_policy."
+            ),
+        }
+        result = invoke(
+            {
+                "mode": "evidence_planning_revision",
+                "normalized_request": request,
+                "collection_policy": request.collection_policy or {},
+                "previous_evidence_request": evidence_request,
+                "blocking_issues": list(blocking_issues),
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Output only revised DBKit EvidenceRequest JSON for "
+                            "this evidence planning guardrail block.\n\n"
+                            "DBKit evidence planning revision context JSON:\n"
+                            + json_dumps(context)
+                        ),
+                    }
+                ],
+            }
+        )
+        revised_json = extract_json_from_invoke_result(result)
+        if revised_json is None:
+            self.telemetry.emit(
+                event_type="evidence_request_revision_parse_failed",
+                stage="evidence_planning",
+                message="Revised EvidenceRequest JSON could not be parsed",
+                attributes={"request_id": request.request_id},
+            )
+            return None
+
+        try:
+            revised = validate_evidence_request(revised_json)
+        except ValueError as exc:
+            self.telemetry.emit(
+                event_type="evidence_request_revision_validation_failed",
+                stage="evidence_planning",
+                message="Revised EvidenceRequest JSON failed validation",
+                attributes={"request_id": request.request_id, "error": str(exc)},
+            )
+            return None
+
+        self.telemetry.emit(
+            event_type="evidence_request_revision_completed",
+            stage="evidence_planning",
+            message="Evidence request revision completed",
+            attributes={"request_id": request.request_id},
+        )
+        return revised
+
+    @staticmethod
+    def _should_revise_evidence_request(blocking_issues: tuple[str, ...]) -> bool:
+        return any(
+            "collection_policy does not permit" in issue
+            for issue in blocking_issues
+        )
 
     def _missing_collection_dependencies(
         self,

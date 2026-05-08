@@ -10,6 +10,7 @@ from dbkit.runtime.collection_guardrails import (
     is_ssh_command_allowed,
 )
 from dbkit.runtime.evidence_pipeline import EvidencePipeline
+from dbkit.runtime.redactor import Redactor
 from dbkit.runtime.secret_store import SecretStore
 from dbkit.runtime.time_context import FixedTimeProvider
 from dbkit.schemas.evidence import CollectionStep
@@ -70,6 +71,82 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
         self.assertIn("Available Collector Tools", skill_text)
         self.assertIn("mysql.runtime_status -> collect_mysql_runtime_status", skill_text)
         self.assertIn("metrics.cpu -> collect_os_cpu_snapshot", skill_text)
+        self.assertIn("Requires collection_policy.allow_ssh=true", skill_text)
+
+    def test_guardrail_blocked_ssh_tools_trigger_one_evidence_request_revision(self) -> None:
+        request = _live_request(with_ssh=False)
+        fake_mysql = FakeMySQLClient(
+            {
+                "SHOW FULL PROCESSLIST": [{"Id": 1}],
+                "SHOW GLOBAL STATUS": [{"Variable_name": "Threads_running", "Value": "3"}],
+                "SHOW ENGINE INNODB STATUS": [{"Status": "ok"}],
+                "SHOW GLOBAL VARIABLES": [{"Variable_name": "max_connections", "Value": "151"}],
+            }
+        )
+        analyzer = RevisionAnalyzerRuntime(
+            first_payload=_evidence_request(
+                request,
+                [
+                    ("collect_mysql_runtime_status", "mysql.runtime_status", "mysql"),
+                    ("collect_os_cpu_snapshot", "metrics.cpu", "ssh"),
+                    ("collect_os_memory_snapshot", "metrics.memory", "ssh"),
+                ],
+            ),
+            second_payload=_evidence_request(
+                request,
+                [
+                    ("collect_mysql_processlist", "mysql.processlist", "mysql"),
+                    ("collect_mysql_runtime_status", "mysql.runtime_status", "mysql"),
+                    ("collect_mysql_innodb_status", "mysql.innodb_status", "mysql"),
+                    ("collect_mysql_variables", "mysql.variables", "mysql"),
+                ],
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = EvidencePipeline(
+                artifact_store=ArtifactStore(root / "artifacts"),
+                telemetry=_telemetry(),
+                collectors=CollectorRegistry(
+                    workspace_root=root / "workspace",
+                    mysql_client_factory=lambda _request, _secrets: fake_mysql,
+                    secret_store=SecretStore({"<SECRET_REF:mysql_password_001>": "Root"}),
+                ),
+                time_provider=_time_provider(),
+                mysql_analyzer_runtime=analyzer,
+            ).run(request)
+
+        self.assertEqual(analyzer.modes, ["evidence_planning", "evidence_planning_revision"])
+        self.assertEqual(result.status, "raw_evidence_collected")
+        self.assertEqual(len(result.raw_evidence), 4)
+        self.assertNotIn(
+            "collect_os_cpu_snapshot",
+            [step.tool_name for step in result.collection_plan.steps],
+        )
+        self.assertIn(
+            "evidence_request_revision_requested",
+            [event.event_type for event in result.telemetry],
+        )
+
+    def test_redactor_trims_trailing_sentence_punctuation_from_secret_values(self) -> None:
+        cases = [
+            ("MySQL密码是 Root@1234!。SSH地址是 192.168.1.1", "Root@1234!"),
+            ("SSH密码是 root。允许连接 MySQL", "root"),
+            ("password is Root@1234!.", "Root@1234!"),
+        ]
+
+        for raw, expected in cases:
+            result = Redactor().redact(raw)
+            self.assertIn(expected, result.secret_values.values(), msg=raw)
+            self.assertNotIn(expected + "。", result.secret_values.values(), msg=raw)
+            self.assertNotIn(expected + ".", result.secret_values.values(), msg=raw)
+
+    def test_redactor_preserves_uri_password_with_at_sign(self) -> None:
+        result = Redactor().redact("mysql://root:Root@1234!@host:3306/db")
+
+        self.assertIn("Root@1234!", result.secret_values.values())
+        self.assertIn("mysql://root:<SECRET_REF:uri_password_001>@host:3306/db", result.redacted_text)
 
     def test_mysql_service_collectors_execute_read_only_sql(self) -> None:
         fake_mysql = FakeMySQLClient(
@@ -338,6 +415,23 @@ class FakeSSHClient:
 
     def tail(self, path: str, lines: int) -> str:
         return self.results.get(("tail", lines, path), "")
+
+
+class RevisionAnalyzerRuntime:
+    def __init__(self, *, first_payload: dict, second_payload: dict) -> None:
+        self.payloads = [first_payload, second_payload]
+        self.modes: list[str] = []
+
+    def invoke(self, payload):
+        self.modes.append(payload.get("mode"))
+        return {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": json.dumps(self.payloads.pop(0), ensure_ascii=False),
+                }
+            ]
+        }
 
 
 class CountingCollectorRegistry(CollectorRegistry):

@@ -21,11 +21,11 @@ class RedactionResult:
 class Redactor:
     # English keyword assignments: password=val, token: val, api_key：val
     _SECRET_ASSIGNMENT = re.compile(
-        r"(?i)\b(password|passwd|pwd|token|secret|api_key)\b(\s*(?::|=|：|\bis\b)\s*)([^\s,;]+)"
+        r"(?i)\b(password|passwd|pwd|token|secret|api_key)\b(\s*(?::|=|：|\bis\b)\s*)([^\s,;，；。]+)"
     )
     # Chinese password / passphrase keyword assignments: 密码是val, 口令为val
     _CHINESE_PASSWORD = re.compile(
-        r"((?:密码|口令)\s*[是为：:]\s*)(\S+)"
+        r"((?:密码|口令)\s*[是为：:]\s*)([^\s,;，；。]+)"
     )
     # HTTP Authorization header
     _AUTHORIZATION = re.compile(
@@ -33,7 +33,7 @@ class Redactor:
     )
     # Database connection URIs with embedded credentials: scheme://user:pass@host
     _DATABASE_URI = re.compile(
-        r"(?i)((?:mysql|redis|mongodb|postgres(?:ql)?|postgresql)://)([^:@\s,;]*):([^@\s,;]+)@([^\s,;]+)"
+        r"(?i)((?:mysql|redis|mongodb|postgres(?:ql)?|postgresql)://)([^:@/\s,;]*):([^\s,;]+)@([^\s,;]+)"
     )
 
     def redact(self, text: str) -> RedactionResult:
@@ -42,30 +42,31 @@ class Redactor:
         patterns: list[str] = []
         secret_values: dict[str, str] = {}
 
-        def _ref(prefix: str, pattern_name: str, value: str) -> str:
+        def _ref(prefix: str, pattern_name: str, value: str) -> tuple[str, str]:
+            value, suffix = _trim_secret_value(value)
             counters[prefix] = counters.get(prefix, 0) + 1
             ref = f"<SECRET_REF:{prefix}_{counters[prefix]:03d}>"
             refs.append(ref)
             secret_values[ref] = value
             if pattern_name not in patterns:
                 patterns.append(pattern_name)
-            return ref
+            return ref, suffix
 
         def _replace_assignment(m: re.Match) -> str:
-            ref = _ref(m.group(1).lower(), "english_assignment", m.group(3))
-            return f"{m.group(1)}{m.group(2)}{ref}"
+            ref, suffix = _ref(m.group(1).lower(), "english_assignment", m.group(3))
+            return f"{m.group(1)}{m.group(2)}{ref}{suffix}"
 
         def _replace_chinese(m: re.Match) -> str:
-            ref = _ref("chinese_password", "chinese_password_assignment", m.group(2))
-            return f"{m.group(1)}{ref}"
+            ref, suffix = _ref("chinese_password", "chinese_password_assignment", m.group(2))
+            return f"{m.group(1)}{ref}{suffix}"
 
         def _replace_auth(m: re.Match) -> str:
-            ref = _ref("auth_token", "authorization_header", m.group(3))
-            return f"{m.group(1)}{m.group(2)}{ref}"
+            ref, suffix = _ref("auth_token", "authorization_header", m.group(3))
+            return f"{m.group(1)}{m.group(2)}{ref}{suffix}"
 
         def _replace_uri(m: re.Match) -> str:
-            ref = _ref("uri_password", "database_uri", m.group(3))
-            return f"{m.group(1)}{m.group(2)}:{ref}@{m.group(4)}"
+            ref, suffix = _ref("uri_password", "database_uri", m.group(3))
+            return f"{m.group(1)}{m.group(2)}:{ref}{suffix}@{m.group(4)}"
 
         redacted = self._SECRET_ASSIGNMENT.sub(_replace_assignment, text)
         redacted = self._CHINESE_PASSWORD.sub(_replace_chinese, redacted)
@@ -96,6 +97,14 @@ def _ratio(numerator: int, denominator: int) -> float:
     if denominator == 0:
         return 1.0
     return round(numerator / denominator, 6)
+
+
+def _trim_secret_value(value: str) -> tuple[str, str]:
+    suffix = ""
+    while value and value[-1] in "。，；;,.":
+        suffix = value[-1] + suffix
+        value = value[:-1]
+    return value, suffix
 
 
 def estimate_tokens(text: str) -> int:
