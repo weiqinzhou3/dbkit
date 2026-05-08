@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.collection_guardrails import CollectionGuardrails
@@ -16,6 +17,132 @@ from dbkit.tools.normalize_request import normalize_request
 
 
 class Phase02EvidencePlanningCollectionTest(unittest.TestCase):
+    def test_json_extractor_supports_pure_fenced_prose_and_block_content(self) -> None:
+        from dbkit.runtime.json_extraction import extract_json_from_invoke_result
+
+        normalized = _provided_evidence_request(files=["/workspace/mysql-error.log"])
+        payload = _evidence_request_payload(normalized)
+        cases = [
+            {"messages": [{"role": "assistant", "content": json.dumps(payload)}]},
+            {
+                "messages": [
+                    {"role": "assistant", "content": "```json\n" + json.dumps(payload) + "\n```"}
+                ]
+            },
+            {
+                "messages": [
+                    {"role": "assistant", "content": "Here is the JSON:\n" + json.dumps(payload)}
+                ]
+            },
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "prefix"},
+                            {"type": "text", "text": json.dumps(payload)},
+                        ],
+                    }
+                ]
+            },
+            {"messages": [SimpleNamespace(type="ai", content=json.dumps(payload))]},
+        ]
+
+        try:
+            from langchain_core.messages import AIMessage
+        except ImportError:
+            AIMessage = None
+        if AIMessage is not None:
+            cases.append({"messages": [AIMessage(content=json.dumps(payload))]})
+
+        for case in cases:
+            parsed = extract_json_from_invoke_result(case)
+            self.assertIsNotNone(parsed)
+            self.assertEqual(parsed["phase"], "phase-02")
+
+    def test_pipeline_parses_fenced_evidence_request_from_analyzer(self) -> None:
+        normalized = _provided_evidence_request(files=["/workspace/mysql-error.log"])
+        payload = _evidence_request_payload(normalized)
+
+        class FakeAnalyzerRuntime:
+            def invoke(self, payload_in):
+                return {
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": "```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```",
+                        }
+                    ]
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "mysql-error.log").write_text("error\n", encoding="utf-8")
+            result = EvidencePipeline(
+                artifact_store=ArtifactStore(root / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                collectors=CollectorRegistry(workspace_root=workspace),
+                time_provider=_fixed_time_provider(),
+                mysql_analyzer_runtime=FakeAnalyzerRuntime(),
+            ).run(normalized)
+
+            self.assertEqual(result.status, "raw_evidence_collected")
+            self.assertEqual(len(result.raw_evidence), 1)
+
+    def test_evidence_request_parse_failure_returns_blocked_artifact(self) -> None:
+        normalized = _provided_evidence_request(files=["/workspace/mysql-error.log"])
+
+        class FakeAnalyzerRuntime:
+            def invoke(self, payload):
+                return {"messages": [{"role": "assistant", "content": "not json"}]}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = EvidencePipeline(
+                artifact_store=ArtifactStore(root / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                collectors=CollectorRegistry(workspace_root=root / "workspace"),
+                time_provider=_fixed_time_provider(),
+                mysql_analyzer_runtime=FakeAnalyzerRuntime(),
+            ).run(normalized)
+
+            self.assertEqual(result.status, "evidence_request_parse_failed")
+            self.assertEqual(result.blocking_issues, ("evidence_request_parse_failed",))
+            artifact = [item for item in result.artifacts if item.kind == "EvidenceRequestFailed"][0]
+            payload = json.loads(artifact.path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["reason"], "evidence_request_parse_failed")
+            self.assertIn(
+                "evidence_request_parse_failed",
+                [event.event_type for event in result.telemetry],
+            )
+
+    def test_evidence_type_alias_and_source_are_normalized(self) -> None:
+        normalized = _provided_evidence_request(files=["/workspace/mysql-error.log"])
+        payload = _evidence_request_payload(
+            normalized,
+            tool_hint="collect_processlist",
+            evidence_type="mysql_processlist",
+            source="live_collection",
+        )
+
+        evidence_request = validate_evidence_request(payload)
+        item = evidence_request.evidence_request["required_evidence"][0]
+
+        self.assertEqual(item["evidence_type"], "mysql.processlist")
+        self.assertEqual(item["source"], "mysql")
+
+        runtime_status_payload = _evidence_request_payload(
+            normalized,
+            tool_hint="collect_mysql_runtime_status",
+            evidence_type="mysql.status",
+            source="mysql",
+        )
+        runtime_status = validate_evidence_request(runtime_status_payload)
+        runtime_item = runtime_status.evidence_request["required_evidence"][0]
+        self.assertEqual(runtime_item["evidence_type"], "mysql.runtime_status")
+
     def test_mysql_analyzer_skill_defines_evidence_planning_mode(self) -> None:
         skill_path = Path("skills/mysql-analyzer/SKILL.md")
 

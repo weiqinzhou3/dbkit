@@ -8,6 +8,48 @@ from typing import Any
 _FORBIDDEN_EVIDENCE_REQUEST_KEYS = frozenset(
     {"root_cause", "findings", "verdict", "summary", "recommended_remediation"}
 )
+_CANONICAL_EVIDENCE_TYPES = frozenset(
+    {
+        "mysql.runtime_status",
+        "mysql.processlist",
+        "mysql.innodb_status",
+        "mysql.variables",
+        "mysql.error_log",
+        "mysql.slow_log",
+        "metrics.cpu",
+        "metrics.memory",
+        "metrics.disk",
+        "os.system_log",
+        "provided.file",
+    }
+)
+_EVIDENCE_TYPE_ALIASES = {
+    "mysql_processlist": "mysql.processlist",
+    "mysql_runtime_status": "mysql.runtime_status",
+    "mysql_status": "mysql.runtime_status",
+    "mysql.status": "mysql.runtime_status",
+    "mysql_innodb_status": "mysql.innodb_status",
+    "mysql_variables": "mysql.variables",
+    "mysql_error_log": "mysql.error_log",
+    "mysql_slow_log": "mysql.slow_log",
+    "os.cpu_metrics": "metrics.cpu",
+    "provided_evidence.file": "provided.file",
+    "provided_evidence.directory": "provided.file",
+}
+_ALLOWED_SOURCES = frozenset(
+    {"mysql", "ssh", "metrics", "file", "provided_evidence"}
+)
+_TOOL_SOURCE_DEFAULTS = {
+    "collect_mysql_runtime_status": "mysql",
+    "collect_processlist": "mysql",
+    "collect_innodb_status": "mysql",
+    "collect_mysql_variables": "mysql",
+    "collect_mysql_error_log": "ssh",
+    "collect_mysql_slow_log": "ssh",
+    "collect_metrics_snapshot": "metrics",
+    "read_provided_evidence_file": "provided_evidence",
+    "read_provided_evidence_directory": "provided_evidence",
+}
 
 
 @dataclass(frozen=True)
@@ -89,8 +131,8 @@ class EvidencePipelineResult:
     request_id: str
     phase: str
     status: str
-    evidence_request: EvidenceRequest
-    collection_plan: CollectionPlan
+    evidence_request: EvidenceRequest | None
+    collection_plan: CollectionPlan | None
     raw_evidence: tuple[RawEvidence, ...]
     artifacts: tuple[Any, ...]
     telemetry: tuple[Any, ...]
@@ -127,6 +169,7 @@ def validate_evidence_request(payload: dict[str, Any]) -> EvidenceRequest:
             raise ValueError(f"EvidenceRequest.evidence_request.{field_name} is required")
     if not isinstance(evidence_request["required_evidence"], list):
         raise ValueError("EvidenceRequest.evidence_request.required_evidence must be a list")
+    evidence_request = _normalize_evidence_request_items(evidence_request)
 
     return EvidenceRequest(
         request_id=str(payload["request_id"]),
@@ -139,6 +182,40 @@ def validate_evidence_request(payload: dict[str, Any]) -> EvidenceRequest:
         evidence_request=dict(evidence_request),
         metadata=dict(payload.get("metadata") or {}),
     )
+
+
+def _normalize_evidence_request_items(evidence_request: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(evidence_request)
+    for field_name in (
+        "required_evidence",
+        "optional_evidence",
+        "not_required_evidence",
+    ):
+        items = normalized.get(field_name)
+        if isinstance(items, list):
+            normalized[field_name] = [
+                _normalize_evidence_request_item(item) if isinstance(item, dict) else item
+                for item in items
+            ]
+    return normalized
+
+
+def _normalize_evidence_request_item(item: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(item)
+    evidence_type = str(normalized.get("evidence_type") or "")
+    canonical_type = _EVIDENCE_TYPE_ALIASES.get(evidence_type, evidence_type)
+    if canonical_type and canonical_type not in _CANONICAL_EVIDENCE_TYPES:
+        raise ValueError(f"unknown EvidenceRequest evidence_type: {evidence_type}")
+    normalized["evidence_type"] = canonical_type
+
+    tool_hint = str(normalized.get("tool_hint") or "")
+    source = str(normalized.get("source") or "")
+    if source not in _ALLOWED_SOURCES:
+        source = _TOOL_SOURCE_DEFAULTS.get(tool_hint, source)
+    if source not in _ALLOWED_SOURCES:
+        raise ValueError(f"unknown EvidenceRequest source: {normalized.get('source')}")
+    normalized["source"] = source
+    return normalized
 
 
 def stable_id(prefix: str, *parts: object) -> str:

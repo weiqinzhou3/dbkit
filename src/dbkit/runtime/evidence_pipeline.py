@@ -5,6 +5,7 @@ from typing import Any
 
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.collection_guardrails import CollectionGuardrails
+from dbkit.runtime.json_extraction import extract_json_from_invoke_result
 from dbkit.runtime.observability import TelemetryRecorder
 from dbkit.runtime.time_context import TimeProvider
 from dbkit.schemas.evidence import (
@@ -60,6 +61,44 @@ class EvidencePipeline:
         )
         if evidence_request_json is None:
             evidence_request_json = self._invoke_mysql_analyzer(request)
+        if evidence_request_json is None:
+            self.telemetry.emit(
+                event_type="evidence_request_parse_failed",
+                stage="evidence_planning",
+                message="MySQL analyzer did not return parseable EvidenceRequest JSON",
+                attributes={
+                    "request_id": request.request_id,
+                    "reason": "evidence_request_parse_failed",
+                },
+            )
+            failed_artifact = self.artifact_store.persist_evidence_request_failed(
+                request,
+                reason="evidence_request_parse_failed",
+            )
+            self.telemetry.emit(
+                event_type="artifact_written",
+                stage="artifacts",
+                message="Artifact written: EvidenceRequestFailed",
+                attributes={
+                    "request_id": request.request_id,
+                    "kind": "EvidenceRequestFailed",
+                    "path": str(failed_artifact.path),
+                },
+            )
+            telemetry_artifact = self.artifact_store.persist_collection_telemetry(
+                request.request_id, self.telemetry.events
+            )
+            return EvidencePipelineResult(
+                request_id=request.request_id,
+                phase="phase-02",
+                status="evidence_request_parse_failed",
+                evidence_request=None,
+                collection_plan=None,
+                raw_evidence=(),
+                artifacts=(failed_artifact, telemetry_artifact),
+                telemetry=tuple(self.telemetry.events),
+                blocking_issues=("evidence_request_parse_failed",),
+            )
         evidence_request = validate_evidence_request(evidence_request_json)
         self.telemetry.emit(
             event_type="evidence_planning_completed",
@@ -267,7 +306,7 @@ class EvidencePipeline:
             steps=tuple(steps),
         )
 
-    def _invoke_mysql_analyzer(self, request: NormalizedRequest) -> dict[str, Any]:
+    def _invoke_mysql_analyzer(self, request: NormalizedRequest) -> dict[str, Any] | None:
         if self.mysql_analyzer_runtime is None:
             raise RuntimeError("MySQL analyzer runtime is required for evidence planning")
         invoke = getattr(self.mysql_analyzer_runtime, "invoke", None)
@@ -294,10 +333,7 @@ class EvidencePipeline:
                 ],
             }
         )
-        parsed = _extract_assistant_json(result)
-        if parsed is None:
-            raise ValueError("MySQL analyzer did not return parseable EvidenceRequest JSON")
-        return parsed
+        return extract_json_from_invoke_result(result)
 
 
 def _source_paths_for_step(
@@ -328,31 +364,6 @@ def _secret_refs_for_step(
     target = request.target or {}
     password_ref = target.get("password_ref")
     return (str(password_ref),) if password_ref else ()
-
-
-def _extract_assistant_json(result: object) -> dict[str, Any] | None:
-    if not isinstance(result, dict):
-        return None
-    messages = result.get("messages") or []
-    for message in reversed(messages):
-        content = _message_content(message)
-        if not content:
-            continue
-        try:
-            import json
-
-            parsed = json.loads(content)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(parsed, dict):
-            return parsed
-    return None
-
-
-def _message_content(message: object) -> str:
-    if isinstance(message, dict):
-        return str(message.get("content") or "")
-    return str(getattr(message, "content", "") or "")
 
 
 def json_dumps(payload: dict[str, Any]) -> str:

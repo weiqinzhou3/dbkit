@@ -77,6 +77,28 @@ class ArtifactStore:
         )
         return ArtifactRecord(kind="EvidenceRequest", path=path)
 
+    def persist_evidence_request_failed(
+        self,
+        request: NormalizedRequest,
+        *,
+        reason: str,
+        details: list[str] | None = None,
+    ) -> ArtifactRecord:
+        path = self.root / f"{request.request_id}.evidence-request-failed.json"
+        payload: dict[str, Any] = {
+            "request_id": request.request_id,
+            "phase": "phase-02",
+            "status": "blocked",
+            "reason": reason,
+            "details": details or [],
+            "normalized_request": request.to_dict(),
+        }
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return ArtifactRecord(kind="EvidenceRequestFailed", path=path)
+
     def persist_collection_plan(self, plan: CollectionPlan) -> ArtifactRecord:
         path = self.root / f"{plan.request_id}.collection-plan.json"
         path.write_text(

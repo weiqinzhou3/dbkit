@@ -99,7 +99,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     ).run(result.normalized_request)
 
     print("phase=phase-02")
-    print(f"status={evidence_result.status}")
+    if evidence_result.status == "evidence_request_parse_failed":
+        print("status=blocked")
+        print("reason=evidence_request_parse_failed")
+    else:
+        print(f"status={evidence_result.status}")
     print(f"input_mode={result.normalized_request.input_mode}")
     print(f"raw_evidence_count={len(evidence_result.raw_evidence)}")
     index_artifacts = [
@@ -110,7 +114,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"artifact={index_artifacts[0].path}")
     elif evidence_result.artifacts:
         print(f"artifact={evidence_result.artifacts[-1].path}")
-    if evidence_result.status == "collection_blocked":
+    if evidence_result.status in {"collection_blocked", "evidence_request_parse_failed"}:
         return 1
     return 0
 
