@@ -395,16 +395,14 @@ class Phase02EvidencePlanningCollectionTest(unittest.TestCase):
             result = EvidencePipeline(
                 artifact_store=ArtifactStore(root / "artifacts"),
                 telemetry=TelemetryRecorder(),
-                collectors=CollectorRegistry(workspace_root=root / "workspace"),
+                collectors=CollectorRegistry(
+                    workspace_root=root / "workspace",
+                    mysql_client_factory=lambda _request, _secrets: FailingMySQLClient(),
+                ),
                 time_provider=_fixed_time_provider(),
             ).run(
                 normalized,
-                evidence_request_json=_evidence_request_payload(
-                    normalized,
-                    tool_hint="collect_mysql_runtime_status",
-                    evidence_type="mysql.runtime_status",
-                    source="mysql",
-                ),
+                evidence_request_json=_mysql_baseline_evidence_request_payload(normalized),
             )
 
             self.assertEqual(result.status, "collection_failed")
@@ -533,6 +531,38 @@ def _evidence_request_payload(
             "mode": "evidence_planning",
         },
     }
+
+
+def _mysql_baseline_evidence_request_payload(normalized) -> dict:
+    payload = _evidence_request_payload(
+        normalized,
+        tool_hint="collect_mysql_processlist",
+        evidence_type="mysql.processlist",
+        source="mysql",
+    )
+    payload["evidence_request"]["required_evidence"] = [
+        {
+            "evidence_type": evidence_type,
+            "priority": "required",
+            "purpose": "collect raw operational evidence",
+            "source": "mysql",
+            "tool_hint": tool_hint,
+        }
+        for tool_hint, evidence_type in (
+            ("collect_mysql_processlist", "mysql.processlist"),
+            ("collect_mysql_runtime_status", "mysql.runtime_status"),
+            ("collect_mysql_innodb_status", "mysql.innodb_status"),
+            ("collect_mysql_variables", "mysql.variables"),
+            ("collect_mysql_service_metadata", "mysql.service_metadata"),
+            ("discover_mysql_log_paths", "mysql.log_paths"),
+        )
+    ]
+    return payload
+
+
+class FailingMySQLClient:
+    def execute(self, sql: str) -> list[dict]:
+        raise RuntimeError("connection refused")
 
 
 def _fixed_time_provider() -> FixedTimeProvider:

@@ -28,6 +28,8 @@ _MYSQL_LOGIN_TOOLS = frozenset(
 _SSH_TOOLS = frozenset(
     {
         "read_remote_file",
+        "collect_mysql_error_log",
+        "collect_mysql_slow_log",
         "collect_os_service_status",
         "collect_os_cpu_snapshot",
         "collect_os_memory_snapshot",

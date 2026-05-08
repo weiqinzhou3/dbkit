@@ -26,6 +26,15 @@ from dbkit.schemas.evidence import (
 from dbkit.schemas.runtime import NormalizedRequest
 from dbkit.tools.collectors import CollectorRegistry
 
+_MYSQL_BASELINE_TOOL_HINTS = (
+    "collect_mysql_processlist",
+    "collect_mysql_runtime_status",
+    "collect_mysql_innodb_status",
+    "collect_mysql_variables",
+    "collect_mysql_service_metadata",
+    "discover_mysql_log_paths",
+)
+
 
 @dataclass
 class EvidencePipeline:
@@ -124,6 +133,46 @@ class EvidencePipeline:
         evidence_artifact = self.artifact_store.persist_evidence_request(
             evidence_request
         )
+        revision_used = False
+
+        contract_issues = self._evidence_request_contract_issues(
+            evidence_request, request
+        )
+        if contract_issues:
+            self.telemetry.emit(
+                event_type="evidence_request_contract_failed",
+                stage="evidence_planning",
+                message="Evidence request contract failed",
+                attributes={
+                    "request_id": request.request_id,
+                    "blocking_issues": list(contract_issues),
+                },
+            )
+            revised = self._revise_evidence_request(
+                request=request,
+                evidence_request=evidence_request,
+                blocking_issues=contract_issues,
+            )
+            if revised is not None:
+                revision_used = True
+                evidence_request = revised
+                evidence_artifact = self.artifact_store.persist_evidence_request(
+                    evidence_request
+                )
+                contract_issues = self._evidence_request_contract_issues(
+                    evidence_request, request
+                )
+            if contract_issues:
+                plan = self.create_collection_plan(evidence_request, request)
+                return self._blocked_collection_result(
+                    request=request,
+                    evidence_request=evidence_request,
+                    evidence_artifact=evidence_artifact,
+                    plan=plan,
+                    blocking_issues=contract_issues,
+                    event_type="evidence_request_contract_blocked",
+                    message="Evidence request contract blocked collection",
+                )
 
         plan = self.create_collection_plan(evidence_request, request)
         self.telemetry.emit(
@@ -143,8 +192,12 @@ class EvidencePipeline:
             attributes={"request_id": request.request_id},
         )
         guardrails_result = self.guardrails.validate(plan, request)
-        if not guardrails_result.passed and self._should_revise_evidence_request(
-            guardrails_result.blocking_issues
+        if (
+            not guardrails_result.passed
+            and not revision_used
+            and self._should_revise_evidence_request(
+                guardrails_result.blocking_issues
+            )
         ):
             revised = self._revise_evidence_request(
                 request=request,
@@ -152,10 +205,25 @@ class EvidencePipeline:
                 blocking_issues=guardrails_result.blocking_issues,
             )
             if revised is not None:
+                revision_used = True
                 evidence_request = revised
                 evidence_artifact = self.artifact_store.persist_evidence_request(
                     evidence_request
                 )
+                contract_issues = self._evidence_request_contract_issues(
+                    evidence_request, request
+                )
+                if contract_issues:
+                    plan = self.create_collection_plan(evidence_request, request)
+                    return self._blocked_collection_result(
+                        request=request,
+                        evidence_request=evidence_request,
+                        evidence_artifact=evidence_artifact,
+                        plan=plan,
+                        blocking_issues=contract_issues,
+                        event_type="evidence_request_contract_blocked",
+                        message="Revised evidence request contract blocked collection",
+                    )
                 plan = self.create_collection_plan(evidence_request, request)
                 self.telemetry.emit(
                     event_type="collection_plan_created",
@@ -176,37 +244,14 @@ class EvidencePipeline:
                 )
                 guardrails_result = self.guardrails.validate(plan, request)
         if not guardrails_result.passed:
-            self.telemetry.emit(
-                event_type="collection_guardrails_blocked",
-                stage="collection_guardrails",
-                message="Collection guardrails blocked",
-                attributes={
-                    "request_id": request.request_id,
-                    "blocking_issues": list(guardrails_result.blocking_issues),
-                },
-            )
-            blocked_plan = CollectionPlan(
-                request_id=plan.request_id,
-                collection_plan_id=plan.collection_plan_id,
-                phase=plan.phase,
-                input_mode=plan.input_mode,
-                steps=plan.steps,
-                guardrails_status="blocked",
-            )
-            plan_artifact = self.artifact_store.persist_collection_plan(blocked_plan)
-            telemetry_artifact = self.artifact_store.persist_collection_telemetry(
-                request.request_id, self.telemetry.events
-            )
-            return EvidencePipelineResult(
-                request_id=request.request_id,
-                phase=request.phase if request.phase.startswith("phase-02.1") else "phase-02",
-                status="collection_blocked",
+            return self._blocked_collection_result(
+                request=request,
                 evidence_request=evidence_request,
-                collection_plan=blocked_plan,
-                raw_evidence=(),
-                artifacts=(evidence_artifact, plan_artifact, telemetry_artifact),
-                telemetry=tuple(self.telemetry.events),
+                evidence_artifact=evidence_artifact,
+                plan=plan,
                 blocking_issues=guardrails_result.blocking_issues,
+                event_type="collection_guardrails_blocked",
+                message="Collection guardrails blocked",
             )
 
         plan = CollectionPlan(
@@ -383,8 +428,12 @@ class EvidencePipeline:
         request: NormalizedRequest,
     ) -> CollectionPlan:
         steps: list[CollectionStep] = []
-        required = evidence_request.evidence_request.get("required_evidence") or []
-        for item in required:
+        evidence_items = []
+        for field_name in ("required_evidence", "optional_evidence"):
+            values = evidence_request.evidence_request.get(field_name) or []
+            if isinstance(values, list):
+                evidence_items.extend(values)
+        for item in evidence_items:
             if not isinstance(item, dict):
                 continue
             tool_name = str(item.get("tool_hint") or "")
@@ -444,6 +493,50 @@ class EvidencePipeline:
         )
         return extract_json_from_invoke_result(result)
 
+    def _blocked_collection_result(
+        self,
+        *,
+        request: NormalizedRequest,
+        evidence_request: EvidenceRequest,
+        evidence_artifact: Any,
+        plan: CollectionPlan,
+        blocking_issues: tuple[str, ...],
+        event_type: str,
+        message: str,
+    ) -> EvidencePipelineResult:
+        self.telemetry.emit(
+            event_type=event_type,
+            stage="collection_guardrails",
+            message=message,
+            attributes={
+                "request_id": request.request_id,
+                "blocking_issues": list(blocking_issues),
+            },
+        )
+        blocked_plan = CollectionPlan(
+            request_id=plan.request_id,
+            collection_plan_id=plan.collection_plan_id,
+            phase=plan.phase,
+            input_mode=plan.input_mode,
+            steps=plan.steps,
+            guardrails_status="blocked",
+        )
+        plan_artifact = self.artifact_store.persist_collection_plan(blocked_plan)
+        telemetry_artifact = self.artifact_store.persist_collection_telemetry(
+            request.request_id, self.telemetry.events
+        )
+        return EvidencePipelineResult(
+            request_id=request.request_id,
+            phase=request.phase if request.phase.startswith("phase-02.1") else "phase-02",
+            status="collection_blocked",
+            evidence_request=evidence_request,
+            collection_plan=blocked_plan,
+            raw_evidence=(),
+            artifacts=(evidence_artifact, plan_artifact, telemetry_artifact),
+            telemetry=tuple(self.telemetry.events),
+            blocking_issues=blocking_issues,
+        )
+
     def _revise_evidence_request(
         self,
         *,
@@ -473,9 +566,11 @@ class EvidencePipeline:
             "previous_evidence_request": evidence_request.to_dict(),
             "blocking_issues": list(blocking_issues),
             "instruction": (
-                "Output revised DBKit EvidenceRequest JSON only. Remove tools "
-                "blocked by collection_policy. Do not add collection tools that "
-                "are not permitted by the collection_policy."
+                "Output revised DBKit EvidenceRequest JSON only. Fix the listed "
+                "blocking issues. Add missing MySQL baseline evidence when the "
+                "baseline policy requires it. Remove tools blocked by "
+                "collection_policy. Do not add collection tools that are not "
+                "permitted by the collection_policy."
             ),
         }
         result = invoke(
@@ -534,6 +629,38 @@ class EvidencePipeline:
             for issue in blocking_issues
         )
 
+    @staticmethod
+    def _evidence_request_contract_issues(
+        evidence_request: EvidenceRequest,
+        request: NormalizedRequest,
+    ) -> tuple[str, ...]:
+        issues: list[str] = []
+        items = _collection_plan_source_items(evidence_request)
+        for field_name, index, item in items:
+            if not str(item.get("tool_hint") or "").strip():
+                issues.append(f"evidence item missing tool_hint: {field_name}[{index}]")
+
+        policy = request.collection_policy or {}
+        if (
+            request.target_domain == "mysql"
+            and request.input_mode in {"live_collection", "hybrid"}
+            and bool(policy.get("allow_mysql_login"))
+        ):
+            tool_hints = {
+                str(item.get("tool_hint") or "")
+                for _, _, item in items
+                if isinstance(item, dict)
+            }
+            missing = [
+                tool_hint
+                for tool_hint in _MYSQL_BASELINE_TOOL_HINTS
+                if tool_hint not in tool_hints
+            ]
+            if missing:
+                issues.append("missing MySQL baseline evidence: " + ", ".join(missing))
+
+        return tuple(dict.fromkeys(issues))
+
     def _missing_collection_dependencies(
         self,
         plan: CollectionPlan,
@@ -555,6 +682,20 @@ def _source_paths_for_step(
     return [str(path) for path in files if str(path).strip()]
 
 
+def _collection_plan_source_items(
+    evidence_request: EvidenceRequest,
+) -> list[tuple[str, int, dict[str, Any]]]:
+    items: list[tuple[str, int, dict[str, Any]]] = []
+    for field_name in ("required_evidence", "optional_evidence"):
+        values = evidence_request.evidence_request.get(field_name) or []
+        if not isinstance(values, list):
+            continue
+        for index, item in enumerate(values):
+            if isinstance(item, dict):
+                items.append((field_name, index, item))
+    return items
+
+
 def _target_ref(source: str, tool_name: str) -> str:
     if tool_name in {"read_provided_evidence_file", "read_provided_evidence_directory"}:
         return "provided_evidence"
@@ -569,6 +710,15 @@ def _secret_refs_for_step(
 ) -> tuple[str, ...]:
     if tool_name.startswith("read_provided_evidence_"):
         return ()
+    if tool_name in {"collect_mysql_error_log", "collect_mysql_slow_log"}:
+        refs = []
+        mysql_ref = (request.target or {}).get("password_ref")
+        ssh_ref = (request.ssh_target or {}).get("password_ref")
+        if mysql_ref:
+            refs.append(str(mysql_ref))
+        if ssh_ref:
+            refs.append(str(ssh_ref))
+        return tuple(refs)
     if tool_name.startswith("collect_os_") or tool_name == "read_remote_file":
         target = request.ssh_target or {}
     else:

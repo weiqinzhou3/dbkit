@@ -13,7 +13,7 @@ from dbkit.runtime.evidence_pipeline import EvidencePipeline
 from dbkit.runtime.redactor import Redactor
 from dbkit.runtime.secret_store import SecretStore
 from dbkit.runtime.time_context import FixedTimeProvider
-from dbkit.schemas.evidence import CollectionStep
+from dbkit.schemas.evidence import CollectionStep, RawEvidence
 from dbkit.tools.collectors import CollectorRegistry
 from dbkit.tools.normalize_request import normalize_request
 
@@ -36,7 +36,7 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
         evidence_request_json = _evidence_request(
             request,
             [
-                ("collect_mysql_runtime_status", "mysql.runtime_status", "mysql"),
+                *_baseline_tools(),
                 ("collect_os_cpu_snapshot", "metrics.cpu", "ssh"),
             ],
         )
@@ -69,9 +69,135 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
         skill_text = Path("skills/mysql-analyzer/SKILL.md").read_text(encoding="utf-8")
 
         self.assertIn("Available Collector Tools", skill_text)
+        self.assertIn("MySQL Baseline Evidence Policy", skill_text)
         self.assertIn("mysql.runtime_status -> collect_mysql_runtime_status", skill_text)
         self.assertIn("metrics.cpu -> collect_os_cpu_snapshot", skill_text)
         self.assertIn("Requires collection_policy.allow_ssh=true", skill_text)
+
+    def test_mysql_plus_ssh_missing_baseline_triggers_revision_and_preserves_baseline(self) -> None:
+        request = _live_request(with_ssh=True)
+        fake_mysql = FakeMySQLClient(_baseline_mysql_results())
+        fake_ssh = FakeSSHClient(
+            {
+                ("tail", 5000, "/var/log/mysql/error.log"): "error line\n",
+                ("tail", 5000, "/var/log/mysql/slow.log"): "slow line\n",
+                ("exec", "uptime"): "load average: 0.10\n",
+                ("exec", "top -b -n 1 | head -50"): "top output\n",
+                ("exec", "vmstat 1 3"): "vmstat output\n",
+            }
+        )
+        analyzer = RevisionAnalyzerRuntime(
+            first_payload=_evidence_request(
+                request,
+                [
+                    ("collect_mysql_processlist", "mysql.processlist", "mysql"),
+                    ("collect_mysql_runtime_status", "mysql.runtime_status", "mysql"),
+                    ("collect_mysql_innodb_status", "mysql.innodb_status", "mysql"),
+                    ("collect_mysql_error_log", "mysql.error_log", "ssh"),
+                    ("collect_mysql_slow_log", "mysql.slow_log", "ssh"),
+                    ("collect_os_cpu_snapshot", "metrics.os_cpu", "ssh"),
+                ],
+            ),
+            second_payload=_evidence_request(
+                request,
+                [
+                    *_baseline_tools(),
+                    ("collect_mysql_error_log", "mysql.error_log", "ssh"),
+                    ("collect_mysql_slow_log", "mysql.slow_log", "ssh"),
+                    ("collect_os_cpu_snapshot", "metrics.os_cpu", "ssh"),
+                ],
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = EvidencePipeline(
+                artifact_store=ArtifactStore(root / "artifacts"),
+                telemetry=_telemetry(),
+                collectors=CollectorRegistry(
+                    workspace_root=root / "workspace",
+                    mysql_client_factory=lambda _request, _secrets: fake_mysql,
+                    ssh_client_factory=lambda _request, _secrets: fake_ssh,
+                    secret_store=SecretStore(
+                        {
+                            "<SECRET_REF:mysql_password_001>": "Root",
+                            "<SECRET_REF:ssh_password_001>": "Root",
+                        }
+                    ),
+                ),
+                time_provider=_time_provider(),
+                mysql_analyzer_runtime=analyzer,
+            ).run(request)
+
+        self.assertEqual(analyzer.modes, ["evidence_planning", "evidence_planning_revision"])
+        self.assertEqual(result.status, "raw_evidence_collected")
+        evidence_types = [item.evidence_type for item in result.raw_evidence]
+        for expected in (
+            "mysql.processlist",
+            "mysql.runtime_status",
+            "mysql.innodb_status",
+            "mysql.variables",
+            "mysql.service_metadata",
+            "mysql.log_paths",
+            "mysql.error_log",
+            "mysql.slow_log",
+            "metrics.os_cpu",
+        ):
+            self.assertIn(expected, evidence_types)
+
+    def test_missing_baseline_without_revision_blocks_without_runtime_injection(self) -> None:
+        request = _live_request(with_ssh=True)
+        collectors = CountingCollectorRegistry(workspace_root=Path("/tmp/workspace"))
+        evidence_request_json = _evidence_request(
+            request,
+            [
+                ("collect_mysql_processlist", "mysql.processlist", "mysql"),
+                ("collect_mysql_runtime_status", "mysql.runtime_status", "mysql"),
+                ("collect_mysql_error_log", "mysql.error_log", "ssh"),
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = EvidencePipeline(
+                artifact_store=ArtifactStore(root / "artifacts"),
+                telemetry=_telemetry(),
+                collectors=collectors,
+                time_provider=_time_provider(),
+            ).run(request, evidence_request_json=evidence_request_json)
+
+        self.assertEqual(collectors.calls, 0)
+        self.assertEqual(result.status, "collection_blocked")
+        self.assertTrue(
+            any("missing MySQL baseline evidence" in issue for issue in result.blocking_issues)
+        )
+        self.assertEqual(
+            [step.tool_name for step in result.collection_plan.steps],
+            [
+                "collect_mysql_processlist",
+                "collect_mysql_runtime_status",
+                "collect_mysql_error_log",
+            ],
+        )
+
+    def test_collection_plan_uses_required_and_optional_tool_hints_only(self) -> None:
+        request = _live_request()
+        payload = _evidence_request(
+            request,
+            [("collect_mysql_runtime_status", "mysql.runtime_status", "mysql")],
+            optional_tools=[("collect_mysql_processlist", "mysql.processlist", "mysql")],
+        )
+
+        from dbkit.schemas.evidence import validate_evidence_request
+
+        plan = EvidencePipeline.create_collection_plan(
+            validate_evidence_request(payload), request
+        )
+
+        self.assertEqual(
+            [step.tool_name for step in plan.steps],
+            ["collect_mysql_runtime_status", "collect_mysql_processlist"],
+        )
 
     def test_guardrail_blocked_ssh_tools_trigger_one_evidence_request_revision(self) -> None:
         request = _live_request(with_ssh=False)
@@ -81,6 +207,17 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
                 "SHOW GLOBAL STATUS": [{"Variable_name": "Threads_running", "Value": "3"}],
                 "SHOW ENGINE INNODB STATUS": [{"Status": "ok"}],
                 "SHOW GLOBAL VARIABLES": [{"Variable_name": "max_connections", "Value": "151"}],
+                "SELECT VERSION()": [{"VERSION()": "8.0.36"}],
+                "SELECT @@hostname, @@port, @@datadir, @@log_error, @@slow_query_log_file": [
+                    {
+                        "@@hostname": "mysql-01",
+                        "@@port": 3306,
+                        "@@datadir": "/var/lib/mysql",
+                        "@@log_error": "/var/log/mysql/error.log",
+                        "@@slow_query_log_file": "/var/log/mysql/slow.log",
+                    }
+                ],
+                **_log_variables(),
             }
         )
         analyzer = RevisionAnalyzerRuntime(
@@ -94,12 +231,7 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
             ),
             second_payload=_evidence_request(
                 request,
-                [
-                    ("collect_mysql_processlist", "mysql.processlist", "mysql"),
-                    ("collect_mysql_runtime_status", "mysql.runtime_status", "mysql"),
-                    ("collect_mysql_innodb_status", "mysql.innodb_status", "mysql"),
-                    ("collect_mysql_variables", "mysql.variables", "mysql"),
-                ],
+                _baseline_tools(),
             ),
         )
 
@@ -119,7 +251,7 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
 
         self.assertEqual(analyzer.modes, ["evidence_planning", "evidence_planning_revision"])
         self.assertEqual(result.status, "raw_evidence_collected")
-        self.assertEqual(len(result.raw_evidence), 4)
+        self.assertEqual(len(result.raw_evidence), 6)
         self.assertNotIn(
             "collect_os_cpu_snapshot",
             [step.tool_name for step in result.collection_plan.steps],
@@ -328,17 +460,14 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
         self.assertFalse(is_ssh_command_allowed("systemctl restart mysqld"))
 
     def test_raw_evidence_index_includes_summary_and_pipeline_status_warnings(self) -> None:
-        request = _live_request()
+        request = _live_request(with_ssh=True)
         evidence_request_json = _evidence_request(
             request,
-            [
-                ("collect_mysql_runtime_status", "mysql.runtime_status"),
-                ("collect_mysql_slow_log", "mysql.slow_log"),
-            ],
+            [*_baseline_tools(), ("collect_mysql_slow_log", "mysql.slow_log", "ssh")],
         )
         fake_mysql = FakeMySQLClient(
             {
-                "SHOW GLOBAL STATUS": [{"Variable_name": "Threads_running", "Value": "3"}],
+                **_baseline_mysql_results(),
                 **_log_variables(slow_enabled=False),
             }
         )
@@ -351,7 +480,12 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
                 collectors=CollectorRegistry(
                     workspace_root=root / "workspace",
                     mysql_client_factory=lambda _request, _secrets: fake_mysql,
-                    secret_store=SecretStore({"<SECRET_REF:mysql_password_001>": "Root"}),
+                    secret_store=SecretStore(
+                        {
+                            "<SECRET_REF:mysql_password_001>": "Root",
+                            "<SECRET_REF:ssh_password_001>": "Root",
+                        }
+                    ),
                 ),
                 time_provider=_time_provider(),
             ).run(request, evidence_request_json=evidence_request_json)
@@ -361,15 +495,47 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
 
         self.assertEqual(result.phase, "phase-02.1")
         self.assertEqual(result.status, "collection_completed_with_warnings")
-        self.assertEqual(payload["collected_count"], 1)
+        self.assertEqual(payload["collected_count"], 6)
         self.assertEqual(payload["not_available_count"], 1)
         self.assertEqual(payload["not_implemented_count"], 0)
+
+    def test_large_payload_data_rows_do_not_enter_raw_evidence_index(self) -> None:
+        raw = RawEvidence(
+            raw_evidence_id="rawev_large",
+            request_id="req_large",
+            evidence_type="mysql.runtime_status",
+            source={"kind": "mysql", "tool_name": "collect_mysql_runtime_status"},
+            collection={"status": "collected", "errors": []},
+            payload={
+                "content_ref": "/tmp/raw/rawev_large.json",
+                "bytes": 2048,
+                "line_count": 200,
+                "data": {
+                    "sql": "SHOW GLOBAL STATUS",
+                    "rows": [
+                        {"Variable_name": f"Status_{index}", "Value": str(index)}
+                        for index in range(100)
+                    ],
+                },
+            },
+            metadata={"time_window": {"before": "6h", "after": "1h"}},
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = ArtifactStore(Path(tmpdir) / "artifacts")
+            artifact = store.persist_raw_evidence_index("req_large", (raw,))
+            index = json.loads(artifact.path.read_text(encoding="utf-8"))
+
+        index_item = index["raw_evidence"][0]
+        self.assertNotIn("data", index_item["payload"])
+        self.assertEqual(index_item["payload"]["bytes"], 2048)
+        self.assertEqual(index_item["preview"]["rows_count"], 100)
 
     def test_collection_failed_when_all_collectors_fail(self) -> None:
         request = _live_request()
         evidence_request_json = _evidence_request(
             request,
-            [("collect_mysql_runtime_status", "mysql.runtime_status")],
+            _baseline_tools(),
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -494,7 +660,22 @@ def _step(index: int, tool_name: str, evidence_type: str) -> CollectionStep:
     )
 
 
-def _evidence_request(request, tools: list[tuple[str, str] | tuple[str, str, str]]) -> dict:
+def _evidence_request(
+    request,
+    tools: list[tuple[str, str] | tuple[str, str, str]],
+    *,
+    optional_tools: list[tuple[str, str] | tuple[str, str, str]] | None = None,
+) -> dict:
+    def _item(item):
+        tool_name, evidence_type, *source = item
+        return {
+            "evidence_type": evidence_type,
+            "priority": "required",
+            "purpose": "collect evidence",
+            "source": source[0] if source else "mysql",
+            "tool_hint": tool_name,
+        }
+
     return {
         "request_id": request.request_id,
         "phase": "phase-02",
@@ -505,23 +686,44 @@ def _evidence_request(request, tools: list[tuple[str, str] | tuple[str, str, str
         "reasoning_mode": "evidence_planning",
         "evidence_request": {
             "goal": "collect real MySQL evidence",
-            "required_evidence": [
-                {
-                    "evidence_type": evidence_type,
-                    "priority": "required",
-                    "purpose": "collect evidence",
-                    "source": source[0] if source else "mysql",
-                    "tool_hint": tool_name,
-                }
-                for item in tools
-                for tool_name, evidence_type, *source in [item]
-            ],
-            "optional_evidence": [],
+            "required_evidence": [_item(item) for item in tools],
+            "optional_evidence": [_item(item) for item in optional_tools or []],
             "not_required_evidence": [],
             "missing_inputs": [],
             "approval_requirements": [],
         },
         "metadata": {"mode": "evidence_planning"},
+    }
+
+
+def _baseline_tools() -> list[tuple[str, str, str]]:
+    return [
+        ("collect_mysql_processlist", "mysql.processlist", "mysql"),
+        ("collect_mysql_runtime_status", "mysql.runtime_status", "mysql"),
+        ("collect_mysql_innodb_status", "mysql.innodb_status", "mysql"),
+        ("collect_mysql_variables", "mysql.variables", "mysql"),
+        ("collect_mysql_service_metadata", "mysql.service_metadata", "mysql"),
+        ("discover_mysql_log_paths", "mysql.log_paths", "mysql"),
+    ]
+
+
+def _baseline_mysql_results() -> dict[str, list[dict]]:
+    return {
+        "SHOW FULL PROCESSLIST": [{"Id": 1}],
+        "SHOW GLOBAL STATUS": [{"Variable_name": "Threads_running", "Value": "3"}],
+        "SHOW ENGINE INNODB STATUS": [{"Status": "ok"}],
+        "SHOW GLOBAL VARIABLES": [{"Variable_name": "max_connections", "Value": "151"}],
+        "SELECT VERSION()": [{"VERSION()": "8.0.36"}],
+        "SELECT @@hostname, @@port, @@datadir, @@log_error, @@slow_query_log_file": [
+            {
+                "@@hostname": "mysql-01",
+                "@@port": 3306,
+                "@@datadir": "/var/lib/mysql",
+                "@@log_error": "/var/log/mysql/error.log",
+                "@@slow_query_log_file": "/var/log/mysql/slow.log",
+            }
+        ],
+        **_log_variables(),
     }
 
 

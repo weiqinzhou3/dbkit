@@ -172,6 +172,23 @@ When SSH is not allowed, prefer MySQL-native collectors:
 - `collect_mysql_service_metadata`
 - `collect_mysql_metrics_snapshot`
 
+## MySQL Baseline Evidence Policy
+
+For any MySQL `live_collection` or `hybrid` request where
+`collection_policy.allow_mysql_login=true`, EvidenceRequest must include these
+baseline MySQL evidence items:
+
+- `mysql.processlist -> collect_mysql_processlist`
+- `mysql.runtime_status -> collect_mysql_runtime_status`
+- `mysql.innodb_status -> collect_mysql_innodb_status`
+- `mysql.variables -> collect_mysql_variables`
+- `mysql.service_metadata -> collect_mysql_service_metadata`
+- `mysql.log_paths -> discover_mysql_log_paths`
+
+If `collection_policy.allow_ssh=true`, add SSH/log/OS evidence on top of this
+baseline. Do not replace, omit, or downgrade baseline evidence because SSH,
+log, or OS evidence is available.
+
 ## Input Mode Guidance
 
 For `provided_evidence`, prefer file readers:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dbkit.runtime.collection_guardrails import is_mysql_sql_allowed
 from dbkit.schemas.evidence import CollectionStep, RawEvidence
@@ -66,6 +66,7 @@ def collect_mysql_log_file(
     raw_root: Path,
     mysql_client: MySQLClient,
     ssh_client: Any | None,
+    ssh_client_factory: Callable[[], Any | None] | None,
     started_at: str,
     completed_at: str,
     tail_lines: int = 5000,
@@ -86,6 +87,8 @@ def collect_mysql_log_file(
                 reason=unavailable,
             )
         path = str(discovery[f"{log_kind}_log_path"])
+        if ssh_client is None and ssh_client_factory is not None:
+            ssh_client = ssh_client_factory()
         if ssh_client is None:
             return error_raw_evidence(
                 step=step,

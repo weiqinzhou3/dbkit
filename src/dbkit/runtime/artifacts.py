@@ -144,14 +144,23 @@ class ArtifactStore:
         payload: dict[str, Any] = {
             "request_id": request_id,
             "phase": phase,
-            "raw_evidence": [item.to_dict() for item in raw_evidence],
+            "raw_evidence": [_raw_evidence_index_entry(item) for item in raw_evidence],
             **collection_summary(raw_evidence),
         }
         raw_dir = self.root / "raw"
         raw_dir.mkdir(parents=True, exist_ok=True)
         for item in raw_evidence:
-            (raw_dir / f"{item.raw_evidence_id}.json").write_text(
-                json.dumps(item.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+            content_ref = item.payload.get("content_ref")
+            if content_ref and Path(str(content_ref)).exists():
+                continue
+            raw_path = raw_dir / f"{item.raw_evidence_id}.json"
+            raw_path.write_text(
+                json.dumps(
+                    item.to_dict(),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
                 encoding="utf-8",
             )
         path.write_text(
@@ -172,3 +181,87 @@ class ArtifactStore:
         ]
         path.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
         return ArtifactRecord(kind="CollectionTelemetry", path=path)
+
+
+def _raw_evidence_index_entry(item: RawEvidence) -> dict[str, Any]:
+    payload = {
+        key: item.payload.get(key)
+        for key in ("content_ref", "bytes", "line_count")
+        if key in item.payload
+    }
+    collection = {
+        key: item.collection.get(key)
+        for key in ("status", "errors", "reason", "duration_ms")
+        if key in item.collection
+    }
+    entry: dict[str, Any] = {
+        "raw_evidence_id": item.raw_evidence_id,
+        "request_id": item.request_id,
+        "evidence_type": item.evidence_type,
+        "source": item.source,
+        "collection": collection,
+        "payload": payload,
+        "metadata": item.metadata,
+    }
+    preview = _payload_preview(item.payload)
+    if preview:
+        entry["preview"] = preview
+    return entry
+
+
+def _payload_preview(payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return {}
+
+    if isinstance(data.get("rows"), list):
+        rows = data["rows"]
+        return {
+            "rows_count": len(rows),
+            "first_n_keys": _first_keys(rows),
+        }
+
+    if isinstance(data.get("queries"), list):
+        queries = data["queries"]
+        rows_count = 0
+        query_count = 0
+        for query in queries:
+            if not isinstance(query, dict):
+                continue
+            query_count += 1
+            rows = query.get("rows")
+            if isinstance(rows, list):
+                rows_count += len(rows)
+        return {
+            "queries_count": query_count,
+            "rows_count": rows_count,
+            "first_n_keys": _first_keys(
+                [
+                    row
+                    for query in queries
+                    if isinstance(query, dict)
+                    for row in (query.get("rows") or [])
+                    if isinstance(row, dict)
+                ]
+            ),
+        }
+
+    return {
+        key: data[key]
+        for key in (
+            "error_log_path",
+            "slow_log_path",
+            "slow_query_log_enabled",
+            "log_output",
+            "datadir",
+            "reason",
+        )
+        if key in data
+    }
+
+
+def _first_keys(rows: list[Any], limit: int = 5) -> list[str]:
+    for row in rows:
+        if isinstance(row, dict):
+            return list(row.keys())[:limit]
+    return []
