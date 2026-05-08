@@ -10,6 +10,7 @@ from dbkit.model_provider import build_agent_model
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.deepagents_runtime import DeepAgentsRuntimeFactory
 from dbkit.runtime.evidence_pipeline import EvidencePipeline
+from dbkit.runtime.evidence_structuring import EvidenceStructuringPipeline
 from dbkit.runtime.guardrails import Guardrails
 from dbkit.runtime.observability import TelemetryRecorder
 from dbkit.runtime.orchestrator import Orchestrator
@@ -20,8 +21,31 @@ from dbkit.tools.collectors import CollectorRegistry
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(argv or [])
-    config_path, interactive_flag, prompt_args = _parse_args(args)
+    config_path, interactive_flag, raw_evidence_index_path, prompt_args = _parse_args(args)
     config = load_app_config(config_path)
+    if raw_evidence_index_path is not None:
+        result = EvidenceStructuringPipeline(
+            artifact_store=ArtifactStore(config.runtime.artifact_dir),
+            telemetry=TelemetryRecorder(),
+        ).run(raw_evidence_index_path)
+        print(f"DBKit {__version__}")
+        print(f"phase={result.phase}")
+        print(f"status={result.status}")
+        if result.bundle is not None:
+            print(f"evidence_items={len(result.bundle.evidence_items)}")
+            print(
+                "unavailable_evidence="
+                f"{len(result.bundle.coverage.get('unavailable_evidence') or [])}"
+            )
+            print(f"quality={result.bundle.quality.get('overall_status')}")
+        if result.bundle_artifact is not None:
+            print(f"artifact={result.bundle_artifact.path}")
+        elif result.artifacts:
+            print(f"artifact={result.artifacts[-1].path}")
+        if result.blocking_issues:
+            print(f"blocking_issues={';'.join(result.blocking_issues)}")
+        return 0 if result.status == "evidence_bundle_created" else 1
+
     user_input = (
         " ".join(prompt_args) if prompt_args else "MySQL runtime intake smoke test"
     )
@@ -157,9 +181,10 @@ def _collection_summary(raw_evidence) -> dict[str, int]:
     return collection_summary(tuple(raw_evidence))
 
 
-def _parse_args(args: list[str]) -> tuple[Path, bool, list[str]]:
+def _parse_args(args: list[str]) -> tuple[Path, bool, Path | None, list[str]]:
     config_path = DEFAULT_CONFIG_PATH
     interactive = False
+    raw_evidence_index_path: Path | None = None
     prompt_args: list[str] = []
     index = 0
     while index < len(args):
@@ -172,10 +197,15 @@ def _parse_args(args: list[str]) -> tuple[Path, bool, list[str]]:
         elif arg == "--interactive":
             interactive = True
             index += 1
+        elif arg == "--from-raw-evidence":
+            if index + 1 >= len(args):
+                raise ValueError("--from-raw-evidence requires a path")
+            raw_evidence_index_path = Path(args[index + 1])
+            index += 2
         else:
             prompt_args.extend(args[index:])
             break
-    return config_path, interactive, prompt_args
+    return config_path, interactive, raw_evidence_index_path, prompt_args
 
 
 def _read_supplement(rendered_user_message: str) -> str:
