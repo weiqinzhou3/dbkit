@@ -175,6 +175,10 @@ def _detect_missing_fields(
     missing: list[str] = []
 
     for field in llm_missing_fields:
+        if field.startswith("runtime_context."):
+            continue
+        if field == "event.event_time" and event and event.get("event_time"):
+            continue
         if _missing_field_allowed_for_mode(field, input_mode, collection_policy):
             missing.append(field)
 
@@ -209,6 +213,8 @@ def _missing_field_allowed_for_mode(
     input_mode: str,
     collection_policy: dict[str, bool],
 ) -> bool:
+    if field.startswith("runtime_context."):
+        return False
     if input_mode == "provided_evidence" and (
         field.startswith("target.") or field.startswith("ssh_target.")
     ):

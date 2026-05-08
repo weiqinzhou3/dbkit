@@ -109,6 +109,12 @@ class Phase012IntakeUxTest(unittest.TestCase):
             runtime.calls[0]["runtime_context"]["current_datetime"],
             "2026-05-08T10:00:00+08:00",
         )
+        initial_content = runtime.calls[0]["messages"][0]["content"]
+        self.assertIn('"runtime_context"', initial_content)
+        self.assertIn('"current_datetime": "2026-05-08T10:00:00+08:00"', initial_content)
+        self.assertIn('"timezone": "Asia/Shanghai"', initial_content)
+        self.assertIn('"locale": "zh-CN"', initial_content)
+        self.assertIn("今天17:00触发 mysql cpu usage > 85%", initial_content)
         self.assertEqual(
             result.normalized_request.event["event_time"],
             "2026-05-08T17:00:00+08:00",
@@ -169,6 +175,117 @@ class Phase012IntakeUxTest(unittest.TestCase):
         self.assertEqual(payload["user_message"]["summary"], "当前请求需要补充 MySQL 主机地址后才能继续。")
         self.assertTrue(payload["supplement_required"])
         self.assertIn("request_blocked_message_rendered", [e.event_type for e in result.telemetry])
+        blocked_content = runtime.calls[1]["messages"][0]["content"]
+        self.assertIn('"sanitized_user_prompt"', blocked_content)
+        self.assertIn('"normalized_request"', blocked_content)
+        self.assertIn('"blocking_issues"', blocked_content)
+        self.assertIn('"missing_fields"', blocked_content)
+        self.assertIn('"input_mode"', blocked_content)
+        self.assertIn('"collection_policy"', blocked_content)
+        self.assertIn('"runtime_context"', blocked_content)
+
+    def test_today_alert_blocked_request_only_exposes_target_host_missing(self) -> None:
+        case = self
+
+        class FakeIntakeRuntime:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def invoke(self, payload):
+                self.calls.append(payload)
+                content = payload["messages"][0]["content"]
+                if payload.get("mode") == "blocked_message":
+                    case.assertIn('"sanitized_user_prompt"', content)
+                    case.assertIn('"blocking_issues"', content)
+                    case.assertIn('"missing_fields"', content)
+                    case.assertIn("target.host", content)
+                    return _assistant_json(
+                        {
+                            "user_message": {
+                                "summary": "当前请求需要补充 MySQL 主机地址后才能继续。",
+                                "missing_items": [
+                                    {
+                                        "field": "target.host",
+                                        "label": "MySQL 主机地址",
+                                        "reason": "你提供了账号、密码和告警时间，但没有提供要连接的 MySQL 主机地址。",
+                                        "example": "192.168.1.10",
+                                    }
+                                ],
+                                "retry_example": "请补充：MySQL 主机是 192.168.1.10",
+                            }
+                        }
+                    )
+                case.assertIn('"current_datetime": "2026-05-08T10:00:00+08:00"', content)
+                case.assertNotIn("密码是root", content)
+                return _assistant_json(
+                    {
+                        "target_agent": "mysql_analyzer",
+                        "target_domain": "mysql",
+                        "task_type": "alert_analysis",
+                        "routing_confidence": 0.93,
+                        "input_mode": "live_collection",
+                        "target": {
+                            "type": "mysql",
+                            "host": None,
+                            "port": 3306,
+                            "username": "root",
+                            "password_ref": "<SECRET_REF:chinese_password_001>",
+                        },
+                        "ssh_target": None,
+                        "collection_policy": {
+                            "allow_live_collection": True,
+                            "allow_mysql_login": True,
+                            "allow_ssh": False,
+                            "allow_metrics_query": False,
+                        },
+                        "event": {
+                            "event_time": "2026-05-08T17:00:00+08:00",
+                            "time_window": {
+                                "before": "6h",
+                                "after": "1h",
+                                "source": "skill_default_from_event_time",
+                            },
+                            "alerts": [{"raw": "mysql cpu usage > 85%"}],
+                            "symptoms": ["high_cpu"],
+                        },
+                        "missing_fields": [
+                            "runtime_context.current_datetime",
+                            "event.event_time",
+                            "target.host",
+                        ],
+                    }
+                )
+
+        runtime = FakeIntakeRuntime()
+        result = _orchestrator_with_runtime(runtime).run(
+            "请帮我分析这个 MySQL，今天17:00触发 mysql cpu usage > 85%，MySQL的账号是root，密码是root。"
+        )
+
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.normalized_request.event["event_time"], "2026-05-08T17:00:00+08:00")
+        self.assertIn("time_window", result.normalized_request.event)
+        self.assertEqual(result.normalized_request.missing_fields, ("target.host",))
+        self.assertNotIn("runtime_context.current_datetime", result.blocking_issues)
+        self.assertNotIn("event.event_time", result.normalized_request.missing_fields)
+        self.assertIn("MySQL 主机地址", result.rendered_user_message)
+        artifact_text = "\n".join(
+            artifact.path.read_text(encoding="utf-8") for artifact in result.artifacts
+        )
+        self.assertNotIn("密码是root", artifact_text)
+        event_types = [event.event_type for event in result.telemetry]
+        self.assertIn("runtime_context_injected", event_types)
+        self.assertIn("request_blocked_message_rendered", event_types)
+
+    def test_runtime_context_missing_fails_as_runtime_error(self) -> None:
+        class BrokenTimeProvider:
+            def runtime_context(self):
+                return {"timezone": "Asia/Shanghai", "locale": "zh-CN"}
+
+        with self.assertRaisesRegex(RuntimeError, "runtime_context.current_datetime"):
+            _orchestrator_with_runtime(
+                runtime=object(),
+                time_provider=BrokenTimeProvider(),
+            ).run("今天17:00触发告警")
 
     def test_invalid_user_message_uses_deterministic_fallback(self) -> None:
         class FakeIntakeRuntime:
@@ -370,7 +487,10 @@ def _assistant_json(payload: dict) -> dict:
     return {"messages": [SimpleNamespace(type="ai", content=json.dumps(payload, ensure_ascii=False))]}
 
 
-def _orchestrator_with_runtime(runtime: object) -> Orchestrator:
+def _orchestrator_with_runtime(
+    runtime: object,
+    time_provider: object | None = None,
+) -> Orchestrator:
     class FakeFactory:
         def create_intake_runtime(self, skill_text: str):
             return runtime
@@ -382,7 +502,7 @@ def _orchestrator_with_runtime(runtime: object) -> Orchestrator:
         artifact_store=ArtifactStore(Path(tmpdir.name) / "artifacts"),
         telemetry=TelemetryRecorder(),
         deepagents_runtime_factory=FakeFactory(),
-        time_provider=FixedTimeProvider(
+        time_provider=time_provider or FixedTimeProvider(
             current_datetime=datetime.fromisoformat("2026-05-08T10:00:00+08:00"),
             timezone="Asia/Shanghai",
             locale="zh-CN",

@@ -129,6 +129,10 @@ runtime:
 
 If timezone is not configured, Runtime may use the local system timezone, but it must record the resolved timezone in telemetry.
 
+`runtime_context.current_datetime` is an internal runtime dependency. It must
+never be presented as a user-fillable missing field. If it is missing, Runtime
+must fail as a runtime configuration error before asking the user for more input.
+
 ## 5.2 Relative Time Handling
 
 `skills/intake/SKILL.md` must explicitly state:
@@ -136,7 +140,8 @@ If timezone is not configured, Runtime may use the local system timezone, but it
 ```text
 Use runtime_context.current_datetime and runtime_context.timezone to resolve relative time expressions.
 Never invent current dates.
-If runtime_context is missing, mark runtime_context.current_datetime as missing.
+If runtime_context is missing, treat it as a runtime configuration error.
+Never expose runtime_context.current_datetime as a user-fillable missing field.
 ```
 
 Relative expressions include at minimum:

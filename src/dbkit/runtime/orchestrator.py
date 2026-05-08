@@ -76,7 +76,7 @@ class Orchestrator:
         # Generate request_id from redacted input so secrets never influence IDs.
         from dbkit.tools.normalize_request import _request_id
         request_id = _request_id(redacted_input.strip())
-        runtime_context = self.time_provider.runtime_context()
+        runtime_context = _validated_runtime_context(self.time_provider.runtime_context())
         self.telemetry.emit_runtime_context_injected(
             request_id=request_id,
             runtime_context=runtime_context,
@@ -264,17 +264,23 @@ class Orchestrator:
             raise TypeError("DeepAgents intake runtime must expose invoke()")
 
         self.telemetry.emit_intake_agent_started(request_id=request_id)
-        payload: dict[str, Any] = {
+        invocation_context: dict[str, Any] = {
             "mode": mode,
             "runtime_context": runtime_context,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": _intake_instruction(mode, user_input),
-                }
-            ],
         }
-        payload.update(extra_payload or {})
+        if mode == "supplement_patch":
+            invocation_context["sanitized_supplement_text"] = user_input
+        else:
+            invocation_context["sanitized_user_prompt"] = user_input
+        invocation_context.update(extra_payload or {})
+
+        payload: dict[str, Any] = dict(invocation_context)
+        payload["messages"] = [
+            {
+                "role": "user",
+                "content": _intake_instruction(mode, invocation_context),
+            }
+        ]
         invoke_result = invoke(payload)
         self.telemetry.emit_intake_agent_completed(request_id=request_id)
 
@@ -293,13 +299,16 @@ class Orchestrator:
         )
         llm_json, reason = self._invoke_intake_runtime(
             intake_runtime,
-            "Generate structured user_message for this blocked DBKit intake request.",
+            normalized_request.redacted_input,
             normalized_request.request_id,
             runtime_context=runtime_context,
             mode="blocked_message",
             extra_payload={
                 "normalized_request": normalized_request.to_dict(),
                 "blocking_issues": list(blocking_issues),
+                "missing_fields": list(normalized_request.missing_fields),
+                "input_mode": normalized_request.input_mode,
+                "collection_policy": normalized_request.collection_policy or {},
             },
         )
         raw_message = (llm_json or {}).get("user_message") if llm_json else None
@@ -595,21 +604,40 @@ def _ratio(numerator: int, denominator: int) -> float:
     return round(numerator / denominator, 6)
 
 
-def _intake_instruction(mode: str, user_input: str) -> str:
+def _intake_instruction(mode: str, invocation_context: dict[str, Any]) -> str:
     if mode == "blocked_message":
-        return (
+        instruction = (
             "Generate a DBKit structured user_message JSON for this blocked "
             "intake request. Do not output prose. Do not include secrets."
         )
-    if mode == "supplement_patch":
-        return (
+    elif mode == "supplement_patch":
+        instruction = (
             "Interpret this redacted supplement text and output structured "
-            f"supplement_patch JSON: {user_input}"
+            "supplement_patch JSON."
+        )
+    else:
+        instruction = (
+            "Parse this DBKit intake request and output structured JSON. Use the "
+            "provided runtime_context for relative time."
         )
     return (
-        "Parse this DBKit intake request and output structured JSON. Use the "
-        f"provided runtime_context for relative time: {user_input}"
+        f"{instruction}\n\n"
+        "DBKit invocation context JSON:\n"
+        f"{json.dumps(invocation_context, ensure_ascii=False, indent=2, sort_keys=True)}"
     )
+
+
+def _validated_runtime_context(context: object) -> dict[str, str]:
+    if not isinstance(context, dict):
+        raise RuntimeError("runtime_context must be a mapping")
+    required = ("current_datetime", "timezone", "locale")
+    missing = [field for field in required if not str(context.get(field) or "").strip()]
+    if missing:
+        raise RuntimeError(
+            "Missing internal runtime dependency: "
+            + ", ".join(f"runtime_context.{field}" for field in missing)
+        )
+    return {field: str(context[field]) for field in required}
 
 
 def _supplement_fields(blocking_issues: tuple[str, ...]) -> list[str]:

@@ -208,8 +208,10 @@ Parse user time expressions into ISO 8601 with timezone. Use
 `runtime_context.current_datetime` and `runtime_context.timezone` to resolve
 relative time. Never invent the current date.
 
-If `runtime_context.current_datetime` is missing, do not output a guessed
-concrete date. Add `runtime_context.current_datetime` to `missing_fields`.
+`runtime_context.current_datetime` is an internal runtime dependency. It must
+never be presented as a user-fillable missing field. If it is missing, Runtime
+must fail as a runtime configuration error before asking the user for more input.
+Do not output a guessed concrete date.
 
 Relative expressions include:
 
@@ -416,6 +418,8 @@ Key rules:
 - `hybrid` only requires live target fields for collection methods the user explicitly allows.
 - `event.event_time` is required for `alert_analysis` and `incident_analysis`.
 - Do not mark `time_window` missing when `event_time` exists and this skill default applies.
+- Never add `runtime_context.current_datetime` or any `runtime_context.*` field
+  to user-facing `missing_fields`; runtime context is not user-fillable.
 
 See `skills/intake/references/missing-fields-policy.md`.
 
@@ -551,3 +555,4 @@ explicitly requested provided-evidence-only mode.
 - Do not return markdown fences.
 - Do not include raw secrets.
 - Do not enable live collection when the user explicitly requested provided-evidence-only mode.
+- Do not ask the user to provide `runtime_context.current_datetime`.

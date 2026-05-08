@@ -26,8 +26,11 @@ Parse the user's redacted input and produce a single machine-readable JSON objec
 Runtime injects `runtime_context.current_datetime`, `runtime_context.timezone`,
 and `runtime_context.locale` into each Intake call. Use this context to resolve
 relative time expressions such as `今天`, `昨天`, `刚才`, `最近1小时`, and `近24小时`.
-Never invent the current date. If runtime context is missing, report
-`runtime_context.current_datetime` as missing instead of guessing.
+Never invent the current date.
+
+`runtime_context.current_datetime` is an internal runtime dependency. It must
+never be presented as a user-fillable missing field. If it is missing, Runtime
+must fail as a runtime configuration error before asking the user for more input.
 
 ## Filesystem Context
 
