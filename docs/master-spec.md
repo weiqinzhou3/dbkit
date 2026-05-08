@@ -76,9 +76,11 @@ Implementation phases are maintained independently.
 ```text
 /docs/phases/
   phase-01-runtime-intake-mvp.md
-  phase-02-evidence-pipeline-mvp.md
-  phase-03-mysql-analyzer-mvp.md
-  phase-04-runtime-hardening.md
+  phase-01.1-runtime-intake-closure.md
+  phase-01.2-intake-ux-runtime-time-context.md
+  phase-02-evidence-planning-collection-mvp.md
+  phase-03-evidence-structuring-mvp.md
+  phase-04-mysql-analyzer-findings-mvp.md
 ```
 
 Each phase spec must reference and comply with:

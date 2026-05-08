@@ -37,8 +37,21 @@ class DeepAgentsRuntimeFactory:
                 tools=[],
                 skills=["/skills/intake/"],
                 backend=self._filesystem_backend(),
-                system_prompt=self._system_prompt(skill_text),
+                system_prompt=self._system_prompt("intake", skill_text),
                 name="dbkit-intake",
+            )
+
+    def create_mysql_analyzer_runtime(self, skill_text: str) -> Any:
+        create_deep_agent = self._create_deep_agent or self._load_create_deep_agent()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return create_deep_agent(
+                model=self.model,
+                tools=[],
+                skills=["/skills/mysql-analyzer/"],
+                backend=self._filesystem_backend(),
+                system_prompt=self._system_prompt("mysql-analyzer", skill_text),
+                name="dbkit-mysql-analyzer",
             )
 
     def _load_create_deep_agent(self) -> Callable[..., Any]:
@@ -48,10 +61,10 @@ class DeepAgentsRuntimeFactory:
 
         return create_deep_agent
 
-    def _system_prompt(self, skill_text: str) -> str:
-        system_md = self.agents_dir / "intake" / "system.md"
+    def _system_prompt(self, agent_name: str, skill_text: str) -> str:
+        system_md = self.agents_dir / agent_name / "system.md"
         if not system_md.exists():
-            raise FileNotFoundError(f"Intake system prompt not found: {system_md}")
+            raise FileNotFoundError(f"Agent system prompt not found: {system_md}")
         agent_prompt = system_md.read_text(encoding="utf-8")
         return (
             f"{agent_prompt}\n\n---\n\n"

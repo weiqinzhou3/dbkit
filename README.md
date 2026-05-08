@@ -6,9 +6,11 @@ The project focuses on transforming large-scale raw operational data into struct
 
 ## Current Phase
 
-Phase 01.2: Intake UX + Runtime Time Context.
+Phase 02: Evidence Planning & Collection MVP.
 
-This phase builds the runnable runtime skeleton, root entrypoint, package structure, DeepAgents SDK adapter, and intake-oriented foundation. It does not perform real DBA analysis.
+This phase connects a Phase-01 `NormalizedRequest` to MySQL Analyzer evidence
+planning, guarded collection planning, and deterministic RawEvidence collection.
+It does not produce findings, root cause, validation verdicts, or summaries.
 
 ## Requirements
 
@@ -78,7 +80,7 @@ If `runtime.workspace_dir: /`, host path `/tmp/mysql_conn_full_mock/` maps to
 Run the root entrypoint:
 
 ```bash
-python3.11 main.py --config config/config.yaml "MySQL connection spike on prod-db-1"
+python3.11 main.py --config config/config.yaml "请帮我分析这个 MySQL，今天17:00触发 mysql cpu usage > 85%，只需要分析本地文件，文件在/tmp/mysql_conn_full_mock/。"
 ```
 
 Run with interactive intake supplement:
