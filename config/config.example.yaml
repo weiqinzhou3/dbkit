@@ -27,3 +27,15 @@ runtime:
   blocked_paths:
     - /workspace/**/.env
     - /workspace/**/*.pem
+collection:
+  mysql:
+    connect_timeout_seconds: 5
+    read_timeout_seconds: 30
+  ssh:
+    connect_timeout_seconds: 5
+    command_timeout_seconds: 30
+  logs:
+    max_bytes: 10485760
+    tail_lines: 5000
+  metrics:
+    mysqld_exporter_url:

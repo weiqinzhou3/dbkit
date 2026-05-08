@@ -143,6 +143,68 @@ class Phase02EvidencePlanningCollectionTest(unittest.TestCase):
         runtime_item = runtime_status.evidence_request["required_evidence"][0]
         self.assertEqual(runtime_item["evidence_type"], "mysql.runtime_status")
 
+        null_source_payload = _evidence_request_payload(
+            normalized,
+            tool_hint="collect_mysql_runtime_status",
+            evidence_type="mysql.runtime_status",
+            source=None,
+        )
+        null_source = validate_evidence_request(null_source_payload)
+        null_source_item = null_source.evidence_request["required_evidence"][0]
+        self.assertEqual(null_source_item["source"], "mysql")
+
+    def test_pipeline_does_not_traceback_when_evidence_request_source_and_tool_are_null(self) -> None:
+        normalized = _provided_evidence_request(files=["/workspace/mysql-error.log"])
+        payload = _evidence_request_payload(
+            normalized,
+            tool_hint=None,
+            evidence_type="mysql.error_log",
+            source=None,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = EvidencePipeline(
+                artifact_store=ArtifactStore(root / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                collectors=CollectorRegistry(workspace_root=root / "workspace"),
+                time_provider=_fixed_time_provider(),
+            ).run(normalized, evidence_request_json=payload)
+
+        self.assertEqual(result.status, "collection_blocked")
+        self.assertIn(
+            "evidence item missing tool_hint: required_evidence[0]",
+            result.blocking_issues,
+        )
+
+    def test_pipeline_validation_failure_returns_blocked_artifact(self) -> None:
+        normalized = _provided_evidence_request(files=["/workspace/mysql-error.log"])
+        payload = _evidence_request_payload(
+            normalized,
+            tool_hint="unknown_tool",
+            evidence_type="unknown.evidence",
+            source="unknown_source",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = EvidencePipeline(
+                artifact_store=ArtifactStore(root / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                collectors=CollectorRegistry(workspace_root=root / "workspace"),
+                time_provider=_fixed_time_provider(),
+            ).run(normalized, evidence_request_json=payload)
+
+            artifact = [
+                item for item in result.artifacts
+                if item.kind == "EvidenceRequestFailed"
+            ][0]
+            artifact_payload = json.loads(artifact.path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.status, "evidence_request_validation_failed")
+        self.assertEqual(result.blocking_issues, ("evidence_request_validation_failed",))
+        self.assertEqual(artifact_payload["reason"], "evidence_request_validation_failed")
+
     def test_mysql_analyzer_skill_defines_evidence_planning_mode(self) -> None:
         skill_path = Path("skills/mysql-analyzer/SKILL.md")
 
@@ -363,7 +425,7 @@ class Phase02EvidencePlanningCollectionTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertTrue(any("target.host" in issue for issue in result.blocking_issues))
 
-    def test_unimplemented_live_collector_returns_not_implemented(self) -> None:
+    def test_live_collector_failure_does_not_fake_success(self) -> None:
         normalized = normalize_request(
             "连接 MySQL 分析 CPU 告警",
             llm_json={
@@ -395,20 +457,18 @@ class Phase02EvidencePlanningCollectionTest(unittest.TestCase):
             result = EvidencePipeline(
                 artifact_store=ArtifactStore(root / "artifacts"),
                 telemetry=TelemetryRecorder(),
-                collectors=CollectorRegistry(workspace_root=root / "workspace"),
+                collectors=CollectorRegistry(
+                    workspace_root=root / "workspace",
+                    mysql_client_factory=lambda _request, _secrets: FailingMySQLClient(),
+                ),
                 time_provider=_fixed_time_provider(),
             ).run(
                 normalized,
-                evidence_request_json=_evidence_request_payload(
-                    normalized,
-                    tool_hint="collect_mysql_runtime_status",
-                    evidence_type="mysql.runtime_status",
-                    source="mysql",
-                ),
+                evidence_request_json=_mysql_baseline_evidence_request_payload(normalized),
             )
 
-            self.assertEqual(result.status, "raw_evidence_collected")
-            self.assertEqual(result.raw_evidence[0].collection["status"], "not_implemented")
+            self.assertEqual(result.status, "collection_failed")
+            self.assertEqual(result.raw_evidence[0].collection["status"], "failed")
 
     def test_raw_secrets_absent_from_artifacts_and_telemetry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -533,6 +593,38 @@ def _evidence_request_payload(
             "mode": "evidence_planning",
         },
     }
+
+
+def _mysql_baseline_evidence_request_payload(normalized) -> dict:
+    payload = _evidence_request_payload(
+        normalized,
+        tool_hint="collect_mysql_processlist",
+        evidence_type="mysql.processlist",
+        source="mysql",
+    )
+    payload["evidence_request"]["required_evidence"] = [
+        {
+            "evidence_type": evidence_type,
+            "priority": "required",
+            "purpose": "collect raw operational evidence",
+            "source": "mysql",
+            "tool_hint": tool_hint,
+        }
+        for tool_hint, evidence_type in (
+            ("collect_mysql_processlist", "mysql.processlist"),
+            ("collect_mysql_runtime_status", "mysql.runtime_status"),
+            ("collect_mysql_innodb_status", "mysql.innodb_status"),
+            ("collect_mysql_variables", "mysql.variables"),
+            ("collect_mysql_service_metadata", "mysql.service_metadata"),
+            ("discover_mysql_log_paths", "mysql.log_paths"),
+        )
+    ]
+    return payload
+
+
+class FailingMySQLClient:
+    def execute(self, sql: str) -> list[dict]:
+        raise RuntimeError("connection refused")
 
 
 def _fixed_time_provider() -> FixedTimeProvider:

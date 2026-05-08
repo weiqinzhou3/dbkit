@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from dbkit.schemas.evidence import CollectionPlan, EvidenceRequest, RawEvidence
+from dbkit.schemas.evidence import CollectionPlan, EvidenceRequest, RawEvidence, collection_summary
 from dbkit.schemas.runtime import ArtifactRecord, NormalizedRequest, TelemetryEvent
 
 
@@ -107,18 +107,63 @@ class ArtifactStore:
         )
         return ArtifactRecord(kind="CollectionPlan", path=path)
 
+    def persist_collection_blocked(
+        self,
+        request: NormalizedRequest,
+        plan: CollectionPlan,
+        *,
+        reason: str,
+        missing_dependencies: list[str] | None = None,
+        install_hint: str | None = None,
+    ) -> ArtifactRecord:
+        path = self.root / f"{request.request_id}.collection-blocked.json"
+        payload: dict[str, Any] = {
+            "request_id": request.request_id,
+            "phase": request.phase,
+            "status": "blocked",
+            "reason": reason,
+            "missing_dependencies": missing_dependencies or [],
+            "install_hint": install_hint,
+            "collection_plan": plan.to_dict(),
+            "normalized_request": request.to_dict(),
+        }
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return ArtifactRecord(kind="CollectionBlocked", path=path)
+
     def persist_raw_evidence_index(
         self,
         request_id: str,
         raw_evidence: tuple[RawEvidence, ...],
+        *,
+        phase: str = "phase-02",
     ) -> ArtifactRecord:
         path = self.root / f"{request_id}.raw-evidence-index.json"
         payload: dict[str, Any] = {
             "request_id": request_id,
-            "phase": "phase-02",
-            "raw_evidence_count": len(raw_evidence),
-            "raw_evidence": [item.to_dict() for item in raw_evidence],
+            "phase": phase,
+            "metadata": _phase_metadata(phase),
+            "raw_evidence": [_raw_evidence_index_entry(item) for item in raw_evidence],
+            **collection_summary(raw_evidence),
         }
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        for item in raw_evidence:
+            content_ref = item.payload.get("content_ref")
+            if content_ref and Path(str(content_ref)).exists():
+                continue
+            raw_path = raw_dir / f"{item.raw_evidence_id}.json"
+            raw_path.write_text(
+                json.dumps(
+                    item.to_dict(),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
         path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -137,3 +182,93 @@ class ArtifactStore:
         ]
         path.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
         return ArtifactRecord(kind="CollectionTelemetry", path=path)
+
+
+def _raw_evidence_index_entry(item: RawEvidence) -> dict[str, Any]:
+    payload = {
+        key: item.payload.get(key)
+        for key in ("content_ref", "bytes", "line_count")
+        if key in item.payload
+    }
+    collection = {
+        key: item.collection.get(key)
+        for key in ("status", "errors", "reason", "duration_ms")
+        if key in item.collection
+    }
+    entry: dict[str, Any] = {
+        "raw_evidence_id": item.raw_evidence_id,
+        "request_id": item.request_id,
+        "evidence_type": item.evidence_type,
+        "source": item.source,
+        "collection": collection,
+        "payload": payload,
+        "metadata": item.metadata,
+    }
+    preview = _payload_preview(item.payload)
+    if preview:
+        entry["preview"] = preview
+    return entry
+
+
+def _phase_metadata(phase: str) -> dict[str, Any]:
+    if phase.startswith("phase-02.1"):
+        return {"phase_detail": "phase-02.1-real-mysql-evidence-collection"}
+    return {}
+
+
+def _payload_preview(payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return {}
+
+    if isinstance(data.get("rows"), list):
+        rows = data["rows"]
+        return {
+            "rows_count": len(rows),
+            "first_n_keys": _first_keys(rows),
+        }
+
+    if isinstance(data.get("queries"), list):
+        queries = data["queries"]
+        rows_count = 0
+        query_count = 0
+        for query in queries:
+            if not isinstance(query, dict):
+                continue
+            query_count += 1
+            rows = query.get("rows")
+            if isinstance(rows, list):
+                rows_count += len(rows)
+        return {
+            "queries_count": query_count,
+            "rows_count": rows_count,
+            "first_n_keys": _first_keys(
+                [
+                    row
+                    for query in queries
+                    if isinstance(query, dict)
+                    for row in (query.get("rows") or [])
+                    if isinstance(row, dict)
+                ]
+            ),
+        }
+
+    return {
+        key: data[key]
+        for key in (
+            "error_log_path",
+            "slow_log_path",
+            "slow_query_log_enabled",
+            "log_output",
+            "datadir",
+            "reason",
+        )
+        if key in data
+    }
+
+
+def _first_keys(rows: list[Any], limit: int = 5) -> list[str]:
+    for row in rows:
+        if isinstance(row, dict):
+            return list(row.keys())[:limit]
+    return []

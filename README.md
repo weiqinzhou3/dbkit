@@ -12,10 +12,48 @@ This phase connects a Phase-01 `NormalizedRequest` to MySQL Analyzer evidence
 planning, guarded collection planning, and deterministic RawEvidence collection.
 It does not produce findings, root cause, validation verdicts, or summaries.
 
+Phase-02.1 default MySQL live collection uses `mysql.runtime_status` for
+`SHOW GLOBAL STATUS` and `mysql.variables` for `SHOW GLOBAL VARIABLES`.
+Deprecated MySQL metrics evidence types such as `metrics.mysql`,
+`metrics.mysql_status`, and `metrics.mysql_variables` are retained only for
+backward compatibility and must not be selected by default planning. Phase-03
+Evidence Structuring must deduplicate overlapping raw evidence if legacy inputs
+contain these deprecated metrics artifacts.
+
 ## Requirements
 
 - Python 3.11+
 - A DBKit config file with an OpenAI-compatible model that supports tool calling and multi-turn agent runtime
+
+## Installation
+
+Install DBKit from the repo root:
+
+```bash
+python3.11 -m pip install -e .
+```
+
+The default install includes Phase-02.1 live collection dependencies:
+
+- `PyMySQL` for MySQL read-only collection
+- `paramiko` for SSH read-only collection
+
+The same dependencies are also exposed as the `collection` extra, so this is
+equivalent and explicit for collection environments:
+
+```bash
+python3.11 -m pip install -e ".[collection]"
+```
+
+If live collection dependencies are missing, DBKit blocks before executing
+collectors and prints:
+
+```text
+status=blocked
+reason=missing_collection_dependencies
+missing_dependencies=pymysql,paramiko
+install_hint=pip install -e ".[collection]"
+```
 
 ## Entry Point
 

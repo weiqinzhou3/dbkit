@@ -7,18 +7,70 @@ from dbkit.schemas.runtime import NormalizedRequest
 _PROVIDED_EVIDENCE_TOOLS = frozenset(
     {"read_provided_evidence_file", "read_provided_evidence_directory"}
 )
-_LIVE_COLLECTION_TOOLS = frozenset(
+_MYSQL_LOGIN_TOOLS = frozenset(
     {
-        "collect_mysql_runtime_status",
+        "collect_mysql_processlist",
         "collect_processlist",
+        "collect_mysql_runtime_status",
+        "collect_mysql_innodb_status",
         "collect_innodb_status",
         "collect_mysql_variables",
+        "collect_mysql_service_metadata",
+        "discover_mysql_log_paths",
         "collect_mysql_error_log",
         "collect_mysql_slow_log",
+        "collect_mysql_metrics_snapshot",
         "collect_metrics_snapshot",
+        "collect_mysql_status_metrics",
+        "collect_mysql_variable_metrics",
+    }
+)
+_SSH_TOOLS = frozenset(
+    {
+        "read_remote_file",
+        "collect_mysql_error_log",
+        "collect_mysql_slow_log",
+        "collect_os_service_status",
+        "collect_os_cpu_snapshot",
+        "collect_os_memory_snapshot",
+        "collect_os_disk_snapshot",
+    }
+)
+_LIVE_COLLECTION_TOOLS = frozenset(
+    {
+        *_MYSQL_LOGIN_TOOLS,
+        *_SSH_TOOLS,
     }
 )
 _ALL_TOOLS = _PROVIDED_EVIDENCE_TOOLS | _LIVE_COLLECTION_TOOLS
+
+_ALLOWED_SQL = frozenset(
+    {
+        "SHOW FULL PROCESSLIST",
+        "SHOW GLOBAL STATUS",
+        "SHOW GLOBAL VARIABLES",
+        "SHOW ENGINE INNODB STATUS",
+        "SELECT VERSION()",
+        "SELECT @@hostname, @@port, @@datadir, @@log_error, @@slow_query_log_file",
+        "SHOW GLOBAL VARIABLES LIKE 'log_error'",
+        "SHOW GLOBAL VARIABLES LIKE 'slow_query_log_file'",
+        "SHOW GLOBAL VARIABLES LIKE 'slow_query_log'",
+        "SHOW GLOBAL VARIABLES LIKE 'log_output'",
+        "SHOW GLOBAL VARIABLES LIKE 'datadir'",
+    }
+)
+_ALLOWED_SSH_EXACT = frozenset(
+    {
+        "uptime",
+        "top -b -n 1 | head -50",
+        "vmstat 1 3",
+        "free -m",
+        "df -h",
+        "systemctl status mysqld --no-pager",
+        "systemctl status mysql --no-pager",
+        "ps -ef | grep -E 'mysqld|mysql' | grep -v grep",
+    }
+)
 
 
 class CollectionGuardrails:
@@ -53,15 +105,26 @@ class CollectionGuardrails:
                     issues.append(
                         f"collection_policy does not permit live collection: {step.tool_name}"
                     )
-                if step.tool_name != "collect_metrics_snapshot" and not policy.get("allow_mysql_login"):
+                if step.tool_name in _MYSQL_LOGIN_TOOLS and not policy.get("allow_mysql_login"):
                     issues.append(
                         f"collection_policy does not permit MySQL login: {step.tool_name}"
                     )
-                target = request.target or {}
-                if not target.get("host"):
-                    issues.append("target.host is required for live collection")
-                if not target.get("username"):
-                    issues.append("target.username is required for live collection")
+                if step.tool_name in _SSH_TOOLS and not policy.get("allow_ssh"):
+                    issues.append(
+                        f"collection_policy does not permit SSH collection: {step.tool_name}"
+                    )
+                if step.tool_name in _MYSQL_LOGIN_TOOLS:
+                    target = request.target or {}
+                    if not target.get("host"):
+                        issues.append("target.host is required for live collection")
+                    if not target.get("username"):
+                        issues.append("target.username is required for live collection")
+                if step.tool_name in _SSH_TOOLS:
+                    ssh_target = request.ssh_target or {}
+                    if not ssh_target.get("host"):
+                        issues.append("ssh_target.host is required for SSH collection")
+                    if not ssh_target.get("username"):
+                        issues.append("ssh_target.username is required for SSH collection")
                 for secret_ref in step.requires_secret_refs:
                     if not str(secret_ref).startswith("<SECRET_REF:"):
                         issues.append(
@@ -75,3 +138,30 @@ class CollectionGuardrails:
             passed=not issues,
             blocking_issues=tuple(dict.fromkeys(issues)),
         )
+
+
+def is_mysql_sql_allowed(sql: str) -> bool:
+    normalized = " ".join(sql.strip().rstrip(";").split())
+    return normalized in _ALLOWED_SQL
+
+
+def is_ssh_command_allowed(command: str) -> bool:
+    normalized = " ".join(command.strip().split())
+    if normalized in _ALLOWED_SSH_EXACT:
+        return True
+    if normalized.startswith("tail -n ") and " -- " in normalized:
+        return _valid_tail_command(normalized)
+    if normalized.startswith("du -sh "):
+        return "--" not in normalized and not any(token in normalized for token in (";", "&", "|", "`", "$("))
+    return False
+
+
+def _valid_tail_command(command: str) -> bool:
+    parts = command.split(" -- ", 1)
+    prefix, path = parts[0], parts[1]
+    count = prefix.removeprefix("tail -n ").strip()
+    if not count.isdigit() or int(count) <= 0:
+        return False
+    if not path.startswith("/"):
+        return False
+    return not any(token in path for token in ("..", ";", "&", "|", "`", "$("))

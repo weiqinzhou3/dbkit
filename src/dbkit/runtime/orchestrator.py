@@ -216,6 +216,7 @@ class Orchestrator:
                 blocking_issues=guardrails_result.blocking_issues,
                 user_message=user_message,
                 rendered_user_message=rendered,
+                secret_values=redaction_result.secret_values,
             )
 
         self.telemetry.emit_guardrails_passed(
@@ -248,6 +249,7 @@ class Orchestrator:
             telemetry=tuple(self.telemetry.events),
             deepagents_runtime_ready=intake_runtime is not None,
             blocked=False,
+            secret_values=redaction_result.secret_values,
         )
 
     def _invoke_intake_runtime(
@@ -531,6 +533,7 @@ class Orchestrator:
             blocked=False,
             user_message=user_message,
             rendered_user_message=rendered,
+            secret_values=redaction_result.secret_values,
         )
 
     def _persist_blocked_result(
@@ -569,6 +572,7 @@ class Orchestrator:
             blocking_issues=blocking_issues,
             user_message=user_message,
             rendered_user_message=rendered_with_artifact or rendered,
+            secret_values={},
         )
 
     def _extract_llm_json(
@@ -670,4 +674,3 @@ def _call_supplement_reader(
         return supplement_reader(rendered_message)
     except TypeError:
         return supplement_reader()
-
