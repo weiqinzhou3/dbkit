@@ -363,7 +363,7 @@ class Phase02EvidencePlanningCollectionTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertTrue(any("target.host" in issue for issue in result.blocking_issues))
 
-    def test_unimplemented_live_collector_returns_not_implemented(self) -> None:
+    def test_live_collector_failure_does_not_fake_success(self) -> None:
         normalized = normalize_request(
             "连接 MySQL 分析 CPU 告警",
             llm_json={
@@ -407,8 +407,8 @@ class Phase02EvidencePlanningCollectionTest(unittest.TestCase):
                 ),
             )
 
-            self.assertEqual(result.status, "raw_evidence_collected")
-            self.assertEqual(result.raw_evidence[0].collection["status"], "not_implemented")
+            self.assertEqual(result.status, "collection_failed")
+            self.assertEqual(result.raw_evidence[0].collection["status"], "failed")
 
     def test_raw_secrets_absent_from_artifacts_and_telemetry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

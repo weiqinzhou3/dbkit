@@ -15,6 +15,7 @@ class RedactionResult:
     estimated_tokens: int
     secret_refs: tuple[str, ...]
     redaction_summary: dict[str, Any]
+    secret_values: dict[str, str]
 
 
 class Redactor:
@@ -39,29 +40,31 @@ class Redactor:
         counters: dict[str, int] = {}
         refs: list[str] = []
         patterns: list[str] = []
+        secret_values: dict[str, str] = {}
 
-        def _ref(prefix: str, pattern_name: str) -> str:
+        def _ref(prefix: str, pattern_name: str, value: str) -> str:
             counters[prefix] = counters.get(prefix, 0) + 1
             ref = f"<SECRET_REF:{prefix}_{counters[prefix]:03d}>"
             refs.append(ref)
+            secret_values[ref] = value
             if pattern_name not in patterns:
                 patterns.append(pattern_name)
             return ref
 
         def _replace_assignment(m: re.Match) -> str:
-            ref = _ref(m.group(1).lower(), "english_assignment")
+            ref = _ref(m.group(1).lower(), "english_assignment", m.group(3))
             return f"{m.group(1)}{m.group(2)}{ref}"
 
         def _replace_chinese(m: re.Match) -> str:
-            ref = _ref("chinese_password", "chinese_password_assignment")
+            ref = _ref("chinese_password", "chinese_password_assignment", m.group(2))
             return f"{m.group(1)}{ref}"
 
         def _replace_auth(m: re.Match) -> str:
-            ref = _ref("auth_token", "authorization_header")
+            ref = _ref("auth_token", "authorization_header", m.group(3))
             return f"{m.group(1)}{m.group(2)}{ref}"
 
         def _replace_uri(m: re.Match) -> str:
-            ref = _ref("uri_password", "database_uri")
+            ref = _ref("uri_password", "database_uri", m.group(3))
             return f"{m.group(1)}{m.group(2)}:{ref}@{m.group(4)}"
 
         redacted = self._SECRET_ASSIGNMENT.sub(_replace_assignment, text)
@@ -85,6 +88,7 @@ class Redactor:
                 "secret_refs": list(refs),
                 "redacted_patterns": patterns,
             },
+            secret_values=secret_values,
         )
 
 

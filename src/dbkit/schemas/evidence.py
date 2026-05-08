@@ -16,9 +16,18 @@ _CANONICAL_EVIDENCE_TYPES = frozenset(
         "mysql.variables",
         "mysql.error_log",
         "mysql.slow_log",
+        "mysql.service_metadata",
+        "mysql.log_paths",
         "metrics.cpu",
         "metrics.memory",
         "metrics.disk",
+        "metrics.mysql",
+        "metrics.mysql_status",
+        "metrics.mysql_variables",
+        "metrics.os_cpu",
+        "metrics.os_memory",
+        "metrics.os_disk",
+        "os.mysql_service_status",
         "os.system_log",
         "provided.file",
     }
@@ -32,6 +41,8 @@ _EVIDENCE_TYPE_ALIASES = {
     "mysql_variables": "mysql.variables",
     "mysql_error_log": "mysql.error_log",
     "mysql_slow_log": "mysql.slow_log",
+    "mysql_service_metadata": "mysql.service_metadata",
+    "mysql_log_paths": "mysql.log_paths",
     "os.cpu_metrics": "metrics.cpu",
     "provided_evidence.file": "provided.file",
     "provided_evidence.directory": "provided.file",
@@ -46,10 +57,30 @@ _TOOL_SOURCE_DEFAULTS = {
     "collect_mysql_variables": "mysql",
     "collect_mysql_error_log": "ssh",
     "collect_mysql_slow_log": "ssh",
+    "collect_mysql_processlist": "mysql",
+    "collect_mysql_service_metadata": "mysql",
+    "discover_mysql_log_paths": "mysql",
+    "collect_mysql_metrics_snapshot": "mysql",
+    "collect_mysql_status_metrics": "mysql",
+    "collect_mysql_variable_metrics": "mysql",
     "collect_metrics_snapshot": "metrics",
+    "collect_os_service_status": "ssh",
+    "collect_os_cpu_snapshot": "ssh",
+    "collect_os_memory_snapshot": "ssh",
+    "collect_os_disk_snapshot": "ssh",
+    "read_remote_file": "ssh",
     "read_provided_evidence_file": "provided_evidence",
     "read_provided_evidence_directory": "provided_evidence",
 }
+_SUMMARY_STATUSES = (
+    "collected",
+    "partial",
+    "failed",
+    "blocked",
+    "not_available",
+    "not_configured",
+    "not_implemented",
+)
 
 
 @dataclass(frozen=True)
@@ -137,6 +168,42 @@ class EvidencePipelineResult:
     artifacts: tuple[Any, ...]
     telemetry: tuple[Any, ...]
     blocking_issues: tuple[str, ...] = ()
+
+
+def collection_summary(raw_evidence: tuple[RawEvidence, ...]) -> dict[str, int]:
+    summary = {f"{status}_count": 0 for status in _SUMMARY_STATUSES}
+    summary["raw_evidence_count"] = len(raw_evidence)
+    for item in raw_evidence:
+        status = str(item.collection.get("status") or "failed")
+        key = f"{status}_count"
+        if key in summary:
+            summary[key] += 1
+    return summary
+
+
+def collection_status(raw_evidence: tuple[RawEvidence, ...]) -> str:
+    summary = collection_summary(raw_evidence)
+    collected = summary["collected_count"]
+    warnings = (
+        summary["failed_count"]
+        + summary["not_available_count"]
+        + summary["partial_count"]
+        + summary["blocked_count"]
+        + summary["not_configured_count"]
+    )
+    if collected > 0 and warnings == 0:
+        return "raw_evidence_collected"
+    if collected > 0:
+        return "collection_completed_with_warnings"
+    if summary["blocked_count"] > 0:
+        return "collection_blocked"
+    if summary["failed_count"] > 0:
+        return "collection_failed"
+    if summary["not_implemented_count"] > 0:
+        return "collection_not_implemented"
+    if summary["not_available_count"] > 0 or summary["not_configured_count"] > 0:
+        return "collection_completed_with_warnings"
+    return "collection_failed"
 
 
 def validate_evidence_request(payload: dict[str, Any]) -> EvidenceRequest:

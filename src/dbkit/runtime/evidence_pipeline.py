@@ -14,6 +14,8 @@ from dbkit.schemas.evidence import (
     EvidencePipelineResult,
     EvidenceRequest,
     RawEvidence,
+    collection_status,
+    collection_summary,
     stable_id,
     validate_evidence_request,
 )
@@ -90,7 +92,7 @@ class EvidencePipeline:
             )
             return EvidencePipelineResult(
                 request_id=request.request_id,
-                phase="phase-02",
+                phase=request.phase if request.phase.startswith("phase-02.1") else "phase-02",
                 status="evidence_request_parse_failed",
                 evidence_request=None,
                 collection_plan=None,
@@ -158,7 +160,7 @@ class EvidencePipeline:
             )
             return EvidencePipelineResult(
                 request_id=request.request_id,
-                phase="phase-02",
+                phase=request.phase if request.phase.startswith("phase-02.1") else "phase-02",
                 status="collection_blocked",
                 evidence_request=evidence_request,
                 collection_plan=blocked_plan,
@@ -208,11 +210,13 @@ class EvidencePipeline:
             )
             raw_items.extend(collected)
             for item in collected:
-                event_type = (
-                    "collector_completed"
-                    if item.collection["status"] in {"collected", "not_implemented"}
-                    else "collector_failed"
-                )
+                status = str(item.collection["status"])
+                if status == "blocked":
+                    event_type = "collector_blocked"
+                elif status == "failed":
+                    event_type = "collector_failed"
+                else:
+                    event_type = "collector_completed"
                 self.telemetry.emit(
                     event_type=event_type,
                     stage="collection",
@@ -221,13 +225,20 @@ class EvidencePipeline:
                         "request_id": request.request_id,
                         "raw_evidence_id": item.raw_evidence_id,
                         "tool_name": step.tool_name,
-                        "status": item.collection["status"],
+                        "evidence_type": item.evidence_type,
+                        "status": status,
+                        "bytes": item.payload.get("bytes", 0),
+                        "line_count": item.payload.get("line_count", 0),
+                        "duration_ms": item.collection.get("duration_ms", 0),
                     },
                 )
 
+        summary = collection_summary(tuple(raw_items))
+        status = collection_status(tuple(raw_items))
         index_artifact = self.artifact_store.persist_raw_evidence_index(
             request.request_id,
             tuple(raw_items),
+            phase=request.phase if request.phase.startswith("phase-02.1") else "phase-02",
         )
         for item in raw_items:
             self.telemetry.emit(
@@ -249,13 +260,19 @@ class EvidencePipeline:
                 "raw_evidence_count": len(raw_items),
             },
         )
+        self.telemetry.emit(
+            event_type="collection_summary_created",
+            stage="collection",
+            message="Collection summary created",
+            attributes={"request_id": request.request_id, **summary},
+        )
         telemetry_artifact = self.artifact_store.persist_collection_telemetry(
             request.request_id, self.telemetry.events
         )
         return EvidencePipelineResult(
             request_id=request.request_id,
-            phase="phase-02",
-            status="raw_evidence_collected",
+            phase=request.phase if request.phase.startswith("phase-02.1") else "phase-02",
+            status=status,
             evidence_request=evidence_request,
             collection_plan=plan,
             raw_evidence=tuple(raw_items),
@@ -350,7 +367,7 @@ def _source_paths_for_step(
 def _target_ref(source: str, tool_name: str) -> str:
     if tool_name in {"read_provided_evidence_file", "read_provided_evidence_directory"}:
         return "provided_evidence"
-    if source == "ssh":
+    if source == "ssh" or tool_name.startswith("collect_os_") or tool_name == "read_remote_file":
         return "ssh_target"
     return "target"
 
@@ -361,7 +378,10 @@ def _secret_refs_for_step(
 ) -> tuple[str, ...]:
     if tool_name.startswith("read_provided_evidence_"):
         return ()
-    target = request.target or {}
+    if tool_name.startswith("collect_os_") or tool_name == "read_remote_file":
+        target = request.ssh_target or {}
+    else:
+        target = request.target or {}
     password_ref = target.get("password_ref")
     return (str(password_ref),) if password_ref else ()
 

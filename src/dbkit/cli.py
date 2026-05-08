@@ -13,6 +13,7 @@ from dbkit.runtime.evidence_pipeline import EvidencePipeline
 from dbkit.runtime.guardrails import Guardrails
 from dbkit.runtime.observability import TelemetryRecorder
 from dbkit.runtime.orchestrator import Orchestrator
+from dbkit.runtime.secret_store import SecretStore
 from dbkit.runtime.time_context import TimeProvider
 from dbkit.tools.collectors import CollectorRegistry
 
@@ -90,7 +91,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     evidence_result = EvidencePipeline(
         artifact_store=ArtifactStore(artifact_root),
         telemetry=TelemetryRecorder(),
-        collectors=CollectorRegistry(workspace_root=config.runtime.workspace_dir),
+        collectors=CollectorRegistry(
+            workspace_root=config.runtime.workspace_dir,
+            secret_store=SecretStore(result.secret_values),
+            log_tail_lines=config.collection.logs.tail_lines,
+        ),
         time_provider=TimeProvider(
             timezone=config.runtime.timezone,
             locale=config.runtime.locale,
@@ -98,7 +103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         mysql_analyzer_runtime=analyzer_runtime,
     ).run(result.normalized_request)
 
-    print("phase=phase-02")
+    print(f"phase={evidence_result.phase}")
     if evidence_result.status == "evidence_request_parse_failed":
         print("status=blocked")
         print("reason=evidence_request_parse_failed")
@@ -106,6 +111,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"status={evidence_result.status}")
     print(f"input_mode={result.normalized_request.input_mode}")
     print(f"raw_evidence_count={len(evidence_result.raw_evidence)}")
+    summary = _collection_summary(evidence_result.raw_evidence)
+    for key in (
+        "collected",
+        "partial",
+        "failed",
+        "blocked",
+        "not_available",
+        "not_configured",
+        "not_implemented",
+    ):
+        print(f"{key}={summary.get(key + '_count', 0)}")
     index_artifacts = [
         artifact for artifact in evidence_result.artifacts
         if artifact.kind == "RawEvidenceIndex"
@@ -114,9 +130,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"artifact={index_artifacts[0].path}")
     elif evidence_result.artifacts:
         print(f"artifact={evidence_result.artifacts[-1].path}")
-    if evidence_result.status in {"collection_blocked", "evidence_request_parse_failed"}:
+    if evidence_result.status in {
+        "collection_blocked",
+        "collection_failed",
+        "collection_not_implemented",
+        "evidence_request_parse_failed",
+    }:
         return 1
     return 0
+
+
+def _collection_summary(raw_evidence) -> dict[str, int]:
+    from dbkit.schemas.evidence import collection_summary
+
+    return collection_summary(tuple(raw_evidence))
 
 
 def _parse_args(args: list[str]) -> tuple[Path, bool, list[str]]:

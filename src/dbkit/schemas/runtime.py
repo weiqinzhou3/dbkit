@@ -89,3 +89,4 @@ class RuntimeResult:
     blocking_issues: tuple[str, ...] = field(default_factory=tuple)
     user_message: dict[str, Any] | None = None
     rendered_user_message: str | None = None
+    secret_values: dict[str, str] = field(default_factory=dict, repr=False)

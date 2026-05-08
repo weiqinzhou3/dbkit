@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from dbkit.schemas.evidence import CollectionPlan, EvidenceRequest, RawEvidence
+from dbkit.schemas.evidence import CollectionPlan, EvidenceRequest, RawEvidence, collection_summary
 from dbkit.schemas.runtime import ArtifactRecord, NormalizedRequest, TelemetryEvent
 
 
@@ -111,14 +111,23 @@ class ArtifactStore:
         self,
         request_id: str,
         raw_evidence: tuple[RawEvidence, ...],
+        *,
+        phase: str = "phase-02",
     ) -> ArtifactRecord:
         path = self.root / f"{request_id}.raw-evidence-index.json"
         payload: dict[str, Any] = {
             "request_id": request_id,
-            "phase": "phase-02",
-            "raw_evidence_count": len(raw_evidence),
+            "phase": phase,
             "raw_evidence": [item.to_dict() for item in raw_evidence],
+            **collection_summary(raw_evidence),
         }
+        raw_dir = self.root / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        for item in raw_evidence:
+            (raw_dir / f"{item.raw_evidence_id}.json").write_text(
+                json.dumps(item.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
         path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",

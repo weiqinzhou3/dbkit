@@ -152,6 +152,110 @@ class MainEntrypointTest(unittest.TestCase):
         self.assertIn("reason=evidence_request_parse_failed", output.getvalue())
         self.assertIn("artifact=", output.getvalue())
 
+    def test_phase021_collection_failed_exits_nonzero(self) -> None:
+        import main
+        from dbkit.config import AgentConfig, AppConfig, ModelConfig, ProviderKind, RuntimeConfig
+        from dbkit.schemas.evidence import EvidencePipelineResult
+        from dbkit.schemas.runtime import NormalizedRequest, RouteDecision, RuntimeResult
+
+        output = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            normalized = NormalizedRequest(
+                request_id="req_cli_collection_failed",
+                original_input="connect mysql",
+                redacted_input="connect mysql",
+                target_domain="mysql",
+                requested_capability="alert_analysis",
+                missing_fields=(),
+                phase="phase-02.1",
+                target_agent="mysql_analyzer",
+                task_type="alert_analysis",
+                input_mode="live_collection",
+            )
+
+            class FakeOrchestrator:
+                def __init__(self, **_kwargs):
+                    pass
+
+                def run(self, *_args, **_kwargs):
+                    return RuntimeResult(
+                        normalized_request=normalized,
+                        route_decision=RouteDecision(
+                            target_agent_name="mysql_analyzer",
+                            target_domain="mysql",
+                            phase="phase-02.1",
+                            reason="test",
+                        ),
+                        artifacts=(),
+                        telemetry=(),
+                        deepagents_runtime_ready=True,
+                        blocked=False,
+                    )
+
+            class FakeAnalyzerAgent:
+                skill_text = "MYSQL_SKILL"
+
+                @classmethod
+                def from_skills_dir(cls, _skills_dir):
+                    return cls()
+
+            class FakeRuntimeFactory:
+                def __init__(self, **_kwargs):
+                    pass
+
+                def create_mysql_analyzer_runtime(self, _skill_text):
+                    return object()
+
+            class FakeEvidencePipeline:
+                def __init__(self, **_kwargs):
+                    pass
+
+                def run(self, _request):
+                    return EvidencePipelineResult(
+                        request_id=normalized.request_id,
+                        phase="phase-02.1",
+                        status="collection_failed",
+                        evidence_request=None,
+                        collection_plan=None,
+                        raw_evidence=(),
+                        artifacts=(),
+                        telemetry=(),
+                    )
+
+            config = AppConfig(
+                model=ModelConfig(
+                    provider_kind=ProviderKind.OPENAI_COMPATIBLE,
+                    model_name="test-model",
+                    base_url="https://example.invalid/v1",
+                    api_key="sk-test",
+                ),
+                agent=AgentConfig(),
+                runtime=RuntimeConfig(
+                    artifact_dir=root / "artifacts",
+                    repo_dir=Path("."),
+                    workspace_dir=root / "workspace",
+                    skills_dir=Path("skills"),
+                    agents_dir=Path("agents"),
+                ),
+            )
+
+            with (
+                patch("dbkit.cli.load_app_config", return_value=config),
+                patch("dbkit.cli.build_agent_model", return_value=object()),
+                patch("dbkit.cli.DeepAgentsRuntimeFactory", FakeRuntimeFactory),
+                patch("dbkit.cli.Orchestrator", FakeOrchestrator),
+                patch("dbkit.cli.MySQLAnalyzerAgent", FakeAnalyzerAgent),
+                patch("dbkit.cli.EvidencePipeline", FakeEvidencePipeline),
+                redirect_stdout(output),
+            ):
+                exit_code = main.main(["--config", str(root / "config.yaml"), "connect mysql"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("phase=phase-02.1", output.getvalue())
+        self.assertIn("status=collection_failed", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

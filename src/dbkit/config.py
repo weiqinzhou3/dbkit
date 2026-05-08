@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -49,10 +49,42 @@ class AgentConfig:
 
 
 @dataclass(frozen=True)
+class MySQLCollectionConfig:
+    connect_timeout_seconds: int = 5
+    read_timeout_seconds: int = 30
+
+
+@dataclass(frozen=True)
+class SSHCollectionConfig:
+    connect_timeout_seconds: int = 5
+    command_timeout_seconds: int = 30
+
+
+@dataclass(frozen=True)
+class LogCollectionConfig:
+    max_bytes: int = 10_485_760
+    tail_lines: int = 5000
+
+
+@dataclass(frozen=True)
+class MetricsCollectionConfig:
+    mysqld_exporter_url: str | None = None
+
+
+@dataclass(frozen=True)
+class CollectionConfig:
+    mysql: MySQLCollectionConfig = field(default_factory=MySQLCollectionConfig)
+    ssh: SSHCollectionConfig = field(default_factory=SSHCollectionConfig)
+    logs: LogCollectionConfig = field(default_factory=LogCollectionConfig)
+    metrics: MetricsCollectionConfig = field(default_factory=MetricsCollectionConfig)
+
+
+@dataclass(frozen=True)
 class AppConfig:
     model: ModelConfig
     agent: AgentConfig
     runtime: RuntimeConfig
+    collection: CollectionConfig = field(default_factory=CollectionConfig)
 
 
 def load_app_config(config_path: str | Path | None = None) -> AppConfig:
@@ -65,6 +97,7 @@ def load_app_config(config_path: str | Path | None = None) -> AppConfig:
         model=_load_model_config(_require_mapping(document, "model")),
         agent=_load_agent_config(_optional_mapping(document, "agent")),
         runtime=_load_runtime_config(_require_mapping(document, "runtime")),
+        collection=_load_collection_config(_optional_mapping(document, "collection")),
     )
 
 
@@ -118,6 +151,31 @@ def _load_agent_config(data: dict[str, Any] | None) -> AgentConfig:
             data, "tool_calling_thinking_type"
         )
         or "disabled",
+    )
+
+
+def _load_collection_config(data: dict[str, Any] | None) -> CollectionConfig:
+    data = data or {}
+    mysql = _optional_mapping(data, "mysql") or {}
+    ssh = _optional_mapping(data, "ssh") or {}
+    logs = _optional_mapping(data, "logs") or {}
+    metrics = _optional_mapping(data, "metrics") or {}
+    return CollectionConfig(
+        mysql=MySQLCollectionConfig(
+            connect_timeout_seconds=_optional_int(mysql, "connect_timeout_seconds", 5),
+            read_timeout_seconds=_optional_int(mysql, "read_timeout_seconds", 30),
+        ),
+        ssh=SSHCollectionConfig(
+            connect_timeout_seconds=_optional_int(ssh, "connect_timeout_seconds", 5),
+            command_timeout_seconds=_optional_int(ssh, "command_timeout_seconds", 30),
+        ),
+        logs=LogCollectionConfig(
+            max_bytes=_optional_int(logs, "max_bytes", 10_485_760),
+            tail_lines=_optional_int(logs, "tail_lines", 5000),
+        ),
+        metrics=MetricsCollectionConfig(
+            mysqld_exporter_url=_optional_string(metrics, "mysqld_exporter_url"),
+        ),
     )
 
 

@@ -79,6 +79,7 @@ Implementation phases are maintained independently.
   phase-01.1-runtime-intake-closure.md
   phase-01.2-intake-ux-runtime-time-context.md
   phase-02-evidence-planning-collection-mvp.md
+  phase-02.1-real-mysql-evidence-collection-mvp.md
   phase-03-evidence-structuring-mvp.md
   phase-04-mysql-analyzer-findings-mvp.md
 ```
