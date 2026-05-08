@@ -101,6 +101,51 @@ class Guardrails:
             raise ValueError(f"Guardrails blocked: {list(result.blocking_issues)}")
         return request
 
+    def validate_supplement_patch(
+        self,
+        patch: dict[str, object],
+        *,
+        base_request: NormalizedRequest,
+    ) -> GuardrailsResult:
+        issues: list[str] = []
+        allowed_top_level = {
+            "target",
+            "ssh_target",
+            "provided_evidence",
+            "event",
+            "evidence_plan",
+            "missing_fields",
+            "metadata",
+        }
+
+        for key in patch:
+            if key == "target_agent":
+                issues.append("supplement_patch cannot modify target_agent")
+            elif key == "target_domain":
+                issues.append("supplement_patch cannot modify target_domain")
+            elif key == "task_type":
+                issues.append("supplement_patch cannot modify task_type")
+            elif key == "input_mode":
+                issues.append("supplement_patch cannot modify input_mode")
+            elif key == "collection_policy":
+                issues.extend(
+                    _collection_policy_patch_issues(
+                        patch.get("collection_policy"),
+                        base_request.collection_policy or {},
+                    )
+                )
+            elif key not in allowed_top_level:
+                issues.append(f"supplement_patch cannot modify field: {key}")
+
+        if _request_contains_secret_leakage(patch):
+            issues.append("secret leakage detected in supplement_patch")
+
+        return GuardrailsResult(
+            passed=len(issues) == 0,
+            normalized_request=base_request,
+            blocking_issues=tuple(issues),
+        )
+
     def _validate_provided_evidence_paths(self, request: NormalizedRequest) -> list[str]:
         provided = request.provided_evidence or {}
         discovery = provided.get("discovery") or {}
@@ -161,6 +206,22 @@ def _validate_time_window(tw: dict) -> str | None:
 def _request_contains_secret_leakage(payload: dict) -> bool:
     text = str(payload)
     return bool(_LEAKAGE_PATTERN.search(text))
+
+
+def _collection_policy_patch_issues(
+    patch_policy: object,
+    base_policy: dict[str, bool],
+) -> list[str]:
+    if not isinstance(patch_policy, dict):
+        return ["supplement_patch.collection_policy must be an object"]
+    issues: list[str] = []
+    for key, value in patch_policy.items():
+        if bool(value) and not bool(base_policy.get(str(key), False)):
+            issues.append(
+                "supplement_patch cannot enable collection policy denied by user: "
+                f"{key}"
+            )
+    return issues
 
 
 def _string_list(value: object) -> list[str]:

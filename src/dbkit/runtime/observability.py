@@ -78,6 +78,21 @@ class TelemetryRecorder:
             attributes={"request_id": request_id, "phase": "phase-01.1"},
         )
 
+    def emit_runtime_context_injected(
+        self, *, request_id: str, runtime_context: dict[str, str]
+    ) -> TelemetryEvent:
+        return self.emit(
+            event_type="runtime_context_injected",
+            stage="runtime_context",
+            message="Runtime time context injected",
+            attributes={
+                "request_id": request_id,
+                "current_datetime": runtime_context.get("current_datetime"),
+                "timezone": runtime_context.get("timezone"),
+                "locale": runtime_context.get("locale"),
+            },
+        )
+
     def emit_intake_agent_completed(self, *, request_id: str) -> TelemetryEvent:
         return self.emit(
             event_type="intake_agent_completed",
@@ -169,4 +184,90 @@ class TelemetryRecorder:
             stage="artifacts",
             message=f"Artifact written: {kind}",
             attributes={"request_id": request_id, "kind": kind, "path": path},
+        )
+
+    def emit_blocked_message_requested(self, *, request_id: str) -> TelemetryEvent:
+        return self.emit(
+            event_type="request_blocked_message_requested",
+            stage="intake",
+            message="Structured blocked user message requested",
+            attributes={"request_id": request_id},
+        )
+
+    def emit_relative_time_resolved(
+        self,
+        *,
+        request_id: str,
+        event_time: str,
+        runtime_context: dict[str, str],
+    ) -> TelemetryEvent:
+        return self.emit(
+            event_type="relative_time_resolved",
+            stage="intake",
+            message="Relative time expression resolved from runtime context",
+            attributes={
+                "request_id": request_id,
+                "event_time": event_time,
+                "current_datetime": runtime_context.get("current_datetime"),
+                "timezone": runtime_context.get("timezone"),
+            },
+        )
+
+    def emit_relative_time_resolution_failed(
+        self, *, request_id: str, reason: str
+    ) -> TelemetryEvent:
+        return self.emit(
+            event_type="relative_time_resolution_failed",
+            stage="intake",
+            message="Relative time resolution failed",
+            attributes={"request_id": request_id, "reason": reason},
+        )
+
+    def emit_blocked_message_validated(
+        self, *, request_id: str, valid: bool, errors: list[str] | None = None
+    ) -> TelemetryEvent:
+        return self.emit(
+            event_type="request_blocked_message_validated",
+            stage="intake",
+            message="Structured blocked user message validated",
+            attributes={
+                "request_id": request_id,
+                "valid": valid,
+                "errors": errors or [],
+            },
+        )
+
+    def emit_blocked_message_rendered(self, *, request_id: str) -> TelemetryEvent:
+        return self.emit(
+            event_type="request_blocked_message_rendered",
+            stage="cli",
+            message="Structured blocked user message rendered",
+            attributes={"request_id": request_id},
+        )
+
+    def emit_blocked_message_fallback_used(
+        self, *, request_id: str, reason: str
+    ) -> TelemetryEvent:
+        return self.emit(
+            event_type="request_blocked_message_fallback_used",
+            stage="cli",
+            message="Fallback blocked user message rendered",
+            attributes={"request_id": request_id, "reason": reason},
+        )
+
+    def emit_interactive_event(
+        self,
+        *,
+        event_type: str,
+        request_id: str,
+        message: str,
+        attributes: dict[str, object] | None = None,
+    ) -> TelemetryEvent:
+        payload = {"request_id": request_id}
+        payload.update(attributes or {})
+        return self.emit(
+            event_type=event_type,
+            stage="interactive_supplement",
+            message=message,
+            attributes=payload,
         )

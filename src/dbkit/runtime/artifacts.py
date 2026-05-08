@@ -24,11 +24,21 @@ class ArtifactStore:
         self,
         request: NormalizedRequest,
         blocking_issues: tuple[str, ...],
+        *,
+        user_message: dict[str, Any] | None = None,
+        supplement_required: bool = True,
+        supplement_fields: list[str] | None = None,
     ) -> ArtifactRecord:
         payload: dict[str, Any] = {
             "status": "blocked",
+            "reason": "missing_required_fields"
+            if any(issue.startswith("missing required field: ") for issue in blocking_issues)
+            else "guardrails_failed",
             "blocking_issues": list(blocking_issues),
             "normalized_request": request.to_dict(),
+            "user_message": user_message or {},
+            "supplement_required": supplement_required,
+            "supplement_fields": supplement_fields or [],
         }
         path = self.root / f"{request.request_id}.blocked-request.json"
         path.write_text(

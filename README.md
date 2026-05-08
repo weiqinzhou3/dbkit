@@ -6,7 +6,7 @@ The project focuses on transforming large-scale raw operational data into struct
 
 ## Current Phase
 
-Phase 01: Runtime + Intake MVP.
+Phase 01.2: Intake UX + Runtime Time Context.
 
 This phase builds the runnable runtime skeleton, root entrypoint, package structure, DeepAgents SDK adapter, and intake-oriented foundation. It does not perform real DBA analysis.
 
@@ -44,6 +44,9 @@ agent:
 runtime:
   artifact_dir: .dbkit/artifacts
   invoke_llm: true
+  interactive: false
+  timezone: Asia/Shanghai
+  locale: zh-CN
   repo_dir: .
   workspace_dir: .
   skills_dir: skills
@@ -76,6 +79,12 @@ Run the root entrypoint:
 
 ```bash
 python3.11 main.py --config config/config.yaml "MySQL connection spike on prod-db-1"
+```
+
+Run with interactive intake supplement:
+
+```bash
+python3.11 main.py --config config/config.yaml --interactive "请帮我分析这个 MySQL，账号 root"
 ```
 
 Run tests:

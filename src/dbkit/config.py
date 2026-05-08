@@ -29,6 +29,9 @@ class ModelConfig:
 class RuntimeConfig:
     artifact_dir: Path = Path(".dbkit") / "artifacts"
     invoke_llm: bool = True
+    interactive: bool = False
+    timezone: str = "Asia/Shanghai"
+    locale: str = "zh-CN"
     repo_dir: Path = Path(".")
     workspace_dir: Path = Path(".")
     skills_dir: Path = Path("skills")
@@ -88,6 +91,9 @@ def _load_runtime_config(data: dict[str, Any]) -> RuntimeConfig:
     return RuntimeConfig(
         artifact_dir=Path(_require_string(data, "artifact_dir", "runtime")),
         invoke_llm=_optional_bool(data, "invoke_llm", True),
+        interactive=_optional_bool(data, "interactive", False),
+        timezone=_optional_string(data, "timezone") or "Asia/Shanghai",
+        locale=_optional_string(data, "locale") or "zh-CN",
         repo_dir=Path(_optional_string(data, "repo_dir") or "."),
         workspace_dir=Path(_optional_string(data, "workspace_dir") or "."),
         skills_dir=Path(_optional_string(data, "skills_dir") or "skills"),

@@ -27,6 +27,7 @@ def normalize_request(
     redaction_summary: dict[str, Any] | None = None,
     llm_intake_failed: bool = False,
     fallback_reason: str | None = None,
+    phase: str = "phase-01.1",
 ) -> NormalizedRequest:
     text = user_input.strip()
     if not text:
@@ -47,6 +48,7 @@ def normalize_request(
         event = _build_event(llm_json)
         evidence_plan = _evidence_plan(llm_json.get("evidence_plan"))
         normalizer = "llm_intake_plus_normalize_request"
+        llm_metadata = _optional_mapping(llm_json.get("metadata")) or {}
     else:
         target_domain = "mysql" if "mysql" in text.lower() else "mysql"
         target_agent = "mysql_analyzer"
@@ -60,6 +62,7 @@ def normalize_request(
         event = None
         evidence_plan = _evidence_plan(None)
         normalizer = "deterministic_fallback"
+        llm_metadata = {}
 
     missing_fields = _detect_missing_fields(
         input_mode=input_mode,
@@ -75,6 +78,7 @@ def normalize_request(
     metadata: dict[str, Any] = {
         "normalizer": normalizer,
         "skill": "skills/intake/SKILL.md",
+        **llm_metadata,
     }
     if llm_intake_failed:
         metadata["llm_intake_failed"] = True
@@ -87,7 +91,7 @@ def normalize_request(
         target_domain=target_domain,
         requested_capability="runtime_intake",
         missing_fields=missing_fields,
-        phase="phase-01.1",
+        phase=phase,
         target_agent=target_agent,
         task_type=task_type,
         routing_confidence=routing_confidence,
