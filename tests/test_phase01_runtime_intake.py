@@ -233,7 +233,7 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
         request = normalize_request("MySQL connection spike on prod-db-1")
 
         self.assertTrue(request.request_id.startswith("req_"))
-        self.assertEqual(request.phase, "phase-01.1")
+        self.assertEqual(request.phase, "phase-01.2")
         self.assertEqual(request.target_domain, "mysql")
         self.assertEqual(request.requested_capability, "runtime_intake")
         self.assertIn("target.host", request.missing_fields)
@@ -801,7 +801,7 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
 
         self.assertEqual(route.target_agent_name, "mysql_analyzer")
         self.assertEqual(route.target_domain, "mysql")
-        self.assertEqual(route.phase, "phase-01.1")
+        self.assertEqual(route.phase, "phase-01.2")
 
     # --- ArtifactStore ---
 

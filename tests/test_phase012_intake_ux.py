@@ -450,6 +450,91 @@ class Phase012IntakeUxTest(unittest.TestCase):
         self.assertNotIn("Root@123", artifacts)
         self.assertIn("<SECRET_REF:chinese_password_", result.normalized_request.target["password_ref"])
 
+    def test_interactive_mixed_supplement_patch_merges_multi_field(self) -> None:
+        """Spec §14.7: mixed supplement sets target.host, ssh_target.host, ssh_target.username."""
+
+        class FakeIntakeRuntime:
+            def invoke(self, payload):
+                if payload.get("mode") == "blocked_message":
+                    return _assistant_json(
+                        {
+                            "user_message": {
+                                "summary": "需要补充 MySQL 主机和 SSH 信息。",
+                                "missing_items": [
+                                    {
+                                        "field": "target.host",
+                                        "label": "MySQL 主机地址",
+                                        "reason": "live collection 需要连接目标。",
+                                        "example": "192.168.1.10",
+                                    }
+                                ],
+                                "retry_example": "MySQL 是 192.168.1.10，SSH 也是这台机器，用户 root",
+                            }
+                        }
+                    )
+                if payload.get("mode") == "supplement_patch":
+                    return _assistant_json(
+                        {
+                            "supplement_patch": {
+                                "target": {"host": "192.168.1.10"},
+                                "ssh_target": {
+                                    "host": "192.168.1.10",
+                                    "username": "root",
+                                },
+                            }
+                        }
+                    )
+                return _assistant_json(
+                    {
+                        "target_agent": "mysql_analyzer",
+                        "target_domain": "mysql",
+                        "task_type": "alert_analysis",
+                        "routing_confidence": 0.91,
+                        "input_mode": "live_collection",
+                        "target": {
+                            "type": "mysql",
+                            "host": None,
+                            "port": 3306,
+                            "username": "dba",
+                            "password_ref": "<SECRET_REF:password_001>",
+                        },
+                        "ssh_target": None,
+                        "collection_policy": {
+                            "allow_live_collection": True,
+                            "allow_mysql_login": True,
+                            "allow_ssh": True,
+                            "allow_metrics_query": False,
+                        },
+                        "event": {
+                            "event_time": "2026-05-08T17:00:00+08:00",
+                            "time_window": {
+                                "before": "6h",
+                                "after": "1h",
+                                "source": "skill_default_from_event_time",
+                            },
+                            "symptoms": ["high_cpu"],
+                        },
+                        "missing_fields": ["target.host", "ssh_target.host", "ssh_target.username"],
+                    }
+                )
+
+        result = _orchestrator_with_runtime(FakeIntakeRuntime()).run(
+            "请连接 MySQL 分析今天17:00告警，用户 dba，也需要 SSH 到机器",
+            interactive=True,
+            supplement_reader=lambda: "MySQL 是 192.168.1.10，SSH 也是这台机器，用户 root",
+        )
+
+        self.assertFalse(result.blocked)
+        self.assertEqual(result.normalized_request.target["host"], "192.168.1.10")
+        self.assertEqual(result.normalized_request.ssh_target["host"], "192.168.1.10")
+        self.assertEqual(result.normalized_request.ssh_target["username"], "root")
+        self.assertNotIn("target.host", result.normalized_request.missing_fields)
+        self.assertNotIn("ssh_target.host", result.normalized_request.missing_fields)
+        self.assertNotIn("ssh_target.username", result.normalized_request.missing_fields)
+        history = result.normalized_request.metadata.get("supplement_history", [])
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["guardrails_status"], "passed")
+
     def test_patch_guardrails_reject_system_agent_target(self) -> None:
         result = Guardrails().validate_supplement_patch(
             {"target_agent": "validation_agent"},

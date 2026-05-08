@@ -498,6 +498,9 @@ class Orchestrator:
         self.telemetry.emit_guardrails_passed(
             request_id=supplemented_request.request_id
         )
+        history = supplemented_request.metadata.get("supplement_history")
+        if isinstance(history, list) and history:
+            history[-1]["guardrails_status"] = "passed"
         self.telemetry.emit_interactive_event(
             event_type="interactive_supplement_completed",
             request_id=supplemented_request.request_id,

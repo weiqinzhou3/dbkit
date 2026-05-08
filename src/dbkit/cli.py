@@ -75,6 +75,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if result.rendered_user_message:
             print()
             print(result.rendered_user_message)
+        print()
+        print("提示：使用 --interactive 可以交互式补充缺失信息。")
         return 1
 
     print(f"phase={result.normalized_request.phase}")

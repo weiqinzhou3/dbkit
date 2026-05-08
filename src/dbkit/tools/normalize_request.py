@@ -27,7 +27,7 @@ def normalize_request(
     redaction_summary: dict[str, Any] | None = None,
     llm_intake_failed: bool = False,
     fallback_reason: str | None = None,
-    phase: str = "phase-01.1",
+    phase: str = "phase-01.2",
 ) -> NormalizedRequest:
     text = user_input.strip()
     if not text:
