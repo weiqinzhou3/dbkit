@@ -144,6 +144,7 @@ class ArtifactStore:
         payload: dict[str, Any] = {
             "request_id": request_id,
             "phase": phase,
+            "metadata": _phase_metadata(phase),
             "raw_evidence": [_raw_evidence_index_entry(item) for item in raw_evidence],
             **collection_summary(raw_evidence),
         }
@@ -207,6 +208,12 @@ def _raw_evidence_index_entry(item: RawEvidence) -> dict[str, Any]:
     if preview:
         entry["preview"] = preview
     return entry
+
+
+def _phase_metadata(phase: str) -> dict[str, Any]:
+    if phase.startswith("phase-02.1"):
+        return {"phase_detail": "phase-02.1-real-mysql-evidence-collection"}
+    return {}
 
 
 def _payload_preview(payload: dict[str, Any]) -> dict[str, Any]:

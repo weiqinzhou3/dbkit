@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
+from time import perf_counter_ns
 from typing import Any, Callable
 
 from dbkit.runtime.artifacts import ArtifactStore
@@ -33,6 +35,21 @@ _MYSQL_BASELINE_TOOL_HINTS = (
     "collect_mysql_variables",
     "collect_mysql_service_metadata",
     "discover_mysql_log_paths",
+)
+_PHASE_02_1_DETAIL = "phase-02.1-real-mysql-evidence-collection"
+_DEPRECATED_MYSQL_METRIC_TOOL_HINTS = frozenset(
+    {
+        "collect_mysql_metrics_snapshot",
+        "collect_mysql_status_metrics",
+        "collect_mysql_variable_metrics",
+    }
+)
+_DEPRECATED_MYSQL_METRIC_EVIDENCE_TYPES = frozenset(
+    {
+        "metrics.mysql",
+        "metrics.mysql_status",
+        "metrics.mysql_variables",
+    }
 )
 
 
@@ -159,6 +176,7 @@ class EvidencePipeline:
                 telemetry=tuple(self.telemetry.events),
                 blocking_issues=("evidence_request_validation_failed",),
             )
+        evidence_request = _with_phase_detail(evidence_request, request)
         self.telemetry.emit(
             event_type="evidence_planning_completed",
             stage="evidence_planning",
@@ -196,7 +214,7 @@ class EvidencePipeline:
             )
             if revised is not None:
                 revision_used = True
-                evidence_request = revised
+                evidence_request = _with_phase_detail(revised, request)
                 evidence_artifact = self.artifact_store.persist_evidence_request(
                     evidence_request
                 )
@@ -247,7 +265,7 @@ class EvidencePipeline:
             )
             if revised is not None:
                 revision_used = True
-                evidence_request = revised
+                evidence_request = _with_phase_detail(revised, request)
                 evidence_artifact = self.artifact_store.persist_evidence_request(
                     evidence_request
                 )
@@ -379,12 +397,18 @@ class EvidencePipeline:
                     "tool_name": step.tool_name,
                 },
             )
+            started_ns = perf_counter_ns()
             collected = self.collectors.collect(
                 step=step,
                 request=request,
                 raw_root=raw_root,
                 started_at=now,
                 completed_at=now,
+            )
+            elapsed_ms = max(0, (perf_counter_ns() - started_ns) // 1_000_000)
+            collected = tuple(
+                _with_collection_duration(item, elapsed_ms)
+                for item in collected
             )
             raw_items.extend(collected)
             for item in collected:
@@ -500,7 +524,7 @@ class EvidencePipeline:
         return CollectionPlan(
             request_id=request.request_id,
             collection_plan_id=stable_id("cp", request.request_id, len(steps)),
-            phase="phase-02",
+            phase=request.phase if request.phase.startswith("phase-02.1") else "phase-02",
             input_mode=request.input_mode,
             steps=tuple(steps),
         )
@@ -610,8 +634,9 @@ class EvidencePipeline:
                 "Output revised DBKit EvidenceRequest JSON only. Fix the listed "
                 "blocking issues. Add missing MySQL baseline evidence when the "
                 "baseline policy requires it. Remove tools blocked by "
-                "collection_policy. Do not add collection tools that are not "
-                "permitted by the collection_policy."
+                "collection_policy. Remove deprecated duplicate MySQL metrics "
+                "evidence. Do not add collection tools that are not permitted by "
+                "the collection_policy."
             ),
         }
         result = invoke(
@@ -699,6 +724,25 @@ class EvidencePipeline:
             ]
             if missing:
                 issues.append("missing MySQL baseline evidence: " + ", ".join(missing))
+            deprecated = sorted(
+                {
+                    str(item.get("tool_hint") or "")
+                    for _, _, item in items
+                    if str(item.get("tool_hint") or "")
+                    in _DEPRECATED_MYSQL_METRIC_TOOL_HINTS
+                }
+                | {
+                    str(item.get("evidence_type") or "")
+                    for _, _, item in items
+                    if str(item.get("evidence_type") or "")
+                    in _DEPRECATED_MYSQL_METRIC_EVIDENCE_TYPES
+                }
+            )
+            if deprecated:
+                issues.append(
+                    "deprecated duplicate MySQL metrics evidence not allowed by default: "
+                    + ", ".join(deprecated)
+                )
 
         return tuple(dict.fromkeys(issues))
 
@@ -735,6 +779,24 @@ def _collection_plan_source_items(
             if isinstance(item, dict):
                 items.append((field_name, index, item))
     return items
+
+
+def _with_phase_detail(
+    evidence_request: EvidenceRequest,
+    request: NormalizedRequest,
+) -> EvidenceRequest:
+    if not request.phase.startswith("phase-02.1"):
+        return evidence_request
+    metadata = dict(evidence_request.metadata)
+    metadata.setdefault("phase_detail", _PHASE_02_1_DETAIL)
+    return replace(evidence_request, metadata=metadata)
+
+
+def _with_collection_duration(item: RawEvidence, duration_ms: int) -> RawEvidence:
+    collection = dict(item.collection)
+    existing = int(collection.get("duration_ms") or 0)
+    collection["duration_ms"] = max(existing, duration_ms)
+    return replace(item, collection=collection)
 
 
 def _target_ref(source: str, tool_name: str) -> str:

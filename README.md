@@ -12,6 +12,14 @@ This phase connects a Phase-01 `NormalizedRequest` to MySQL Analyzer evidence
 planning, guarded collection planning, and deterministic RawEvidence collection.
 It does not produce findings, root cause, validation verdicts, or summaries.
 
+Phase-02.1 default MySQL live collection uses `mysql.runtime_status` for
+`SHOW GLOBAL STATUS` and `mysql.variables` for `SHOW GLOBAL VARIABLES`.
+Deprecated MySQL metrics evidence types such as `metrics.mysql`,
+`metrics.mysql_status`, and `metrics.mysql_variables` are retained only for
+backward compatibility and must not be selected by default planning. Phase-03
+Evidence Structuring must deduplicate overlapping raw evidence if legacy inputs
+contain these deprecated metrics artifacts.
+
 ## Requirements
 
 - Python 3.11+

@@ -80,9 +80,6 @@ Use only these canonical `evidence_type` values:
 - `metrics.cpu`
 - `metrics.memory`
 - `metrics.disk`
-- `metrics.mysql`
-- `metrics.mysql_status`
-- `metrics.mysql_variables`
 - `metrics.os_cpu`
 - `metrics.os_memory`
 - `metrics.os_disk`
@@ -118,9 +115,6 @@ Tool source mapping:
 - `discover_mysql_log_paths` -> `mysql`
 - `collect_mysql_error_log` -> `ssh`
 - `collect_mysql_slow_log` -> `ssh`
-- `collect_mysql_metrics_snapshot` -> `mysql`
-- `collect_mysql_status_metrics` -> `mysql`
-- `collect_mysql_variable_metrics` -> `mysql`
 - `collect_metrics_snapshot` -> `metrics`
 - `collect_os_service_status` -> `ssh`
 - `collect_os_cpu_snapshot` -> `ssh`
@@ -144,9 +138,6 @@ one of these collector tools. Runtime only validates and executes the
 - `mysql.log_paths -> discover_mysql_log_paths`; source=`mysql`; Requires `collection_policy.allow_live_collection=true` and `collection_policy.allow_mysql_login=true`.
 - `mysql.error_log -> collect_mysql_error_log`; source=`ssh`; Requires collection_policy.allow_ssh=true and an SSH target.
 - `mysql.slow_log -> collect_mysql_slow_log`; source=`ssh`; Requires collection_policy.allow_ssh=true and an SSH target.
-- `metrics.mysql -> collect_mysql_metrics_snapshot`; source=`mysql`; Requires `collection_policy.allow_live_collection=true` and `collection_policy.allow_mysql_login=true`.
-- `metrics.mysql_status -> collect_mysql_status_metrics`; source=`mysql`; Requires `collection_policy.allow_live_collection=true` and `collection_policy.allow_mysql_login=true`.
-- `metrics.mysql_variables -> collect_mysql_variable_metrics`; source=`mysql`; Requires `collection_policy.allow_live_collection=true` and `collection_policy.allow_mysql_login=true`.
 - `metrics.cpu -> collect_os_cpu_snapshot`; source=`ssh`; Requires collection_policy.allow_ssh=true and an SSH target.
 - `metrics.memory -> collect_os_memory_snapshot`; source=`ssh`; Requires collection_policy.allow_ssh=true and an SSH target.
 - `metrics.disk -> collect_os_disk_snapshot`; source=`ssh`; Requires collection_policy.allow_ssh=true and an SSH target.
@@ -170,7 +161,9 @@ When SSH is not allowed, prefer MySQL-native collectors:
 - `collect_mysql_innodb_status`
 - `collect_mysql_variables`
 - `collect_mysql_service_metadata`
-- `collect_mysql_metrics_snapshot`
+
+Use `mysql.runtime_status` for `SHOW GLOBAL STATUS` and `mysql.variables` for
+`SHOW GLOBAL VARIABLES`.
 
 ## MySQL Baseline Evidence Policy
 
@@ -188,6 +181,23 @@ baseline MySQL evidence items:
 If `collection_policy.allow_ssh=true`, add SSH/log/OS evidence on top of this
 baseline. Do not replace, omit, or downgrade baseline evidence because SSH,
 log, or OS evidence is available.
+
+## Deprecated MySQL Metrics Evidence
+
+Do not select these evidence types in default planning:
+
+- `metrics.mysql`
+- `metrics.mysql_status`
+- `metrics.mysql_variables`
+
+Do not select these collector tools in default planning:
+
+- `collect_mysql_metrics_snapshot`
+- `collect_mysql_status_metrics`
+- `collect_mysql_variable_metrics`
+
+They overlap with `mysql.runtime_status` and `mysql.variables`. If MySQL-native
+status or variables are needed, use the baseline evidence types instead.
 
 ## Input Mode Guidance
 
@@ -207,9 +217,6 @@ collection policy:
 - `discover_mysql_log_paths`
 - `collect_mysql_error_log`
 - `collect_mysql_slow_log`
-- `collect_mysql_metrics_snapshot`
-- `collect_mysql_status_metrics`
-- `collect_mysql_variable_metrics`
 - `collect_os_service_status`
 - `collect_os_cpu_snapshot`
 - `collect_os_memory_snapshot`

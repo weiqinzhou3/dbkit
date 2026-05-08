@@ -1,4 +1,5 @@
 import json
+import time
 import tempfile
 import unittest
 from datetime import datetime
@@ -73,6 +74,49 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
         self.assertIn("mysql.runtime_status -> collect_mysql_runtime_status", skill_text)
         self.assertIn("metrics.cpu -> collect_os_cpu_snapshot", skill_text)
         self.assertIn("Requires collection_policy.allow_ssh=true", skill_text)
+        self.assertIn("Deprecated MySQL Metrics Evidence", skill_text)
+        baseline_section = skill_text.split("## MySQL Baseline Evidence Policy", 1)[1]
+        baseline_section = baseline_section.split("## Deprecated MySQL Metrics Evidence", 1)[0]
+        self.assertNotIn("metrics.mysql", baseline_section)
+        self.assertNotIn("collect_mysql_metrics_snapshot", baseline_section)
+
+    def test_deprecated_mysql_metrics_trigger_revision_and_are_removed(self) -> None:
+        request = _live_request()
+        fake_mysql = FakeMySQLClient(_baseline_mysql_results())
+        analyzer = RevisionAnalyzerRuntime(
+            first_payload=_evidence_request(
+                request,
+                [
+                    *_baseline_tools(),
+                    ("collect_mysql_metrics_snapshot", "metrics.mysql", "mysql"),
+                    ("collect_mysql_status_metrics", "metrics.mysql_status", "mysql"),
+                    ("collect_mysql_variable_metrics", "metrics.mysql_variables", "mysql"),
+                ],
+            ),
+            second_payload=_evidence_request(request, _baseline_tools()),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = EvidencePipeline(
+                artifact_store=ArtifactStore(root / "artifacts"),
+                telemetry=_telemetry(),
+                collectors=CollectorRegistry(
+                    workspace_root=root / "workspace",
+                    mysql_client_factory=lambda _request, _secrets: fake_mysql,
+                    secret_store=SecretStore({"<SECRET_REF:mysql_password_001>": "Root"}),
+                ),
+                time_provider=_time_provider(),
+                mysql_analyzer_runtime=analyzer,
+            ).run(request)
+
+        self.assertEqual(analyzer.modes, ["evidence_planning", "evidence_planning_revision"])
+        self.assertEqual(result.status, "raw_evidence_collected")
+        evidence_types = {item.evidence_type for item in result.raw_evidence}
+        self.assertEqual(evidence_types, {item[1] for item in _baseline_tools()})
+        self.assertNotIn("metrics.mysql", evidence_types)
+        self.assertNotIn("metrics.mysql_status", evidence_types)
+        self.assertNotIn("metrics.mysql_variables", evidence_types)
 
     def test_mysql_plus_ssh_missing_baseline_triggers_revision_and_preserves_baseline(self) -> None:
         request = _live_request(with_ssh=True)
@@ -105,6 +149,9 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
                     ("collect_mysql_error_log", "mysql.error_log", "ssh"),
                     ("collect_mysql_slow_log", "mysql.slow_log", "ssh"),
                     ("collect_os_cpu_snapshot", "metrics.os_cpu", "ssh"),
+                    ("collect_os_memory_snapshot", "metrics.os_memory", "ssh"),
+                    ("collect_os_disk_snapshot", "metrics.os_disk", "ssh"),
+                    ("collect_os_service_status", "os.mysql_service_status", "ssh"),
                 ],
             ),
         )
@@ -142,8 +189,13 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
             "mysql.error_log",
             "mysql.slow_log",
             "metrics.os_cpu",
+            "metrics.os_memory",
+            "metrics.os_disk",
+            "os.mysql_service_status",
         ):
             self.assertIn(expected, evidence_types)
+        for deprecated in ("metrics.mysql", "metrics.mysql_status", "metrics.mysql_variables"):
+            self.assertNotIn(deprecated, evidence_types)
 
     def test_missing_baseline_without_revision_blocks_without_runtime_injection(self) -> None:
         request = _live_request(with_ssh=True)
@@ -498,6 +550,13 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
         self.assertEqual(payload["collected_count"], 6)
         self.assertEqual(payload["not_available_count"], 1)
         self.assertEqual(payload["not_implemented_count"], 0)
+        self.assertEqual(payload["phase"], "phase-02.1")
+        self.assertEqual(
+            payload["metadata"]["phase_detail"],
+            "phase-02.1-real-mysql-evidence-collection",
+        )
+        for item in payload["raw_evidence"]:
+            self.assertNotIn("data", item["payload"])
 
     def test_large_payload_data_rows_do_not_enter_raw_evidence_index(self) -> None:
         raw = RawEvidence(
@@ -531,6 +590,30 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
         self.assertEqual(index_item["payload"]["bytes"], 2048)
         self.assertEqual(index_item["preview"]["rows_count"], 100)
 
+    def test_collector_duration_ms_records_tool_execution_time(self) -> None:
+        request = _live_request()
+        fake_mysql = DelayedMySQLClient(
+            {"SHOW GLOBAL STATUS": [{"Variable_name": "Threads_running", "Value": "3"}]},
+            delay_seconds=0.02,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = EvidencePipeline(
+                artifact_store=ArtifactStore(root / "artifacts"),
+                telemetry=_telemetry(),
+                collectors=CollectorRegistry(
+                    workspace_root=root / "workspace",
+                    mysql_client_factory=lambda _request, _secrets: fake_mysql,
+                    secret_store=SecretStore({"<SECRET_REF:mysql_password_001>": "Root"}),
+                ),
+                time_provider=_time_provider(),
+            ).run(request, evidence_request_json=_evidence_request(request, _baseline_tools()))
+
+        durations = [int(item.collection["duration_ms"]) for item in result.raw_evidence]
+        self.assertTrue(all(duration >= 0 for duration in durations))
+        self.assertGreater(durations[0], 0)
+
     def test_collection_failed_when_all_collectors_fail(self) -> None:
         request = _live_request()
         evidence_request_json = _evidence_request(
@@ -563,6 +646,16 @@ class FakeMySQLClient:
     def execute(self, sql: str) -> list[dict]:
         self.queries.append(sql)
         return self.results.get(sql, [])
+
+
+class DelayedMySQLClient(FakeMySQLClient):
+    def __init__(self, results: dict[str, list[dict]], *, delay_seconds: float) -> None:
+        super().__init__(results)
+        self.delay_seconds = delay_seconds
+
+    def execute(self, sql: str) -> list[dict]:
+        time.sleep(self.delay_seconds)
+        return super().execute(sql)
 
 
 class FailingMySQLClient:
