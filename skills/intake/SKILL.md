@@ -70,6 +70,12 @@ Do not assume host absolute paths such as `/tmp/...` are readable. If the user
 stores files in a host directory, runtime must map that host directory to
 `/workspace/` via config.
 
+If `runtime.workspace_dir=/`, convert host path `/tmp/a` to
+`/workspace/tmp/a` before calling filesystem tools.
+
+If `runtime.workspace_dir=/tmp/mysql_conn_full_mock`, convert host path
+`/tmp/mysql_conn_full_mock/mysql-error.log` to `/workspace/mysql-error.log`.
+
 ## Target Agent Selection
 
 `target_agent` must be a domain analyzer route target:
@@ -285,6 +291,57 @@ Examples:
 - `只需要分析本地文件` -> `provided_evidence.mode="local_files"`
 
 Phase-01.1 does not read file contents. It only records the user's evidence intent and paths.
+
+### Provided Evidence File Discovery
+
+When the user provides a directory:
+
+1. Convert any host absolute path to the matching `/workspace/` virtual path.
+2. Call `ls` on the directory.
+3. Call `glob` from that directory for common evidence files:
+   - `*.log`
+   - `*.txt`
+   - `*.out`
+   - `*.err`
+   - `*.prom`
+   - `*.json`
+   - `*.csv`
+4. Put discovered files in `provided_evidence.files`.
+5. Record discovery details in `provided_evidence.discovery`.
+6. Use `read_file` only when needed to confirm a specific text file path exists
+   or to collect lightweight metadata. Do not analyze file contents in Phase-01.1.
+
+When the user provides a specific file:
+
+1. Convert it to a `/workspace/` virtual path.
+2. Register it in `provided_evidence.files`.
+3. Record it in `provided_evidence.discovery.discovered_files`.
+
+Discovery shape:
+
+```json
+{
+  "attempted_paths": ["/workspace/tmp/mysql_conn_full_mock/"],
+  "discovered_files": ["/workspace/tmp/mysql_conn_full_mock/mysql-error.log"],
+  "discovery_status": "files_found",
+  "errors": [],
+  "file_sizes_bytes": {
+    "/workspace/tmp/mysql_conn_full_mock/mysql-error.log": 10713
+  }
+}
+```
+
+Allowed `discovery_status` values:
+
+- `not_attempted`
+- `files_found`
+- `empty`
+- `partial`
+- `error`
+
+Do not assume the user is wrong after one empty `ls` or `glob`. Record the
+attempted path and errors. Only leave `provided_evidence.files=[]` when discovery
+is actually empty or failed.
 
 ## Collection Policy
 

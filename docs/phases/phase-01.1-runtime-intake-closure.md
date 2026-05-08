@@ -234,6 +234,27 @@ The Intake Agent must use DBKit virtual paths:
 
 Host absolute paths such as `/tmp/...` are not valid agent-visible paths unless the runtime maps that host directory into `/workspace/`.
 
+If `runtime.workspace_dir=/`, host path `/tmp/a` maps to `/workspace/tmp/a`.
+
+Provided evidence discovery is owned by the Intake Agent using the Intake Skill
+and DeepAgents filesystem tools. Runtime must not scan directories or generate
+evidence lists from prompt semantics. Runtime only configures filesystem roots,
+executes tool calls, records telemetry, and validates final `provided_evidence`.
+
+`provided_evidence.discovery` records discovery status:
+
+```json
+{
+  "attempted_paths": ["/workspace/tmp/mysql_conn_full_mock/"],
+  "discovered_files": ["/workspace/tmp/mysql_conn_full_mock/mysql-error.log"],
+  "discovery_status": "files_found",
+  "errors": [],
+  "file_sizes_bytes": {
+    "/workspace/tmp/mysql_conn_full_mock/mysql-error.log": 10713
+  }
+}
+```
+
 ## 4.8 Artifact Readability
 
 All JSON artifacts must use:

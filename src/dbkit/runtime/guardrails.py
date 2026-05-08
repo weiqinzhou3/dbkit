@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import re
 
 from dbkit.schemas.runtime import GuardrailsResult, NormalizedRequest
@@ -23,6 +24,19 @@ _LEAKAGE_PATTERN = re.compile(
 
 
 class Guardrails:
+    def __init__(
+        self,
+        *,
+        allowed_workspace_root: str = "/workspace/",
+        max_discovered_files: int = 100,
+        max_evidence_file_size_bytes: int = 50_000_000,
+        blocked_paths: tuple[str, ...] = (),
+    ) -> None:
+        self.allowed_workspace_root = _normalize_root(allowed_workspace_root)
+        self.max_discovered_files = max_discovered_files
+        self.max_evidence_file_size_bytes = max_evidence_file_size_bytes
+        self.blocked_paths = blocked_paths
+
     def validate(self, request: NormalizedRequest) -> GuardrailsResult:
         issues: list[str] = []
 
@@ -65,6 +79,8 @@ class Guardrails:
         if _request_contains_secret_leakage(request.to_dict()):
             issues.append("secret leakage detected in normalized_request")
 
+        issues.extend(self._validate_provided_evidence_paths(request))
+
         if request.event:
             tw = request.event.get("time_window")
             if tw:
@@ -84,6 +100,45 @@ class Guardrails:
         if not result.passed:
             raise ValueError(f"Guardrails blocked: {list(result.blocking_issues)}")
         return request
+
+    def _validate_provided_evidence_paths(self, request: NormalizedRequest) -> list[str]:
+        provided = request.provided_evidence or {}
+        discovery = provided.get("discovery") or {}
+        files = _string_list(provided.get("files"))
+        discovered_files = _string_list(discovery.get("discovered_files"))
+        attempted_paths = _string_list(discovery.get("attempted_paths"))
+        all_paths = list(dict.fromkeys(files + discovered_files + attempted_paths))
+        issues: list[str] = []
+
+        evidence_files = list(dict.fromkeys(files + discovered_files))
+        if len(evidence_files) > self.max_discovered_files:
+            issues.append(
+                "too many discovered files: "
+                f"{len(evidence_files)} > {self.max_discovered_files}"
+            )
+
+        for path in all_paths:
+            if not _is_under_root(path, self.allowed_workspace_root):
+                issues.append(
+                    f"provided evidence path outside allowed workspace root: {path}"
+                )
+            if any(fnmatch.fnmatch(path, pattern) for pattern in self.blocked_paths):
+                issues.append(f"provided evidence path matches blocked path: {path}")
+
+        sizes = discovery.get("file_sizes_bytes") or {}
+        if isinstance(sizes, dict):
+            for path, raw_size in sizes.items():
+                try:
+                    size = int(raw_size)
+                except (TypeError, ValueError):
+                    continue
+                if size > self.max_evidence_file_size_bytes:
+                    issues.append(
+                        "provided evidence file exceeds max evidence file size: "
+                        f"{path}={size} > {self.max_evidence_file_size_bytes}"
+                    )
+
+        return issues
 
 
 def _validate_time_window(tw: dict) -> str | None:
@@ -106,3 +161,20 @@ def _validate_time_window(tw: dict) -> str | None:
 def _request_contains_secret_leakage(payload: dict) -> bool:
     text = str(payload)
     return bool(_LEAKAGE_PATTERN.search(text))
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]
+
+
+def _normalize_root(path: str) -> str:
+    root = path if path.startswith("/") else f"/{path}"
+    return root if root.endswith("/") else f"{root}/"
+
+
+def _is_under_root(path: str, root: str) -> bool:
+    if path == root.rstrip("/"):
+        return True
+    return path.startswith(root)

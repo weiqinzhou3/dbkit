@@ -53,7 +53,36 @@ class DeepAgentsRuntimeFactory:
         if not system_md.exists():
             raise FileNotFoundError(f"Intake system prompt not found: {system_md}")
         agent_prompt = system_md.read_text(encoding="utf-8")
-        return f"{agent_prompt}\n\n---\n\n{skill_text}"
+        return (
+            f"{agent_prompt}\n\n---\n\n"
+            f"{self._filesystem_context_prompt()}\n\n---\n\n"
+            f"{skill_text}"
+        )
+
+    def _filesystem_context_prompt(self) -> str:
+        return "\n".join(
+            [
+                "## Runtime Filesystem Mapping",
+                "",
+                "DeepAgents file tools use DBKit virtual paths.",
+                "",
+                "- `/repo/` maps to configured `runtime.repo_dir`.",
+                "- `/workspace/` maps to configured `runtime.workspace_dir`.",
+                "- `/skills/` maps to configured `runtime.skills_dir`.",
+                "- `/agents/` maps to configured `runtime.agents_dir`.",
+                "",
+                "When the user provides a host absolute path, convert it to the",
+                "corresponding `/workspace/` virtual path before calling `ls`,",
+                "`glob`, or `read_file`.",
+                "",
+                "If `runtime.workspace_dir=/`, host path `/tmp/a` maps to",
+                "`/workspace/tmp/a`.",
+                "",
+                "If `runtime.workspace_dir=/tmp/mysql_conn_full_mock`, host path",
+                "`/tmp/mysql_conn_full_mock/mysql-error.log` maps to",
+                "`/workspace/mysql-error.log`.",
+            ]
+        )
 
     def _filesystem_backend(self) -> Any:
         from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
@@ -79,3 +108,20 @@ class DeepAgentsRuntimeFactory:
                 ),
             },
         )
+
+    def host_path_to_workspace_virtual_path(self, host_path: str | Path) -> str:
+        path = Path(host_path)
+        if not path.is_absolute():
+            return f"/workspace/{path.as_posix().lstrip('/')}"
+
+        workspace = self.workspace_dir.absolute()
+        try:
+            relative = path.relative_to(workspace)
+        except (OSError, ValueError):
+            relative = Path(path.as_posix().lstrip("/"))
+
+        suffix = relative.as_posix().strip("/")
+        virtual_path = "/workspace/" + suffix if suffix else "/workspace/"
+        if str(host_path).endswith("/") and not virtual_path.endswith("/"):
+            virtual_path += "/"
+        return virtual_path

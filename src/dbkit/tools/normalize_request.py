@@ -219,10 +219,12 @@ def _missing_field_allowed_for_mode(
 def _has_provided_evidence(provided_evidence: dict[str, Any] | None) -> bool:
     if not provided_evidence:
         return False
+    discovery = provided_evidence.get("discovery") or {}
     return bool(
         provided_evidence.get("files")
         or provided_evidence.get("pasted_text")
         or provided_evidence.get("input_files")
+        or discovery.get("discovered_files")
     )
 
 
@@ -272,13 +274,34 @@ def _collection_policy(value: object, input_mode: str) -> dict[str, bool]:
 
 def _provided_evidence(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
+        discovery = value.get("discovery") if isinstance(value.get("discovery"), dict) else {}
         return {
             "mode": value.get("mode") or "unknown",
             "files": list(value.get("files") or []),
             "pasted_text": bool(value.get("pasted_text", False)),
             "description": value.get("description") or "",
+            "discovery": _provided_evidence_discovery(discovery),
         }
-    return {"mode": "unknown", "files": [], "pasted_text": False, "description": ""}
+    return {
+        "mode": "unknown",
+        "files": [],
+        "pasted_text": False,
+        "description": "",
+        "discovery": _provided_evidence_discovery({}),
+    }
+
+
+def _provided_evidence_discovery(value: dict[str, Any]) -> dict[str, Any]:
+    file_sizes = value.get("file_sizes_bytes") or {}
+    if not isinstance(file_sizes, dict):
+        file_sizes = {}
+    return {
+        "attempted_paths": list(value.get("attempted_paths") or []),
+        "discovered_files": list(value.get("discovered_files") or []),
+        "discovery_status": value.get("discovery_status") or "not_attempted",
+        "errors": list(value.get("errors") or []),
+        "file_sizes_bytes": dict(file_sizes),
+    }
 
 
 def _evidence_plan(value: object) -> dict[str, Any]:

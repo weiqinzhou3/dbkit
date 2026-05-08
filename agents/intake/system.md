@@ -34,13 +34,22 @@ Use these virtual paths when inspecting available files. Do not treat host paths
 such as `/tmp/...` as directly readable unless the runtime has mapped that host
 directory into `/workspace/`.
 
+When the user provides a host absolute path, convert it to the corresponding
+workspace virtual path before using filesystem tools. If `runtime.workspace_dir=/`,
+host path `/tmp/a` maps to `/workspace/tmp/a`. If
+`runtime.workspace_dir=/tmp/mysql_conn_full_mock`, host path
+`/tmp/mysql_conn_full_mock/mysql-error.log` maps to
+`/workspace/mysql-error.log`.
+
 ## What You Must Not Do
 
 - Do not perform DBA analysis or root cause reasoning.
 - Do not generate MySQL query recommendations.
 - Do not output prose, summaries, or explanations.
 - Do not output raw secrets — use only `<SECRET_REF:...>` placeholders already present in the input.
-- Do not call any tools or external resources.
+- Do not call tools except DeepAgents filesystem tools needed for provided evidence discovery (`ls`, `glob`, and narrowly scoped `read_file`).
+- Do not analyze file contents in Phase-01.1. Only discover and register files.
+- Do not access external resources.
 
 ## Output Format
 

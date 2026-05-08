@@ -33,6 +33,10 @@ class RuntimeConfig:
     workspace_dir: Path = Path(".")
     skills_dir: Path = Path("skills")
     agents_dir: Path = Path("agents")
+    allowed_workspace_root: str = "/workspace/"
+    max_discovered_files: int = 100
+    max_evidence_file_size_bytes: int = 50_000_000
+    blocked_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -88,6 +92,15 @@ def _load_runtime_config(data: dict[str, Any]) -> RuntimeConfig:
         workspace_dir=Path(_optional_string(data, "workspace_dir") or "."),
         skills_dir=Path(_optional_string(data, "skills_dir") or "skills"),
         agents_dir=Path(_optional_string(data, "agents_dir") or "agents"),
+        allowed_workspace_root=_optional_string(
+            data, "allowed_workspace_root"
+        )
+        or "/workspace/",
+        max_discovered_files=_optional_int(data, "max_discovered_files", 100),
+        max_evidence_file_size_bytes=_optional_int(
+            data, "max_evidence_file_size_bytes", 50_000_000
+        ),
+        blocked_paths=tuple(_optional_string_list(data, "blocked_paths")),
     )
 
 
@@ -148,3 +161,20 @@ def _optional_bool(data: dict[str, Any], field: str, default: bool) -> bool:
         if normalized in {"false", "no", "0", "off"}:
             return False
     raise ValueError(f"Config field {field} must be a boolean.")
+
+
+def _optional_int(data: dict[str, Any], field: str, default: int) -> int:
+    value = data.get(field, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Config field {field} must be an integer.") from None
+
+
+def _optional_string_list(data: dict[str, Any], field: str) -> list[str]:
+    value = data.get(field)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"Config field {field} must be a list.")
+    return [str(item).strip() for item in value if str(item).strip()]

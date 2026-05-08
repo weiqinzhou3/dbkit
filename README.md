@@ -69,6 +69,9 @@ If local evidence is stored in `/tmp/mysql_conn_full_mock`, set
 agent-visible `/workspace/` path. Host absolute paths such as `/tmp/...` are not
 the same as DeepAgents virtual filesystem paths.
 
+If `runtime.workspace_dir: /`, host path `/tmp/mysql_conn_full_mock/` maps to
+`/workspace/tmp/mysql_conn_full_mock/`.
+
 Run the root entrypoint:
 
 ```bash

@@ -46,6 +46,11 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
                         "  workspace_dir: /tmp/dbkit-workspace",
                         "  skills_dir: skills",
                         "  agents_dir: agents",
+                        "  allowed_workspace_root: /workspace/",
+                        "  max_discovered_files: 10",
+                        "  max_evidence_file_size_bytes: 2048",
+                        "  blocked_paths:",
+                        "    - /workspace/**/.env",
                     ]
                 ),
                 encoding="utf-8",
@@ -71,6 +76,10 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
             self.assertEqual(config.runtime.workspace_dir, Path("/tmp/dbkit-workspace"))
             self.assertEqual(config.runtime.skills_dir, Path("skills"))
             self.assertEqual(config.runtime.agents_dir, Path("agents"))
+            self.assertEqual(config.runtime.allowed_workspace_root, "/workspace/")
+            self.assertEqual(config.runtime.max_discovered_files, 10)
+            self.assertEqual(config.runtime.max_evidence_file_size_bytes, 2048)
+            self.assertEqual(config.runtime.blocked_paths, ("/workspace/**/.env",))
 
     def test_build_model_uses_openai_compatible_config(self) -> None:
         config = load_app_config(_write_config_file())
@@ -324,6 +333,12 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
                 "files": [],
                 "pasted_text": False,
                 "description": "只需要分析本地文件",
+                "discovery": {
+                    "attempted_paths": ["/workspace/tmp/mysql_conn_full_mock/"],
+                    "discovered_files": [],
+                    "discovery_status": "empty",
+                    "errors": [],
+                },
             },
             "collection_policy": {
                 "allow_live_collection": False,
@@ -363,6 +378,55 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
         self.assertNotIn("target.host", request.missing_fields)
         self.assertNotIn("target.username", request.missing_fields)
         self.assertIn("provided_evidence.files", request.missing_fields)
+        self.assertEqual(
+            request.provided_evidence["discovery"]["discovery_status"],
+            "empty",
+        )
+
+    def test_normalize_request_preserves_provided_evidence_discovery(self) -> None:
+        request = normalize_request(
+            "只分析 /tmp/mock_dir",
+            llm_json={
+                "target_agent": "mysql_analyzer",
+                "target_domain": "mysql",
+                "task_type": "alert_analysis",
+                "routing_confidence": 0.9,
+                "input_mode": "provided_evidence",
+                "target": None,
+                "ssh_target": None,
+                "provided_evidence": {
+                    "mode": "local_files",
+                    "files": ["/workspace/tmp/mock_dir/mysql-error.log"],
+                    "pasted_text": False,
+                    "description": "只分析 /tmp/mock_dir",
+                    "discovery": {
+                        "attempted_paths": ["/workspace/tmp/mock_dir/"],
+                        "discovered_files": ["/workspace/tmp/mock_dir/mysql-error.log"],
+                        "discovery_status": "files_found",
+                        "errors": [],
+                        "file_sizes_bytes": {
+                            "/workspace/tmp/mock_dir/mysql-error.log": 1234,
+                        },
+                    },
+                },
+                "collection_policy": {
+                    "allow_live_collection": False,
+                    "allow_mysql_login": False,
+                    "allow_ssh": False,
+                    "allow_metrics_query": False,
+                },
+                "event": {"event_time": "2026-05-07T17:00:00+08:00", "symptoms": []},
+                "missing_fields": [],
+            },
+        )
+
+        discovery = request.provided_evidence["discovery"]
+        self.assertEqual(discovery["attempted_paths"], ["/workspace/tmp/mock_dir/"])
+        self.assertEqual(
+            discovery["discovered_files"],
+            ["/workspace/tmp/mock_dir/mysql-error.log"],
+        )
+        self.assertEqual(request.missing_fields, ())
 
     def test_normalize_request_live_collection_requires_live_target_fields(self) -> None:
         llm_json = {
@@ -426,6 +490,48 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
         self.assertEqual(request.provided_evidence["files"], ["/tmp/mysql-slow.log"])
         self.assertIn("target.host", request.missing_fields)
         self.assertNotIn("ssh_target.host", request.missing_fields)
+
+    def test_normalize_request_registers_specific_provided_file(self) -> None:
+        request = normalize_request(
+            "只分析 /tmp/mysql_conn_full_mock/mysql-error.log",
+            llm_json={
+                "target_agent": "mysql_analyzer",
+                "target_domain": "mysql",
+                "task_type": "alert_analysis",
+                "routing_confidence": 0.9,
+                "input_mode": "provided_evidence",
+                "provided_evidence": {
+                    "mode": "local_files",
+                    "files": ["/workspace/tmp/mysql_conn_full_mock/mysql-error.log"],
+                    "pasted_text": False,
+                    "description": "只分析 mysql-error.log",
+                    "discovery": {
+                        "attempted_paths": [
+                            "/workspace/tmp/mysql_conn_full_mock/mysql-error.log"
+                        ],
+                        "discovered_files": [
+                            "/workspace/tmp/mysql_conn_full_mock/mysql-error.log"
+                        ],
+                        "discovery_status": "files_found",
+                        "errors": [],
+                    },
+                },
+                "collection_policy": {
+                    "allow_live_collection": False,
+                    "allow_mysql_login": False,
+                    "allow_ssh": False,
+                    "allow_metrics_query": False,
+                },
+                "event": {"event_time": "2026-05-07T17:00:00+08:00", "symptoms": []},
+                "missing_fields": [],
+            },
+        )
+
+        self.assertEqual(
+            request.provided_evidence["files"],
+            ["/workspace/tmp/mysql_conn_full_mock/mysql-error.log"],
+        )
+        self.assertEqual(request.missing_fields, ())
 
     def test_normalize_request_extracts_redacted_mysql_uri_target(self) -> None:
         redacted = "mysql://root:<SECRET_REF:uri_password_001>@192.168.1.1:3306"
@@ -532,6 +638,102 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
         self.assertTrue(any("provided_evidence.files" in i for i in result.blocking_issues))
         self.assertFalse(any("target.host" in i for i in result.blocking_issues))
         self.assertFalse(any("target.username" in i for i in result.blocking_issues))
+
+    def test_guardrails_blocks_provided_evidence_outside_workspace(self) -> None:
+        request = normalize_request(
+            "只分析 /etc/passwd",
+            llm_json={
+                "target_agent": "mysql_analyzer",
+                "target_domain": "mysql",
+                "task_type": "general_question",
+                "routing_confidence": 0.9,
+                "input_mode": "provided_evidence",
+                "provided_evidence": {
+                    "mode": "local_files",
+                    "files": ["/etc/passwd"],
+                    "pasted_text": False,
+                    "description": "只分析 /etc/passwd",
+                    "discovery": {
+                        "attempted_paths": ["/etc/passwd"],
+                        "discovered_files": ["/etc/passwd"],
+                        "discovery_status": "files_found",
+                        "errors": [],
+                    },
+                },
+                "missing_fields": [],
+            },
+        )
+
+        result = Guardrails().validate(request)
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("outside allowed workspace root" in i for i in result.blocking_issues))
+
+    def test_guardrails_blocks_too_many_or_too_large_discovered_files(self) -> None:
+        files = [f"/workspace/tmp/mock/file-{i}.log" for i in range(3)]
+        request = normalize_request(
+            "只分析 /tmp/mock",
+            llm_json={
+                "target_agent": "mysql_analyzer",
+                "target_domain": "mysql",
+                "task_type": "general_question",
+                "routing_confidence": 0.9,
+                "input_mode": "provided_evidence",
+                "provided_evidence": {
+                    "mode": "local_files",
+                    "files": files,
+                    "pasted_text": False,
+                    "description": "只分析 /tmp/mock",
+                    "discovery": {
+                        "attempted_paths": ["/workspace/tmp/mock/"],
+                        "discovered_files": files,
+                        "discovery_status": "files_found",
+                        "errors": [],
+                        "file_sizes_bytes": {files[0]: 2048},
+                    },
+                },
+                "missing_fields": [],
+            },
+        )
+
+        result = Guardrails(
+            max_discovered_files=2,
+            max_evidence_file_size_bytes=1024,
+        ).validate(request)
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("too many discovered files" in i for i in result.blocking_issues))
+        self.assertTrue(any("exceeds max evidence file size" in i for i in result.blocking_issues))
+
+    def test_guardrails_blocks_configured_blocked_paths(self) -> None:
+        request = normalize_request(
+            "只分析 /workspace/tmp/secret.env",
+            llm_json={
+                "target_agent": "mysql_analyzer",
+                "target_domain": "mysql",
+                "task_type": "general_question",
+                "routing_confidence": 0.9,
+                "input_mode": "provided_evidence",
+                "provided_evidence": {
+                    "mode": "local_files",
+                    "files": ["/workspace/tmp/secret.env"],
+                    "pasted_text": False,
+                    "description": "只分析 secret",
+                    "discovery": {
+                        "attempted_paths": ["/workspace/tmp/secret.env"],
+                        "discovered_files": ["/workspace/tmp/secret.env"],
+                        "discovery_status": "files_found",
+                        "errors": [],
+                    },
+                },
+                "missing_fields": [],
+            },
+        )
+
+        result = Guardrails(blocked_paths=("/workspace/tmp/secret*",)).validate(request)
+
+        self.assertFalse(result.passed)
+        self.assertTrue(any("blocked path" in i for i in result.blocking_issues))
 
     def test_guardrails_blocks_invalid_target_agent(self) -> None:
         llm_json = {
@@ -819,6 +1021,59 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
             self.assertEqual(calls[0]["skills"], ["/skills/intake/"])
             self.assertEqual(calls[0]["tools"], [])
 
+    def test_workspace_root_maps_host_absolute_paths_to_workspace_virtual_paths(self) -> None:
+        calls = []
+
+        def fake_create_deep_agent(**kwargs):
+            calls.append(kwargs)
+            return object()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            tmp_dir = root / "tmp" / "mock_dir"
+            tmp_dir.mkdir(parents=True)
+            (tmp_dir / "mysql-error.log").write_text("error", encoding="utf-8")
+            (tmp_dir / "processlist.txt").write_text("processlist", encoding="utf-8")
+            agents_dir = root / "agents"
+            skills_dir = root / "skills"
+            (agents_dir / "intake").mkdir(parents=True)
+            (agents_dir / "intake" / "system.md").write_text(
+                "System prompt", encoding="utf-8"
+            )
+            (skills_dir / "intake").mkdir(parents=True)
+
+            factory = DeepAgentsRuntimeFactory(
+                create_deep_agent=fake_create_deep_agent,
+                model=object(),
+                workspace_dir=root,
+                skills_dir=skills_dir,
+                agents_dir=agents_dir,
+                repo_dir=root,
+            )
+            factory.create_intake_runtime(skill_text="SKILL_CONTENT")
+
+            backend = calls[0]["backend"]
+            host_style_path = "/tmp/mock_dir/"
+            virtual_path = "/workspace/tmp/mock_dir/"
+            self.assertEqual(
+                factory.host_path_to_workspace_virtual_path(host_style_path),
+                virtual_path,
+            )
+            entries = backend.ls(virtual_path)
+            self.assertIsNone(entries.error)
+            self.assertEqual(
+                sorted(entry["path"] for entry in entries.entries),
+                [
+                    "/workspace/tmp/mock_dir/mysql-error.log",
+                    "/workspace/tmp/mock_dir/processlist.txt",
+                ],
+            )
+            matches = backend.glob("*.log", virtual_path)
+            self.assertEqual(
+                [entry["path"] for entry in matches.matches],
+                ["/workspace/tmp/mock_dir/mysql-error.log"],
+            )
+
     # --- Orchestrator ---
 
     def test_orchestrator_consumes_llm_json_and_routes_successfully(self) -> None:
@@ -925,7 +1180,7 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
                                 "ssh_target": None,
                                 "provided_evidence": {
                                     "mode": "local_files",
-                                    "files": ["/tmp/mysql-error.log"],
+                                    "files": ["/workspace/tmp/mysql-error.log"],
                                     "pasted_text": False,
                                     "description": "只分析本地文件",
                                 },

@@ -18,3 +18,9 @@ runtime:
   workspace_dir: .
   skills_dir: skills
   agents_dir: agents
+  allowed_workspace_root: /workspace/
+  max_discovered_files: 100
+  max_evidence_file_size_bytes: 50000000
+  blocked_paths:
+    - /workspace/**/.env
+    - /workspace/**/*.pem

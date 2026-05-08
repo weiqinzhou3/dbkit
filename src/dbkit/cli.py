@@ -8,6 +8,7 @@ from dbkit.config import DEFAULT_CONFIG_PATH, load_app_config
 from dbkit.model_provider import build_agent_model
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.deepagents_runtime import DeepAgentsRuntimeFactory
+from dbkit.runtime.guardrails import Guardrails
 from dbkit.runtime.observability import TelemetryRecorder
 from dbkit.runtime.orchestrator import Orchestrator
 
@@ -27,6 +28,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         skills_dir=config.runtime.skills_dir,
         artifact_store=ArtifactStore(artifact_root),
         telemetry=TelemetryRecorder(),
+        guardrails=Guardrails(
+            allowed_workspace_root=config.runtime.allowed_workspace_root,
+            max_discovered_files=config.runtime.max_discovered_files,
+            max_evidence_file_size_bytes=config.runtime.max_evidence_file_size_bytes,
+            blocked_paths=config.runtime.blocked_paths,
+        ),
         deepagents_runtime_factory=DeepAgentsRuntimeFactory(
             model=model,
             tools_enabled=False,
