@@ -106,6 +106,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"phase={evidence_result.phase}")
     if evidence_result.status in {
         "evidence_request_parse_failed",
+        "evidence_request_validation_failed",
         "missing_collection_dependencies",
     }:
         print("status=blocked")
@@ -143,6 +144,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "collection_failed",
         "collection_not_implemented",
         "evidence_request_parse_failed",
+        "evidence_request_validation_failed",
         "missing_collection_dependencies",
     }:
         return 1

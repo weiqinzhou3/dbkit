@@ -117,7 +117,48 @@ class EvidencePipeline:
                 telemetry=tuple(self.telemetry.events),
                 blocking_issues=("evidence_request_parse_failed",),
             )
-        evidence_request = validate_evidence_request(evidence_request_json)
+        try:
+            evidence_request = validate_evidence_request(evidence_request_json)
+        except ValueError as exc:
+            self.telemetry.emit(
+                event_type="evidence_request_validation_failed",
+                stage="evidence_planning",
+                message="EvidenceRequest JSON failed validation",
+                attributes={
+                    "request_id": request.request_id,
+                    "reason": "evidence_request_validation_failed",
+                    "error": str(exc),
+                },
+            )
+            failed_artifact = self.artifact_store.persist_evidence_request_failed(
+                request,
+                reason="evidence_request_validation_failed",
+                details=[str(exc)],
+            )
+            self.telemetry.emit(
+                event_type="artifact_written",
+                stage="artifacts",
+                message="Artifact written: EvidenceRequestFailed",
+                attributes={
+                    "request_id": request.request_id,
+                    "kind": "EvidenceRequestFailed",
+                    "path": str(failed_artifact.path),
+                },
+            )
+            telemetry_artifact = self.artifact_store.persist_collection_telemetry(
+                request.request_id, self.telemetry.events
+            )
+            return EvidencePipelineResult(
+                request_id=request.request_id,
+                phase=request.phase if request.phase.startswith("phase-02.1") else "phase-02",
+                status="evidence_request_validation_failed",
+                evidence_request=None,
+                collection_plan=None,
+                raw_evidence=(),
+                artifacts=(failed_artifact, telemetry_artifact),
+                telemetry=tuple(self.telemetry.events),
+                blocking_issues=("evidence_request_validation_failed",),
+            )
         self.telemetry.emit(
             event_type="evidence_planning_completed",
             stage="evidence_planning",

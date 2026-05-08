@@ -143,6 +143,68 @@ class Phase02EvidencePlanningCollectionTest(unittest.TestCase):
         runtime_item = runtime_status.evidence_request["required_evidence"][0]
         self.assertEqual(runtime_item["evidence_type"], "mysql.runtime_status")
 
+        null_source_payload = _evidence_request_payload(
+            normalized,
+            tool_hint="collect_mysql_runtime_status",
+            evidence_type="mysql.runtime_status",
+            source=None,
+        )
+        null_source = validate_evidence_request(null_source_payload)
+        null_source_item = null_source.evidence_request["required_evidence"][0]
+        self.assertEqual(null_source_item["source"], "mysql")
+
+    def test_pipeline_does_not_traceback_when_evidence_request_source_and_tool_are_null(self) -> None:
+        normalized = _provided_evidence_request(files=["/workspace/mysql-error.log"])
+        payload = _evidence_request_payload(
+            normalized,
+            tool_hint=None,
+            evidence_type="mysql.error_log",
+            source=None,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = EvidencePipeline(
+                artifact_store=ArtifactStore(root / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                collectors=CollectorRegistry(workspace_root=root / "workspace"),
+                time_provider=_fixed_time_provider(),
+            ).run(normalized, evidence_request_json=payload)
+
+        self.assertEqual(result.status, "collection_blocked")
+        self.assertIn(
+            "evidence item missing tool_hint: required_evidence[0]",
+            result.blocking_issues,
+        )
+
+    def test_pipeline_validation_failure_returns_blocked_artifact(self) -> None:
+        normalized = _provided_evidence_request(files=["/workspace/mysql-error.log"])
+        payload = _evidence_request_payload(
+            normalized,
+            tool_hint="unknown_tool",
+            evidence_type="unknown.evidence",
+            source="unknown_source",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            result = EvidencePipeline(
+                artifact_store=ArtifactStore(root / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                collectors=CollectorRegistry(workspace_root=root / "workspace"),
+                time_provider=_fixed_time_provider(),
+            ).run(normalized, evidence_request_json=payload)
+
+            artifact = [
+                item for item in result.artifacts
+                if item.kind == "EvidenceRequestFailed"
+            ][0]
+            artifact_payload = json.loads(artifact.path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.status, "evidence_request_validation_failed")
+        self.assertEqual(result.blocking_issues, ("evidence_request_validation_failed",))
+        self.assertEqual(artifact_payload["reason"], "evidence_request_validation_failed")
+
     def test_mysql_analyzer_skill_defines_evidence_planning_mode(self) -> None:
         skill_path = Path("skills/mysql-analyzer/SKILL.md")
 

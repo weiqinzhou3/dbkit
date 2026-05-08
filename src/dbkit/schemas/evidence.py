@@ -280,6 +280,9 @@ def _normalize_evidence_request_item(item: dict[str, Any]) -> dict[str, Any]:
     source = str(normalized.get("source") or "")
     if source not in _ALLOWED_SOURCES:
         source = _TOOL_SOURCE_DEFAULTS.get(tool_hint, source)
+    if not source:
+        normalized["source"] = ""
+        return normalized
     if source not in _ALLOWED_SOURCES:
         raise ValueError(f"unknown EvidenceRequest source: {normalized.get('source')}")
     normalized["source"] = source
