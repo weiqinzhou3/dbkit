@@ -1,5 +1,10 @@
 # DBKit Evidence Agent
 
-Placeholder — Phase-02 scope.
+Placeholder — Phase-03 scope.
 
-The Evidence Agent executes the evidence plan produced by the Intake Agent and collects structured, bounded evidence from target systems.
+In Phase-02, Evidence Agent does not decide what to collect and does not
+structure EvidenceBundle output.
+
+Phase-02 evidence requirements are decided by the MySQL Analyzer Agent in
+`evidence_planning` mode. Runtime converts that EvidenceRequest into a guarded
+CollectionPlan and executes deterministic collector tools to produce RawEvidence.

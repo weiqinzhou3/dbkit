@@ -4,14 +4,17 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from dbkit import __version__
+from dbkit.agents.mysql_analyzer import MySQLAnalyzerAgent
 from dbkit.config import DEFAULT_CONFIG_PATH, load_app_config
 from dbkit.model_provider import build_agent_model
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.deepagents_runtime import DeepAgentsRuntimeFactory
+from dbkit.runtime.evidence_pipeline import EvidencePipeline
 from dbkit.runtime.guardrails import Guardrails
 from dbkit.runtime.observability import TelemetryRecorder
 from dbkit.runtime.orchestrator import Orchestrator
 from dbkit.runtime.time_context import TimeProvider
+from dbkit.tools.collectors import CollectorRegistry
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -24,6 +27,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     repo_root = config.runtime.repo_dir
     artifact_root = config.runtime.artifact_dir
     model = build_agent_model(config.model, config.agent)
+    runtime_factory = DeepAgentsRuntimeFactory(
+        model=model,
+        tools_enabled=False,
+        repo_dir=config.runtime.repo_dir,
+        workspace_dir=config.runtime.workspace_dir,
+        skills_dir=config.runtime.skills_dir,
+        agents_dir=config.runtime.agents_dir,
+    )
     orchestrator = Orchestrator(
         repo_root=repo_root,
         skills_dir=config.runtime.skills_dir,
@@ -35,14 +46,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_evidence_file_size_bytes=config.runtime.max_evidence_file_size_bytes,
             blocked_paths=config.runtime.blocked_paths,
         ),
-        deepagents_runtime_factory=DeepAgentsRuntimeFactory(
-            model=model,
-            tools_enabled=False,
-            repo_dir=config.runtime.repo_dir,
-            workspace_dir=config.runtime.workspace_dir,
-            skills_dir=config.runtime.skills_dir,
-            agents_dir=config.runtime.agents_dir,
-        ),
+        deepagents_runtime_factory=runtime_factory,
         invoke_llm=config.runtime.invoke_llm,
         time_provider=TimeProvider(
             timezone=config.runtime.timezone,
@@ -79,11 +83,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("提示：使用 --interactive 可以交互式补充缺失信息。")
         return 1
 
-    print(f"phase={result.normalized_request.phase}")
-    print(f"target_agent={result.route_decision.target_agent_name}")
-    print(f"target_domain={result.normalized_request.target_domain}")
-    print(f"task_type={result.normalized_request.task_type}")
-    print(f"artifact={result.artifacts[0].path}")
+    mysql_analyzer = MySQLAnalyzerAgent.from_skills_dir(config.runtime.skills_dir)
+    analyzer_runtime = runtime_factory.create_mysql_analyzer_runtime(
+        mysql_analyzer.skill_text
+    )
+    evidence_result = EvidencePipeline(
+        artifact_store=ArtifactStore(artifact_root),
+        telemetry=TelemetryRecorder(),
+        collectors=CollectorRegistry(workspace_root=config.runtime.workspace_dir),
+        time_provider=TimeProvider(
+            timezone=config.runtime.timezone,
+            locale=config.runtime.locale,
+        ),
+        mysql_analyzer_runtime=analyzer_runtime,
+    ).run(result.normalized_request)
+
+    print("phase=phase-02")
+    print(f"status={evidence_result.status}")
+    print(f"input_mode={result.normalized_request.input_mode}")
+    print(f"raw_evidence_count={len(evidence_result.raw_evidence)}")
+    index_artifacts = [
+        artifact for artifact in evidence_result.artifacts
+        if artifact.kind == "RawEvidenceIndex"
+    ]
+    if index_artifacts:
+        print(f"artifact={index_artifacts[0].path}")
+    elif evidence_result.artifacts:
+        print(f"artifact={evidence_result.artifacts[-1].path}")
+    if evidence_result.status == "collection_blocked":
+        return 1
     return 0
 
 
