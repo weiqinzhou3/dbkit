@@ -1,6 +1,6 @@
-# Phase-03 — Evidence Structuring MVP
+# Phase-03 — Evidence Structuring Subagent MVP
 
-Version: v0.2
+Version: v0.3
 Status: Active Planning
 Depends on: Phase-02.1 Real MySQL Evidence Collection MVP
 Runtime Foundation: DeepAgents SDK
@@ -15,7 +15,7 @@ Phase-02.1 already completed real evidence collection:
 
 ```text
 NormalizedRequest
-  -> MySQL Analyzer Agent in evidence_planning mode
+  -> MySQL Analyzer Agent / mode=evidence_planning
   -> EvidenceRequest
   -> CollectionPlan
   -> Collector Tools
@@ -28,7 +28,8 @@ Phase-03 output:
 
 ```text
 RawEvidence index + RawEvidence artifacts
-  -> Evidence Agent / Evidence Tools
+  -> Evidence Structuring Subagent
+  -> Evidence Processing Tools
   -> EvidenceBundle
 ```
 
@@ -36,43 +37,310 @@ Phase-03 must not perform final MySQL diagnosis.
 
 ---
 
-# 2. Core Responsibility Split
+# 2. Subagent Ownership
+
+The Evidence Structuring Subagent is the **subagent of the MySQL Analyzer Agent** in the MySQL analysis workflow.
+
+Conceptually:
 
 ```text
-MySQL Analyzer Agent:
-  already decided what evidence was needed in Phase-02 / Phase-02.1
-
-Collector Tools:
-  already collected RawEvidence in Phase-02.1
-
-Evidence Agent:
-  cleans, filters, deduplicates, aggregates, normalizes, and structures RawEvidence
-
-Evidence Tools:
-  perform deterministic parsing, filtering, aggregation, token estimation, raw_ref mapping, and bundle construction
-
-Runtime:
-  orchestrates Evidence Agent / Evidence Tools, enforces guardrails, persists artifacts, and emits telemetry
+MySQL Analyzer Agent
+  -> plans evidence
+  -> receives RawEvidence collection result
+  -> delegates evidence structuring to Evidence Structuring Subagent
+  -> receives EvidenceBundle
+  -> continues later in findings_generation mode
 ```
 
-Evidence Agent must not decide what to collect.
+Runtime / Coordinator is not the semantic owner of the Evidence Structuring Subagent.
 
-Evidence Agent must not create new collection requests.
+Runtime / Coordinator only:
 
-Evidence Agent must not generate root cause, findings, verdict, or final summary.
+```text
+registers the subagent
+wires it into the execution graph
+passes inputs and artifacts
+enforces guardrails
+persists artifacts
+emits telemetry
+```
+
+The MySQL Analyzer Agent owns the domain workflow and delegates to the Evidence Structuring Subagent when RawEvidence needs to be converted into EvidenceBundle.
+
+This relationship must be visible in config / agent registration.
+
+Recommended conceptual config:
+
+```yaml
+agents:
+  mysql_analyzer:
+    system_prompt: agents/mysql-analyzer/system.md
+    skills:
+      - skills/mysql-analyzer/SKILL.md
+    subagents:
+      evidence_structuring:
+        agent: evidence_structuring
+        skill: skills/evidence/SKILL.md
+        allowed_tools:
+          - load_raw_evidence_index
+          - load_raw_artifact
+          - classify_raw_evidence
+          - parse_mysql_processlist
+          - parse_mysql_runtime_status
+          - parse_mysql_innodb_status
+          - parse_mysql_variables
+          - parse_mysql_service_metadata
+          - parse_mysql_log_paths
+          - parse_mysql_error_log
+          - parse_mysql_slow_log
+          - parse_os_cpu_snapshot
+          - parse_os_memory_snapshot
+          - parse_os_disk_snapshot
+          - parse_os_mysql_service_status
+          - filter_by_time_window
+          - deduplicate_events
+          - aggregate_log_patterns
+          - aggregate_processlist
+          - aggregate_mysql_status
+          - aggregate_os_metrics
+          - estimate_token_size
+          - validate_raw_refs
+          - build_evidence_bundle
+
+  evidence_structuring:
+    system_prompt: agents/evidence-structuring/system.md
+    skills:
+      - skills/evidence/SKILL.md
+```
+
+The exact file layout may follow the repository’s current conventions, but the relationship must remain:
+
+```text
+mysql_analyzer -> delegates to evidence_structuring subagent
+```
+
+For future domains, the same Evidence Structuring Subagent may be reused or specialized:
+
+```text
+redis_analyzer -> evidence_structuring(domain=redis)
+mongodb_analyzer -> evidence_structuring(domain=mongodb)
+```
+
+But in this phase, the parent caller is `mysql_analyzer`.
 
 ---
 
-# 3. Phase Goal
+# 3. Agentic Runtime Flow
 
-Build the Evidence Structuring layer.
+The intended runtime shape is:
+
+```text
+User Prompt
+  -> Intake Agent
+  -> NormalizedRequest
+  -> MySQL Analyzer Agent / mode=evidence_planning
+  -> EvidenceRequest
+  -> Collector Tools
+  -> RawEvidence
+  -> MySQL Analyzer Agent delegates to Evidence Structuring Subagent
+  -> Evidence Structuring Subagent / skills/evidence/SKILL.md
+  -> EvidenceBundle
+  -> MySQL Analyzer Agent / mode=findings_generation
+  -> FindingsDraft
+  -> Validation Agent
+  -> Verdict / Summary
+```
+
+Important:
+
+```text
+MySQL Analyzer Agent is invoked in Phase-02 for evidence planning.
+Evidence Structuring Subagent is invoked in Phase-03 as a child/subagent of MySQL Analyzer.
+MySQL Analyzer Agent is invoked again in Phase-04 for findings generation.
+```
+
+The two MySQL Analyzer calls are different modes of the same domain agent.
+
+Phase-03 is the boundary between raw collection and final domain reasoning.
+
+---
+
+# 4. Core Responsibility Split
+
+```text
+MySQL Analyzer Agent:
+  owns the MySQL analysis workflow
+  decides what evidence is needed in Phase-02 / Phase-02.1
+  delegates RawEvidence transformation to Evidence Structuring Subagent in Phase-03
+  consumes EvidenceBundle in Phase-04
+  does not clean RawEvidence directly
+
+Collector Tools:
+  collect RawEvidence in Phase-02.1
+  do not structure EvidenceBundle
+  do not generate findings
+
+Evidence Structuring Subagent:
+  decides how to process available RawEvidence
+  selects evidence processing tools
+  cleans, filters, deduplicates, aggregates, normalizes, and structures RawEvidence
+  generates EvidenceBundle only
+  returns EvidenceBundle to MySQL Analyzer workflow
+
+Evidence Processing Tools:
+  perform deterministic parsing, filtering, aggregation, token estimation, raw_ref mapping, and bundle construction
+
+Runtime:
+  registers MySQL Analyzer and Evidence Structuring Subagent
+  exposes allowed tools
+  invokes subagent according to the workflow
+  validates EvidenceBundle schema
+  enforces guardrails
+  persists artifacts
+  emits telemetry
+```
+
+Evidence Structuring Subagent must not decide what to collect.
+
+Evidence Structuring Subagent must not create new collection requests.
+
+Evidence Structuring Subagent must not call live collection tools.
+
+Evidence Structuring Subagent must not generate root cause, findings, verdict, or final summary.
+
+---
+
+# 5. Runtime and Subagent Boundary
+
+## 5.1 Runtime May Do
+
+Runtime may:
+
+```text
+load configuration
+resolve artifact paths
+instantiate agents and subagents
+register evidence processing tools
+pass RawEvidence index path
+pass runtime context
+enforce tool allowlist
+validate EvidenceBundle schema
+write artifacts
+write telemetry
+block unsafe outputs
+```
+
+## 5.2 Runtime Must Not Do
+
+Runtime must not:
+
+```text
+parse MySQL error logs itself
+aggregate Aborted connection patterns itself
+decide which evidence is semantically important
+generate EvidenceItems by hardcoded MySQL logic
+generate MySQL findings
+generate summary/verdict
+invent additional collection steps
+```
+
+If runtime contains deterministic helper code, that code must be exposed as an evidence processing tool or schema/guardrail utility.
+
+## 5.3 MySQL Analyzer May Delegate
+
+MySQL Analyzer Agent may delegate to Evidence Structuring Subagent when:
+
+```text
+RawEvidence exists
+RawEvidence index path exists
+EvidenceBundle is missing or stale
+analysis requires structured evidence
+```
+
+The delegation input must include:
+
+```text
+request_id
+raw_evidence_index path
+NormalizedRequest metadata
+EvidenceRequest metadata if available
+time_window
+domain=mysql
+```
+
+The delegation output must be:
+
+```text
+EvidenceBundle artifact path
+EvidenceBundle object or summary metadata
+Evidence quality status
+coverage summary
+```
+
+## 5.4 Evidence Subagent May Call
+
+The Evidence Structuring Subagent may call:
+
+```text
+load_raw_evidence_index
+load_raw_artifact
+classify_raw_evidence
+parse_mysql_processlist
+parse_mysql_runtime_status
+parse_mysql_innodb_status
+parse_mysql_variables
+parse_mysql_service_metadata
+parse_mysql_log_paths
+parse_mysql_error_log
+parse_mysql_slow_log
+parse_os_cpu_snapshot
+parse_os_memory_snapshot
+parse_os_disk_snapshot
+parse_os_mysql_service_status
+filter_by_time_window
+deduplicate_events
+aggregate_log_patterns
+aggregate_processlist
+aggregate_mysql_status
+aggregate_os_metrics
+estimate_token_size
+validate_raw_refs
+build_evidence_bundle
+```
+
+## 5.5 Evidence Subagent Must Not Call
+
+The Evidence Structuring Subagent must not call:
+
+```text
+live MySQL collectors
+SSH collectors
+remote file readers
+remediation tools
+query kill tools
+configuration change tools
+finding generation tools
+validation verdict tools
+```
+
+Phase-03 does not re-collect data.
+
+---
+
+# 6. Phase Goal
+
+Build the Evidence Structuring Subagent layer.
 
 This phase must support:
 
+- being registered as a subagent under `mysql_analyzer`
+- being callable by MySQL Analyzer after collection
+- being callable from CLI for repeatable testing
 - loading Phase-02.1 `raw-evidence-index.json`
 - loading full raw artifacts from `payload.content_ref`
 - validating raw artifact availability
 - classifying raw evidence
+- selecting appropriate evidence processing tools
 - parsing supported MySQL / OS raw evidence types
 - time-window filtering where possible
 - deduplicating semantically overlapping raw evidence
@@ -80,12 +348,12 @@ This phase must support:
 - preserving raw references
 - producing evidence quality flags
 - creating a bounded `EvidenceBundle`
+- returning EvidenceBundle metadata to MySQL Analyzer
 - emitting evidence processing telemetry
-- providing a repeatable CLI/test entrypoint from existing raw evidence
 
 ---
 
-# 4. Phase Inputs
+# 7. Phase Inputs
 
 Phase-03 input is the Phase-02.1 artifact set.
 
@@ -121,11 +389,11 @@ If `content_ref` is missing for a collected RawEvidence item, Phase-03 must mark
 
 ---
 
-# 5. Supported RawEvidence Types
+# 8. Supported RawEvidence Types
 
 Phase-03 must support the following Phase-02.1 evidence types.
 
-## 5.1 MySQL Baseline Evidence
+## 8.1 MySQL Baseline Evidence
 
 ```text
 mysql.processlist
@@ -136,14 +404,14 @@ mysql.service_metadata
 mysql.log_paths
 ```
 
-## 5.2 MySQL Log Evidence
+## 8.2 MySQL Log Evidence
 
 ```text
 mysql.error_log
 mysql.slow_log
 ```
 
-## 5.3 OS / SSH Evidence
+## 8.3 OS / SSH Evidence
 
 ```text
 metrics.os_cpu
@@ -152,7 +420,7 @@ metrics.os_disk
 os.mysql_service_status
 ```
 
-## 5.4 Deprecated / Removed Evidence Types
+## 8.4 Deprecated / Removed Evidence Types
 
 Phase-03 must not reintroduce these deprecated duplicate types:
 
@@ -162,13 +430,7 @@ metrics.mysql_status
 metrics.mysql_variables
 ```
 
-If they appear in old artifacts, Phase-03 may either:
-
-```text
-skip them as deprecated
-```
-
-or normalize them to existing canonical equivalents, but must not create duplicate EvidenceItems.
+If they appear in old artifacts, Phase-03 may either skip them as deprecated or normalize them to existing canonical equivalents, but must not create duplicate EvidenceItems.
 
 Canonical equivalents:
 
@@ -180,7 +442,7 @@ metrics.mysql           -> duplicate of mysql.runtime_status + mysql.variables
 
 ---
 
-# 6. EvidenceBundle Schema
+# 9. EvidenceBundle Schema
 
 Required shape:
 
@@ -195,6 +457,8 @@ Required shape:
   "time_window": {
     "start": "2026-05-09T10:00:00+08:00",
     "end": "2026-05-09T17:00:00+08:00",
+    "start_utc": "2026-05-09T02:00:00+00:00",
+    "end_utc": "2026-05-09T09:00:00+00:00",
     "source": "skill_default_from_event_time"
   },
   "evidence_items": [],
@@ -208,6 +472,7 @@ Required shape:
   },
   "quality": {
     "overall_status": "usable",
+    "llm_safe": true,
     "warnings": []
   },
   "processing_summary": {
@@ -223,6 +488,8 @@ Required shape:
   "skipped_raw_evidence": [],
   "metadata": {
     "skill": "skills/evidence/SKILL.md",
+    "subagent": "evidence_structuring",
+    "parent_agent": "mysql_analyzer",
     "runtime_foundation": "DeepAgents SDK"
   }
 }
@@ -230,7 +497,7 @@ Required shape:
 
 ---
 
-# 7. EvidenceItem Schema
+# 10. EvidenceItem Schema
 
 Required shape:
 
@@ -248,7 +515,11 @@ Required shape:
   "time_range": {
     "start": "2026-05-09T10:00:00+08:00",
     "end": "2026-05-09T17:00:00+08:00",
-    "timestamp_parse_status": "ok"
+    "start_utc": "2026-05-09T02:00:00+00:00",
+    "end_utc": "2026-05-09T09:00:00+00:00",
+    "timestamp_parse_status": "ok",
+    "timezone_handling": "normalized_to_utc",
+    "source_timezone": "UTC"
   },
   "summary": "Error log contains repeated connection warnings during the incident window.",
   "structured_payload": {},
@@ -275,35 +546,17 @@ Rules:
 
 ---
 
-# 8. Handling RawEvidence Status
+# 11. Handling RawEvidence Status
 
 Phase-03 must respect Phase-02.1 collection status.
 
-## 8.1 collected
+## 11.1 collected
 
-If status is:
+If status is `collected`, Phase-03 should process the raw artifact via `payload.content_ref`.
 
-```text
-collected
-```
+## 11.2 not_available
 
-Phase-03 should process the raw artifact via `payload.content_ref`.
-
-## 8.2 not_available
-
-If status is:
-
-```text
-not_available
-```
-
-Example:
-
-```text
-mysql.slow_log reason=slow_query_log_disabled
-```
-
-Phase-03 must:
+If status is `not_available`, such as `mysql.slow_log reason=slow_query_log_disabled`, Phase-03 must:
 
 - not fabricate an EvidenceItem
 - record it in `coverage.unavailable_evidence`
@@ -311,42 +564,17 @@ Phase-03 must:
 - preserve reason from RawEvidence
 - not treat it as collector failure
 
-Example:
+## 11.3 failed / blocked
 
-```json
-{
-  "evidence_type": "mysql.slow_log",
-  "status": "not_available",
-  "reason": "slow_query_log_disabled"
-}
-```
+If status is `failed` or `blocked`, Phase-03 must record it in coverage, add quality warnings, avoid pretending evidence exists, and preserve error reason.
 
-## 8.3 failed / blocked
+## 11.4 deprecated
 
-If status is:
-
-```text
-failed
-blocked
-```
-
-Phase-03 must:
-
-- record it in coverage
-- add quality warnings
-- avoid pretending evidence exists
-- preserve error reason
-
-## 8.4 deprecated
-
-If RawEvidence type is deprecated, Phase-03 must:
-
-- record in `coverage.deprecated_evidence_types`
-- skip or normalize without creating duplicate evidence
+If RawEvidence type is deprecated, Phase-03 must record it in `coverage.deprecated_evidence_types` and skip or normalize without creating duplicate evidence.
 
 ---
 
-# 9. Evidence Processing Tools
+# 12. Evidence Processing Tools
 
 Minimum tools:
 
@@ -379,19 +607,15 @@ build_evidence_bundle
 
 Tools perform deterministic transformations.
 
-Evidence Agent decides which processing tools to use based on RawEvidence type and Evidence Skill.
+Evidence Structuring Subagent decides which processing tools to use based on RawEvidence type and Evidence Skill.
 
 ---
 
-# 10. Processing Requirements by Evidence Type
+# 13. Processing Requirements by Evidence Type
 
-## 10.1 mysql.processlist
+## 13.1 mysql.processlist
 
-Input:
-
-```text
-SHOW FULL PROCESSLIST
-```
+Input: `SHOW FULL PROCESSLIST`
 
 Must produce:
 
@@ -406,42 +630,15 @@ Must produce:
 - representative query samples with raw_refs
 - quality flag if processlist has very few rows or only DBKit connection
 
-Required fields to support:
-
-```text
-Id
-User
-Host
-db
-Command
-Time
-State
-Info
-```
-
 No root cause judgment.
 
-## 10.2 mysql.runtime_status
+## 13.2 mysql.runtime_status
 
-Input:
+Input: `SHOW GLOBAL STATUS`
 
-```text
-SHOW GLOBAL STATUS
-```
+Must produce selected key counters, connection/thread/query counters, temporary table counters, aborted connection counters, status variable count, and raw_refs or row refs.
 
-Must produce:
-
-- selected key counters
-- connection-related counters
-- thread-related counters
-- query / command counters
-- handler counters where available
-- temporary table counters
-- aborted connection counters
-- status variable count
-- raw_refs or row refs
-
-Examples of useful variables:
+Useful variables include:
 
 ```text
 Threads_connected
@@ -462,49 +659,35 @@ Innodb_buffer_pool_reads
 
 Do not calculate root cause.
 
-## 10.3 mysql.innodb_status
+## 13.3 mysql.innodb_status
 
-Input:
+Input: `SHOW ENGINE INNODB STATUS`
 
-```text
-SHOW ENGINE INNODB STATUS
-```
+Must produce section summaries, transaction section presence, lock wait hints, deadlock section presence, buffer pool hints, row operation hints, and raw_refs.
 
-Must produce:
+Do not diagnose final root cause.
 
-- section summaries where detectable
-- transaction section presence
-- lock wait hints
-- deadlock section presence
-- buffer pool hints
-- row operation hints
-- raw_refs
+## 13.4 mysql.variables
 
-Allowed to extract structured sections, but not diagnose final root cause.
+Input: `SHOW GLOBAL VARIABLES`
 
-## 10.4 mysql.variables
-
-Input:
+Must produce selected variable map including:
 
 ```text
-SHOW GLOBAL VARIABLES
+max_connections
+slow_query_log
+slow_query_log_file
+log_output
+long_query_time
+datadir
+log_error
+innodb_buffer_pool_size
+log_timestamps
+time_zone
+system_time_zone
 ```
 
-Must produce:
-
-- selected variable map
-- max_connections
-- slow_query_log
-- slow_query_log_file
-- log_output
-- long_query_time
-- datadir
-- log_error
-- innodb_buffer_pool_size
-- key relevant config values
-- raw_refs
-
-## 10.5 mysql.service_metadata
+## 13.5 mysql.service_metadata
 
 Must structure:
 
@@ -515,11 +698,14 @@ port
 datadir
 log_error
 slow_query_log_file
+log_timestamps
+time_zone
+system_time_zone
 ```
 
 If version is MySQL 5.7 / 8.0 / MariaDB, record normalized family if detectable.
 
-## 10.6 mysql.log_paths
+## 13.6 mysql.log_paths
 
 Must structure:
 
@@ -529,135 +715,104 @@ slow_log_path
 slow_query_log_enabled
 log_output
 datadir
+log_timestamps
 ```
 
-This EvidenceItem is required when available because Phase-04 needs to explain:
+This EvidenceItem is required because Phase-04 needs to explain where logs came from, why slow log is unavailable, whether log output is FILE or TABLE, and whether logs use UTC or system time.
 
-- where logs came from
-- why slow log is unavailable
-- whether log output is FILE or TABLE
-
-## 10.7 mysql.error_log
+## 13.7 mysql.error_log
 
 Must support:
 
 - timestamp extraction
+- timezone-aware timestamp normalization
 - time-window filtering when timestamps parse
 - repeated event grouping
 - error pattern extraction
 - severity hints
+- semantic hints, such as `aborted_connection`, `access_denied`, `too_many_connections`, `timeout`, `crash_or_restart`, `oom_or_memory`, `replication_error`, `innodb_error`
 - top patterns
 - retained lines count
 - discarded lines count
 - raw line references
 - timestamp parse failure handling
 
-If timestamps cannot be parsed:
-
-```text
-timestamp_parse_status=failed
-```
+If timestamps cannot be parsed, set `timestamp_parse_status=failed`.
 
 Do not silently treat all lines as in-window.
 
-## 10.8 mysql.slow_log
+If the raw artifact is readable, do not skip `mysql.error_log` entirely just because part of the parser fails. Produce an EvidenceItem with quality flags.
 
-If status is collected, must support:
+## 13.8 mysql.slow_log
 
-- timestamp extraction
-- query time
-- lock time
-- rows examined
-- rows sent
-- user / host where available
-- SQL digest grouping
-- top N slow query patterns
-- raw_refs
+If status is collected, must support timestamp extraction, query time, lock time, rows examined, rows sent, user / host, SQL digest grouping, top N slow query patterns, and raw_refs.
 
 If status is not_available due to `slow_query_log_disabled`, record unavailable evidence only.
 
 Do not put large SQL dumps into EvidenceBundle.
 
-## 10.9 metrics.os_cpu
+## 13.9 metrics.os_cpu
 
-Input may include:
+Input may include `uptime`, `top`, and `vmstat`.
 
-```text
-uptime
-top
-vmstat
-```
+Must produce load average, CPU usage hints if parseable, top CPU processes if available, run queue / context switch hints if vmstat available, raw_refs, and parse quality flags.
 
-Must produce:
+## 13.10 metrics.os_memory
 
-- load average
-- CPU usage hints if parseable
-- top CPU processes if available
-- run queue / context switch hints if vmstat available
-- raw_refs
-- parse quality flags
+Input may include `free -m` and `vmstat`.
 
-## 10.10 metrics.os_memory
+Must produce total / used / free / available memory if parseable, swap usage, memory pressure hints, and raw_refs.
 
-Input may include:
+## 13.11 metrics.os_disk
 
-```text
-free -m
-vmstat
-```
+Input may include `df -h` and `du -sh <datadir>`.
 
-Must produce:
+Must produce filesystem usage summary, MySQL datadir size if available, high disk usage hints, and raw_refs.
 
-- total / used / free / available memory if parseable
-- swap usage
-- memory pressure hints
-- raw_refs
+## 13.12 os.mysql_service_status
 
-## 10.11 metrics.os_disk
+Input may include `systemctl status mysqld/mysql` and `ps -ef | grep mysqld`.
 
-Input may include:
-
-```text
-df -h
-du -sh <datadir>
-```
-
-Must produce:
-
-- filesystem usage summary
-- MySQL datadir size if available
-- high disk usage hints
-- raw_refs
-
-## 10.12 os.mysql_service_status
-
-Input may include:
-
-```text
-systemctl status mysqld/mysql
-ps -ef | grep mysqld
-```
-
-Must produce:
-
-- service active/inactive state if parseable
-- process presence
-- mysqld command line if available
-- recent service log snippets if available
-- raw_refs
+Must produce service active/inactive state if parseable, process presence, mysqld command line if available, recent service log snippets if available, and raw_refs.
 
 ---
 
-# 11. Time Window Filtering
+# 14. Time Window and Timezone Handling
 
-Phase-03 must use `time_window` from RawEvidence metadata or NormalizedRequest.
+Time window must be preserved and enforced in both collection and structuring.
+
+Phase-02.1 collection stage should:
+
+```text
+attempt time_window-aware log collection where possible
+record collection_strategy
+record time_window_aware
+record time_window_coverage
+record coverage warnings when only bounded tail was possible
+```
+
+Phase-03 structuring stage must:
+
+```text
+read raw artifact from content_ref
+parse timestamps
+normalize timestamps and time_window to UTC
+strictly filter timestamped evidence by time_window
+record retained/discarded counts
+record timestamp and timezone quality flags
+```
 
 Rules:
 
-- apply filtering to evidence types with timestamps
-- preserve evidence without timestamps but mark `timestamp_parse_status=not_applicable`
+- if log timestamp contains `Z`, treat it as UTC
+- if log timestamp contains explicit offset, use that offset
+- if log timestamp has no offset, infer from `log_timestamps`, MySQL timezone variables, or OS timezone metadata
+- if timezone cannot be inferred, mark `timezone_inference_failed`
+- never compare local-time strings directly to UTC log timestamps
+- do not treat `tail 5000 lines` as proof of full time_window coverage
 - if timestamps cannot be parsed, set `timestamp_parse_status=failed`
-- record discarded / retained counts
+- if filtering is only partial, set `time_window_filter_status=partial`
+- if filtering cannot be performed, set `time_window_filter_status=unavailable`
 - do not drop all evidence silently
 
 Time-window filtering applies primarily to:
@@ -671,7 +826,58 @@ It may partially apply to OS command output if timestamps exist.
 
 ---
 
-# 12. Deduplication Rules
+# 15. Log Pattern Aggregation Rules
+
+For log evidence, the order must be:
+
+```text
+load raw artifact
+parse timestamp
+normalize timezone
+filter by time_window
+normalize pattern
+aggregate top_patterns
+preserve raw_refs
+```
+
+Top patterns must be based on retained in-window events only.
+
+Basic pattern normalization should:
+
+```text
+remove timestamp
+remove thread id
+remove IP:port
+remove obvious numeric IDs
+preserve severity marker such as Note / Warning / ERROR
+preserve important MySQL message type
+```
+
+Each top pattern should include:
+
+```json
+{
+  "pattern": "...",
+  "count": 1,
+  "semantic_hint": "aborted_connection",
+  "operational_relevance": "high",
+  "raw_refs": []
+}
+```
+
+Evidence-level summary should mention the leading pattern without generating root cause.
+
+Example:
+
+```text
+Error log contains 404 Aborted connection events inside the requested time window.
+```
+
+This is evidence summarization, not final diagnosis.
+
+---
+
+# 16. Deduplication Rules
 
 Phase-03 must deduplicate semantically overlapping evidence.
 
@@ -691,7 +897,7 @@ Do not remove raw_refs needed for traceability.
 
 ---
 
-# 13. Bounded Context Reduction
+# 17. Bounded Context Reduction
 
 EvidenceBundle must be bounded and LLM-safe.
 
@@ -731,7 +937,7 @@ top_patterns
 
 ---
 
-# 14. Evidence Quality Flags
+# 18. Evidence Quality Flags
 
 EvidenceItems may include quality flags:
 
@@ -747,6 +953,11 @@ deprecated_evidence_type
 raw_ref_missing
 secret_redacted
 parser_partial
+time_window_filter_unavailable
+time_window_filter_partial
+timezone_inference_failed
+coverage_unknown
+collection_tail_fallback
 ```
 
 Bundle-level quality statuses:
@@ -760,7 +971,7 @@ failed
 
 ---
 
-# 15. Evidence Guardrails
+# 19. Evidence Guardrails
 
 Evidence Guardrails must check:
 
@@ -777,6 +988,7 @@ raw_refs valid
 EvidenceItem schema valid
 EvidenceBundle schema valid
 no root cause / findings / verdict fields
+subagent did not call live collection tools
 ```
 
 If guardrails fail:
@@ -788,7 +1000,7 @@ reason=evidence_guardrails_failed
 
 ---
 
-# 16. Artifacts
+# 20. Artifacts
 
 Required artifacts:
 
@@ -819,12 +1031,14 @@ Artifacts must not contain raw chain-of-thought.
 
 ---
 
-# 17. Telemetry
+# 21. Telemetry
 
 Required events:
 
 ```text
 evidence_structuring_started
+evidence_subagent_invoked
+evidence_subagent_completed
 raw_evidence_index_loaded
 raw_artifact_loaded
 raw_artifact_load_failed
@@ -849,6 +1063,8 @@ Telemetry must include:
 
 ```text
 request_id
+parent_agent=mysql_analyzer
+subagent=evidence_structuring
 raw_evidence_id
 evidence_type
 tool_name
@@ -859,13 +1075,13 @@ status
 quality_flags
 ```
 
-Telemetry must not include raw secrets.
+Telemetry must not include raw secrets or chain-of-thought.
 
 ---
 
-# 18. CLI Behavior
+# 22. CLI Behavior
 
-## 18.1 Run Phase-03 from Existing RawEvidence
+## 22.1 Run Phase-03 from Existing RawEvidence
 
 Phase-03 must support a repeatable entrypoint from an existing raw evidence index.
 
@@ -882,6 +1098,8 @@ Expected output:
 DBKit 0.1.0
 phase=phase-03
 status=evidence_bundle_created
+subagent=evidence_structuring
+parent_agent=mysql_analyzer
 evidence_items=...
 unavailable_evidence=...
 quality=usable_with_warnings
@@ -890,7 +1108,7 @@ artifact=.dbkit/artifacts/<request_id>.evidence-bundle.json
 
 If this exact CLI flag is not implemented, an equivalent testable entrypoint must exist.
 
-## 18.2 Run Phase-01 -> Phase-02.1 -> Phase-03 in One Command
+## 22.2 Run Phase-01 -> Phase-02.1 -> Phase-03 in One Command
 
 Phase-03 may also run after Phase-02.1 in the same command if the runtime supports phase chaining.
 
@@ -905,7 +1123,7 @@ Only EvidenceBundle artifact.
 
 ---
 
-# 19. Skill Requirements
+# 23. Skill Requirements
 
 Create or update:
 
@@ -917,12 +1135,16 @@ Required sections:
 
 ```text
 Role
+Parent Agent Relationship
 Input Contract
 Output Contract
 Supported Evidence Types
 Deprecated Evidence Types
+Allowed Processing Tools
+Forbidden Tools
 Processing Rules
 Time Window Rules
+Timezone Rules
 Deduplication Rules
 Aggregation Rules
 Raw Reference Rules
@@ -935,12 +1157,16 @@ Forbidden Behavior
 Skill must state:
 
 ```text
-Do not diagnose root cause.
-Do not generate findings.
-Do not generate verdict.
-Do not invent missing raw data.
-Do not request additional collection.
-Do not reintroduce deprecated metrics.mysql* evidence.
+You are the Evidence Structuring Subagent for mysql_analyzer.
+You transform RawEvidence into EvidenceBundle.
+You may select evidence processing tools.
+You must not call live collection tools.
+You must not request additional collection.
+You must not diagnose root cause.
+You must not generate findings.
+You must not generate verdict.
+You must not invent missing raw data.
+You must not reintroduce deprecated metrics.mysql* evidence.
 Always preserve raw_refs.
 Use content_ref to read full raw artifacts.
 Prefer summaries and aggregation over raw dumps.
@@ -948,7 +1174,7 @@ Prefer summaries and aggregation over raw dumps.
 
 ---
 
-# 20. Out of Scope
+# 24. Out of Scope
 
 Do not implement:
 
@@ -968,13 +1194,25 @@ Do not implement:
 
 ---
 
-# 21. Required Tests
+# 25. Required Tests
 
-## 21.1 Load RawEvidence Index
+## 25.1 Subagent Registration
+
+Evidence Structuring Subagent is registered under MySQL Analyzer workflow.
+
+## 25.2 Subagent Delegation
+
+MySQL Analyzer can delegate RawEvidence structuring to Evidence Structuring Subagent.
+
+## 25.3 Subagent Tool Allowlist
+
+Evidence Structuring Subagent can call evidence processing tools but cannot call live MySQL/SSH collectors.
+
+## 25.4 Load RawEvidence Index
 
 Given a Phase-02.1 raw-evidence-index, Phase-03 loads it and resolves content_ref.
 
-## 21.2 Process MySQL Baseline
+## 25.5 Process MySQL Baseline
 
 Raw evidence types produce EvidenceItems:
 
@@ -987,7 +1225,7 @@ mysql.service_metadata
 mysql.log_paths
 ```
 
-## 21.3 Process MySQL+SSH Extension
+## 25.6 Process MySQL+SSH Extension
 
 Raw evidence types produce EvidenceItems or unavailable coverage:
 
@@ -1000,47 +1238,54 @@ metrics.os_disk
 os.mysql_service_status
 ```
 
-## 21.4 Slow Log Disabled
+## 25.7 Slow Log Disabled
 
 If `mysql.slow_log` status is `not_available` and reason is `slow_query_log_disabled`, EvidenceBundle records unavailable evidence and does not create fake slow log EvidenceItem.
 
-## 21.5 Error Log Structuring
+## 25.8 Error Log Structuring
 
 Error log becomes EvidenceItem with:
 
 ```text
 top_patterns
+semantic_hint
 timestamp_parse_status
+timezone_handling
+time_window_filter_status
 raw_refs
 retained_lines
 discarded_lines
 ```
 
-## 21.6 Processlist Structuring
+## 25.9 Timezone-Aware Filtering
+
+User window in `+08:00` matches error log timestamps in `Z` correctly after UTC normalization.
+
+## 25.10 Processlist Structuring
 
 Processlist becomes structured counts and top states/users.
 
-## 21.7 Runtime Status Structuring
+## 25.11 Runtime Status Structuring
 
 Runtime status extracts selected counters and raw_refs.
 
-## 21.8 Variables Structuring
+## 25.12 Variables Structuring
 
 Variables extracts key config values and raw_refs.
 
-## 21.9 Service Metadata Structuring
+## 25.13 Service Metadata Structuring
 
 Service metadata extracts version, hostname, port, datadir, and log paths.
 
-## 21.10 Log Paths Structuring
+## 25.14 Log Paths Structuring
 
 Log paths extracts error/slow log path and slow_query_log_enabled.
 
-## 21.11 OS Metrics Structuring
+## 25.15 OS Metrics Structuring
 
 OS CPU/memory/disk snapshots become structured payloads with parse quality flags.
 
-## 21.12 Dedup Deprecated Metrics
+## 25.16 Dedup Deprecated Metrics
 
 If old artifacts contain:
 
@@ -1052,19 +1297,19 @@ metrics.mysql_variables
 
 Phase-03 does not create duplicate EvidenceItems.
 
-## 21.13 Time Window Filtering
+## 25.17 Time Window Filtering
 
 Timestamped logs outside window are excluded or marked out-of-window.
 
-## 21.14 Timestamp Parse Failure
+## 25.18 Timestamp Parse Failure
 
 Unparseable timestamps are marked explicitly.
 
-## 21.15 Bounded Output
+## 25.19 Bounded Output
 
 EvidenceBundle does not embed large raw content.
 
-## 21.16 No Findings
+## 25.20 No Findings
 
 EvidenceBundle must not contain:
 
@@ -1076,38 +1321,41 @@ final_summary
 recommendations
 ```
 
-## 21.17 Secret Safety
+## 25.21 Secret Safety
 
 No raw secrets in EvidenceBundle or telemetry.
 
-## 21.18 CLI Entrypoint
+## 25.22 CLI Entrypoint
 
 `--from-raw-evidence` or equivalent repeatable entrypoint works.
 
 ---
 
-# 22. Success Criteria
+# 26. Success Criteria
 
 Phase-03 is complete when:
 
-1. Phase-02.1 RawEvidence becomes EvidenceBundle.
-2. EvidenceItems are structured for MySQL baseline evidence.
-3. EvidenceItems are structured for SSH/log/OS extension evidence.
-4. `not_available` evidence is handled correctly.
-5. `mysql.log_paths` and `mysql.service_metadata` are first-class EvidenceItems.
-6. Time-window filtering works where applicable.
-7. Deduplication works for repeated logs and deprecated duplicate metrics.
-8. Raw refs are preserved and valid.
-9. Output is bounded and LLM-safe.
-10. Evidence processing telemetry exists.
-11. Evidence Guardrails pass.
-12. No findings/root cause/verdict are generated.
-13. Required tests pass.
-14. GitHub CI passes.
+1. Evidence Structuring Subagent is registered under MySQL Analyzer workflow.
+2. MySQL Analyzer can delegate RawEvidence structuring to Evidence Structuring Subagent.
+3. Evidence Structuring Subagent can only call evidence processing tools.
+4. Phase-02.1 RawEvidence becomes EvidenceBundle.
+5. EvidenceItems are structured for MySQL baseline evidence.
+6. EvidenceItems are structured for SSH/log/OS extension evidence.
+7. `not_available` evidence is handled correctly.
+8. `mysql.log_paths` and `mysql.service_metadata` are first-class EvidenceItems.
+9. Time-window and timezone-aware filtering work where applicable.
+10. Deduplication works for repeated logs and deprecated duplicate metrics.
+11. Raw refs are preserved and valid.
+12. Output is bounded and LLM-safe.
+13. Evidence processing telemetry exists.
+14. Evidence Guardrails pass.
+15. No findings/root cause/verdict are generated.
+16. Required tests pass.
+17. GitHub CI passes.
 
 ---
 
-# 23. Closeout Requirements
+# 27. Closeout Requirements
 
 Implementation closeout must report:
 
@@ -1123,8 +1371,16 @@ Evidence processing telemetry path
 Evidence item count
 Unavailable evidence count
 Quality status
+Subagent registration path
+Parent agent relationship
 Known limitations
 Remaining risks
 ```
 
-Do not mark Phase-03 complete without a repeatable test using a real Phase-02.1 raw-evidence-index.
+Do not mark Phase-03 complete without:
+
+```text
+a repeatable test using a real Phase-02.1 raw-evidence-index
+evidence_structuring registered as mysql_analyzer subagent
+tool allowlist proving no live collectors are callable from Evidence Subagent
+```

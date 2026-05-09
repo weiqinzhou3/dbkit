@@ -5,6 +5,7 @@ from pathlib import Path
 from time import perf_counter_ns
 from typing import Any
 
+from dbkit.agents.evidence_structuring import EvidenceStructuringSubagentRegistration
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.observability import TelemetryRecorder
 from dbkit.schemas.evidence import (
@@ -27,9 +28,18 @@ class EvidenceStructuringPipeline:
         *,
         artifact_store: ArtifactStore,
         telemetry: TelemetryRecorder,
+        subagent_registration: EvidenceStructuringSubagentRegistration | None = None,
     ) -> None:
         self.artifact_store = artifact_store
         self.telemetry = telemetry
+        self.subagent_registration = (
+            subagent_registration
+            or EvidenceStructuringSubagentRegistration.from_dirs(
+                skills_dir=Path("skills"),
+                agents_dir=Path("agents"),
+            )
+        )
+        self.subagent_registration.validate()
 
     def run(self, raw_evidence_index_path: str | Path) -> EvidenceStructuringResult:
         index_path = Path(raw_evidence_index_path)
@@ -39,6 +49,13 @@ class EvidenceStructuringPipeline:
             "evidence_structuring_started",
             "Evidence structuring started",
             input_raw_evidence_index=str(index_path),
+            status="started",
+        )
+        self._emit(
+            "evidence_subagent_invoked",
+            "MySQL analyzer delegated evidence structuring to subagent",
+            input_raw_evidence_index=str(index_path),
+            status="started",
         )
 
         if not index_path.exists():
@@ -113,6 +130,8 @@ class EvidenceStructuringPipeline:
                 request_id=request_id,
                 raw_evidence_id=raw_id,
                 evidence_type=evidence_type,
+                tool_name="classify_raw_evidence",
+                status="completed",
                 collection_status=status,
             )
 
@@ -186,11 +205,13 @@ class EvidenceStructuringPipeline:
             content_ref = str(payload.get("content_ref") or "")
             dedup_key = (evidence_type, content_ref)
             self._emit(
-                "dedup_started",
+                "deduplication_started",
                 "Evidence deduplication check started",
                 request_id=request_id,
                 raw_evidence_id=raw_id,
                 evidence_type=evidence_type,
+                tool_name="deduplicate_events",
+                status="started",
             )
             if dedup_key in seen_keys:
                 skipped.append(
@@ -201,21 +222,25 @@ class EvidenceStructuringPipeline:
                     }
                 )
                 self._emit(
-                    "dedup_completed",
+                    "deduplication_completed",
                     "Duplicate raw evidence skipped",
                     request_id=request_id,
                     raw_evidence_id=raw_id,
                     evidence_type=evidence_type,
+                    tool_name="deduplicate_events",
+                    status="skipped",
                     deduplicated=True,
                 )
                 continue
             seen_keys.add(dedup_key)
             self._emit(
-                "dedup_completed",
+                "deduplication_completed",
                 "Evidence deduplication check completed",
                 request_id=request_id,
                 raw_evidence_id=raw_id,
                 evidence_type=evidence_type,
+                tool_name="deduplicate_events",
+                status="completed",
                 deduplicated=False,
             )
 
@@ -228,6 +253,8 @@ class EvidenceStructuringPipeline:
                     request_id=request_id,
                     raw_evidence_id=raw_id,
                     evidence_type=evidence_type,
+                    tool_name="load_raw_artifact",
+                    status="completed",
                     bytes=len(raw_text.encode("utf-8")),
                 )
             except (OSError, json.JSONDecodeError) as exc:
@@ -255,6 +282,8 @@ class EvidenceStructuringPipeline:
                 request_id=request_id,
                 raw_evidence_id=raw_id,
                 evidence_type=evidence_type,
+                tool_name=_parser_tool_name(evidence_type),
+                status="started",
             )
             self._emit(
                 "time_window_filter_started",
@@ -262,6 +291,8 @@ class EvidenceStructuringPipeline:
                 request_id=request_id,
                 raw_evidence_id=raw_id,
                 evidence_type=evidence_type,
+                tool_name="filter_by_time_window",
+                status="started",
             )
             parser_started_ns = perf_counter_ns()
             try:
@@ -301,6 +332,8 @@ class EvidenceStructuringPipeline:
                 time_window_filter_status=structured.get("time_window_filter_status"),
                 collection_time_window_coverage=structured.get("collection_time_window_coverage"),
                 duration_ms=parser_duration_ms,
+                tool_name="filter_by_time_window",
+                status="completed",
             )
             self._emit(
                 "evidence_parser_completed",
@@ -308,8 +341,10 @@ class EvidenceStructuringPipeline:
                 request_id=request_id,
                 raw_evidence_id=raw_id,
                 evidence_type=evidence_type,
+                tool_name=_parser_tool_name(evidence_type),
                 status="partial" if item.quality_flags else "completed",
                 duration_ms=parser_duration_ms,
+                quality_flags=list(item.quality_flags),
             )
             evidence_items.append(item)
             self._emit(
@@ -319,6 +354,9 @@ class EvidenceStructuringPipeline:
                 raw_evidence_id=raw_id,
                 evidence_id=item.evidence_id,
                 evidence_type=evidence_type,
+                tool_name="build_evidence_bundle",
+                status="completed",
+                quality_flags=list(item.quality_flags),
             )
 
         self._emit(
@@ -344,6 +382,15 @@ class EvidenceStructuringPipeline:
             "Evidence bundle created",
             request_id=request_id,
             evidence_item_count=len(evidence_items),
+            tool_name="build_evidence_bundle",
+            status="completed",
+        )
+        self._emit(
+            "evidence_subagent_completed",
+            "Evidence structuring subagent completed",
+            request_id=request_id,
+            evidence_item_count=len(evidence_items),
+            status="completed",
         )
 
         for item in evidence_items:
@@ -463,7 +510,7 @@ class EvidenceStructuringPipeline:
             "unavailable_count": len(unavailable),
             "deprecated_count": len(set(deprecated)),
         }
-        self.telemetry.emit_runtime_cost(
+        runtime_cost_event = self.telemetry.emit_runtime_cost(
             stage="evidence_structuring",
             raw_bytes=raw_bytes,
             filtered_bytes=structured_bytes,
@@ -471,6 +518,14 @@ class EvidenceStructuringPipeline:
             estimated_tokens=tokens_after,
             tool_latency_ms=0,
         )
+        runtime_cost_event.attributes.setdefault(
+            "parent_agent", self.subagent_registration.parent_agent
+        )
+        runtime_cost_event.attributes.setdefault(
+            "subagent", self.subagent_registration.name
+        )
+        runtime_cost_event.attributes.setdefault("status", "completed")
+        runtime_cost_event.attributes.setdefault("tool_name", "estimate_token_size")
         return EvidenceBundle(
             request_id=request_id,
             phase="phase-03",
@@ -487,6 +542,10 @@ class EvidenceStructuringPipeline:
             metadata={
                 "phase_detail": "phase-03-evidence-structuring-mvp",
                 "input_phase": "phase-02.1",
+                "skill": "skills/evidence/SKILL.md",
+                "subagent": "evidence_structuring",
+                "parent_agent": "mysql_analyzer",
+                "runtime_foundation": "DeepAgents SDK",
             },
         )
 
@@ -543,14 +602,17 @@ class EvidenceStructuringPipeline:
 
     def _artifact_written(self, request_id: str, artifact: Any) -> None:
         self._emit(
-            "artifact_written",
+            "evidence_artifact_written",
             "Artifact written",
             request_id=request_id,
             kind=artifact.kind,
             path=str(artifact.path),
+            status="completed",
         )
 
     def _emit(self, event_type: str, message: str, **attributes: Any) -> None:
+        attributes.setdefault("parent_agent", self.subagent_registration.parent_agent)
+        attributes.setdefault("subagent", self.subagent_registration.name)
         self.telemetry.emit(
             event_type=event_type,
             stage="evidence_structuring",
@@ -575,3 +637,20 @@ def _quality_status(
     if not evidence_items:
         return "insufficient"
     return "usable_with_warnings" if warnings else "usable"
+
+
+def _parser_tool_name(evidence_type: str) -> str:
+    return {
+        "mysql.processlist": "parse_mysql_processlist",
+        "mysql.runtime_status": "parse_mysql_runtime_status",
+        "mysql.innodb_status": "parse_mysql_innodb_status",
+        "mysql.variables": "parse_mysql_variables",
+        "mysql.service_metadata": "parse_mysql_service_metadata",
+        "mysql.log_paths": "parse_mysql_log_paths",
+        "mysql.error_log": "parse_mysql_error_log",
+        "mysql.slow_log": "parse_mysql_slow_log",
+        "metrics.os_cpu": "parse_os_cpu_snapshot",
+        "metrics.os_memory": "parse_os_memory_snapshot",
+        "metrics.os_disk": "parse_os_disk_snapshot",
+        "os.mysql_service_status": "parse_os_mysql_service_status",
+    }.get(evidence_type, "classify_raw_evidence")

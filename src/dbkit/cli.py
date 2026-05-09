@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from dbkit import __version__
+from dbkit.agents.evidence_structuring import EvidenceStructuringSubagentRegistration
 from dbkit.agents.mysql_analyzer import MySQLAnalyzerAgent
 from dbkit.config import DEFAULT_CONFIG_PATH, load_app_config
 from dbkit.model_provider import build_agent_model
@@ -27,10 +28,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = EvidenceStructuringPipeline(
             artifact_store=ArtifactStore(config.runtime.artifact_dir),
             telemetry=TelemetryRecorder(),
+            subagent_registration=EvidenceStructuringSubagentRegistration.from_dirs(
+                skills_dir=config.runtime.skills_dir,
+                agents_dir=config.runtime.agents_dir,
+            ),
         ).run(raw_evidence_index_path)
         print(f"DBKit {__version__}")
         print(f"phase={result.phase}")
         print(f"status={result.status}")
+        if result.bundle is not None:
+            print(f"subagent={result.bundle.metadata.get('subagent')}")
+            print(f"parent_agent={result.bundle.metadata.get('parent_agent')}")
         if result.bundle is not None:
             print(f"evidence_items={len(result.bundle.evidence_items)}")
             print(
@@ -108,7 +116,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("提示：使用 --interactive 可以交互式补充缺失信息。")
         return 1
 
-    mysql_analyzer = MySQLAnalyzerAgent.from_skills_dir(config.runtime.skills_dir)
+    try:
+        mysql_analyzer = MySQLAnalyzerAgent.from_skills_dir(
+            config.runtime.skills_dir,
+            agents_dir=config.runtime.agents_dir,
+        )
+    except TypeError:
+        mysql_analyzer = MySQLAnalyzerAgent.from_skills_dir(config.runtime.skills_dir)
     analyzer_runtime = runtime_factory.create_mysql_analyzer_runtime(
         mysql_analyzer.skill_text
     )

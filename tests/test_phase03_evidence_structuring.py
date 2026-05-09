@@ -6,12 +6,27 @@ import unittest
 from pathlib import Path
 
 from dbkit.cli import main as cli_main
+from dbkit.agents.mysql_analyzer import MySQLAnalyzerAgent
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.evidence_structuring import EvidenceStructuringPipeline
 from dbkit.runtime.observability import TelemetryRecorder
 
 
 class Phase03EvidenceStructuringTest(unittest.TestCase):
+    def test_evidence_structuring_is_registered_as_mysql_analyzer_subagent(self) -> None:
+        agent = MySQLAnalyzerAgent.from_skills_dir(Path("skills"))
+        registration = agent.subagents["evidence_structuring"]
+
+        self.assertEqual(agent.name, "mysql_analyzer")
+        self.assertEqual(registration.parent_agent, "mysql_analyzer")
+        self.assertEqual(registration.name, "evidence_structuring")
+        self.assertEqual(registration.skill_path, Path("skills/evidence/SKILL.md"))
+        self.assertTrue(registration.is_tool_allowed("parse_mysql_error_log"))
+        self.assertTrue(registration.is_tool_allowed("build_evidence_bundle"))
+        self.assertFalse(registration.is_tool_allowed("collect_mysql_error_log"))
+        self.assertFalse(registration.is_tool_allowed("read_remote_file"))
+        self.assertFalse(registration.is_tool_allowed("kill_mysql_query"))
+
     def test_raw_evidence_index_becomes_bounded_evidence_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -32,6 +47,10 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
         ])
         self.assertEqual(bundle["coverage"]["unavailable_evidence"][0]["reason"], "slow_query_log_disabled")
         self.assertEqual(bundle["quality"]["overall_status"], "usable_with_warnings")
+        self.assertEqual(bundle["metadata"]["subagent"], "evidence_structuring")
+        self.assertEqual(bundle["metadata"]["parent_agent"], "mysql_analyzer")
+        self.assertEqual(bundle["metadata"]["skill"], "skills/evidence/SKILL.md")
+        self.assertEqual(bundle["metadata"]["runtime_foundation"], "DeepAgents SDK")
 
         evidence_types = {item["evidence_type"] for item in bundle["evidence_items"]}
         for expected in (
@@ -109,8 +128,45 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("phase=phase-03", output)
         self.assertIn("status=evidence_bundle_created", output)
+        self.assertIn("subagent=evidence_structuring", output)
+        self.assertIn("parent_agent=mysql_analyzer", output)
         self.assertIn("quality=usable_with_warnings", output)
         self.assertIn(".evidence-bundle.json", output)
+
+    def test_phase03_telemetry_records_subagent_delegation_and_tool_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = _write_raw_evidence_fixture(root)
+            result = EvidenceStructuringPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+            ).run(index_path)
+            telemetry_artifact = [
+                artifact for artifact in result.artifacts
+                if artifact.kind == "EvidenceProcessingTelemetry"
+            ][0]
+            events = [
+                json.loads(line)
+                for line in telemetry_artifact.path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        event_types = [event["event_type"] for event in events]
+        self.assertIn("evidence_subagent_invoked", event_types)
+        self.assertIn("evidence_subagent_completed", event_types)
+        self.assertIn("deduplication_started", event_types)
+        self.assertIn("deduplication_completed", event_types)
+        self.assertIn("evidence_artifact_written", event_types)
+        for event in events:
+            attrs = event.get("attributes") or {}
+            self.assertEqual(attrs.get("parent_agent"), "mysql_analyzer")
+            self.assertEqual(attrs.get("subagent"), "evidence_structuring")
+        tool_names = {
+            (event.get("attributes") or {}).get("tool_name")
+            for event in events
+        }
+        self.assertIn("parse_mysql_error_log", tool_names)
+        self.assertIn("filter_by_time_window", tool_names)
+        self.assertNotIn("collect_mysql_error_log", tool_names)
 
     def test_missing_content_ref_is_blocked_by_evidence_guardrails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
