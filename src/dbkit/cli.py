@@ -64,6 +64,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             validation_runtime=runtime_factory.create_validation_runtime(validation_skill),
             repo_dir=config.runtime.repo_dir,
+            max_prompt_chars=config.runtime.phase04_max_prompt_chars,
+            findings_generation_timeout_seconds=(
+                config.runtime.phase04_findings_generation_timeout_seconds
+            ),
+            validation_timeout_seconds=config.runtime.phase04_validation_timeout_seconds,
+            max_findings_generation_retries=(
+                config.runtime.phase04_max_findings_generation_retries
+            ),
+            max_validation_retries=config.runtime.phase04_max_validation_retries,
+            max_agent_iterations=config.runtime.phase04_max_agent_iterations,
         ).run(evidence_bundle_path)
         print(f"DBKit {__version__}")
         print("mode=replay")
@@ -377,6 +387,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             _validation_skill(config.runtime.skills_dir)
         ),
         repo_dir=config.runtime.repo_dir,
+        max_prompt_chars=config.runtime.phase04_max_prompt_chars,
+        findings_generation_timeout_seconds=(
+            config.runtime.phase04_findings_generation_timeout_seconds
+        ),
+        validation_timeout_seconds=config.runtime.phase04_validation_timeout_seconds,
+        max_findings_generation_retries=(
+            config.runtime.phase04_max_findings_generation_retries
+        ),
+        max_validation_retries=config.runtime.phase04_max_validation_retries,
+        max_agent_iterations=config.runtime.phase04_max_agent_iterations,
     ).run(
         structuring_result.bundle_artifact.path,
         expected_request_id=evidence_result.request_id,

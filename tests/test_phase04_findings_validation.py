@@ -253,6 +253,157 @@ class Phase04FindingsValidationTest(unittest.TestCase):
         self.assertEqual(invalid_payload["retry_attempt"], 1)
         self.assertNotIn("Root@1234", json.dumps(invalid_payload, ensure_ascii=False))
 
+    def test_validation_status_alias_is_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_path = _write_evidence_bundle(root)
+            validation = _validation_payload("req_phase04")
+            validation["validated_findings"][0]["validation_status"] = "valid"
+
+            result = Phase04AnalysisPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                mysql_analyzer_runtime=FakeAnalyzerRuntime(_findings_payload("req_phase04")),
+                validation_runtime=FakeValidationRuntime(validation),
+            ).run(bundle_path)
+
+            validation_payload = _artifact_payload(result.artifacts, "ValidationResult")
+
+        self.assertEqual(result.status, "analysis_completed_with_warnings")
+        self.assertEqual(validation_payload["validated_findings"][0]["validation_status"], "passed")
+        events = [event for event in result.telemetry if event.event_type == "validation_status_normalized"]
+        self.assertEqual(events[0].attributes["original_validation_status"], "valid")
+        self.assertEqual(events[0].attributes["normalized_validation_status"], "passed")
+
+    def test_invalid_validation_status_retries_once_then_blocks_with_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_path = _write_evidence_bundle(root)
+            first = _validation_payload("req_phase04")
+            first["validated_findings"][0]["validation_status"] = "warning"
+            second = _validation_payload("req_phase04")
+            second["validated_findings"][0]["validation_status"] = "still_invalid"
+            validation_runtime = FakeSequenceValidationRuntime([first, second])
+
+            result = Phase04AnalysisPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                mysql_analyzer_runtime=FakeAnalyzerRuntime(_findings_payload("req_phase04")),
+                validation_runtime=validation_runtime,
+            ).run(bundle_path)
+
+            invalid_payload = _artifact_payload(result.artifacts, "InvalidValidationResult")
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(len(validation_runtime.invocations), 2)
+        self.assertIn(
+            "validation_result_invalid: validation_status must be one of passed/downgraded/blocked/requires_human_review, got 'still_invalid'",
+            result.blocking_issues,
+        )
+        self.assertEqual(invalid_payload["retry_attempt"], 1)
+        event_types = [event.event_type for event in result.telemetry]
+        self.assertIn("validation_retry_requested", event_types)
+        self.assertIn("validation_result_schema_validation_failed", event_types)
+
+    def test_invalid_validation_status_retry_can_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_path = _write_evidence_bundle(root)
+            first = _validation_payload("req_phase04")
+            first["validated_findings"][0]["validation_status"] = "warning"
+            second = _validation_payload("req_phase04")
+            second["validated_findings"][0]["validation_status"] = "passed"
+            validation_runtime = FakeSequenceValidationRuntime([first, second])
+
+            result = Phase04AnalysisPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                mysql_analyzer_runtime=FakeAnalyzerRuntime(_findings_payload("req_phase04")),
+                validation_runtime=validation_runtime,
+            ).run(bundle_path)
+
+            validation_payload = _artifact_payload(result.artifacts, "ValidationResult")
+
+        self.assertEqual(result.status, "analysis_completed_with_warnings")
+        self.assertEqual(len(validation_runtime.invocations), 2)
+        self.assertEqual(validation_payload["validated_findings"][0]["validation_status"], "passed")
+
+    def test_phase04_uses_bounded_compact_analysis_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_path = _write_large_evidence_bundle(root)
+            analyzer = FakeAnalyzerRuntime(_findings_payload("req_phase04"))
+            validation = FakeValidationRuntime(_validation_payload("req_phase04"))
+
+            result = Phase04AnalysisPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                mysql_analyzer_runtime=analyzer,
+                validation_runtime=validation,
+                max_prompt_chars=30000,
+            ).run(bundle_path)
+
+        self.assertEqual(result.status, "analysis_completed_with_warnings")
+        analyzer_message = analyzer.invocations[0]["messages"][0]["content"]
+        validation_message = validation.invocations[0]["messages"][0]["content"]
+        self.assertIn("compact_analysis_context", analyzer.invocations[0])
+        self.assertNotIn("EvidenceBundle JSON", analyzer_message)
+        self.assertNotIn("raw-log-line-should-not-enter-llm", analyzer_message)
+        self.assertNotIn("raw-log-line-should-not-enter-llm", validation_message)
+        self.assertLessEqual(len(analyzer_message), 30000)
+        compact_events = [
+            event for event in result.telemetry
+            if event.event_type == "compact_analysis_context_created"
+        ]
+        self.assertTrue(compact_events)
+        self.assertLess(compact_events[0].attributes["compression_ratio"], 1)
+
+    def test_phase04_timing_telemetry_has_duration_ms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_path = _write_evidence_bundle(root)
+
+            result = Phase04AnalysisPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                mysql_analyzer_runtime=FakeAnalyzerRuntime(_findings_payload("req_phase04")),
+                validation_runtime=FakeValidationRuntime(_validation_payload("req_phase04")),
+            ).run(bundle_path)
+
+        for event in result.telemetry:
+            self.assertIn("duration_ms", event.attributes)
+            self.assertGreaterEqual(event.attributes["duration_ms"], 0)
+
+    def test_validation_timeout_returns_human_review_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_path = _write_evidence_bundle(root)
+
+            result = Phase04AnalysisPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                mysql_analyzer_runtime=FakeAnalyzerRuntime(_findings_payload("req_phase04")),
+                validation_runtime=FakeTimeoutRuntime(),
+            ).run(bundle_path)
+
+        self.assertEqual(result.status, "human_review_required")
+        self.assertTrue(any(event.attributes.get("status") == "timeout" for event in result.telemetry))
+
+    def test_findings_generation_timeout_returns_human_review_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_path = _write_evidence_bundle(root)
+
+            result = Phase04AnalysisPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                mysql_analyzer_runtime=FakeTimeoutRuntime(),
+                validation_runtime=FakeValidationRuntime(_validation_payload("req_phase04")),
+            ).run(bundle_path)
+
+        self.assertEqual(result.status, "human_review_required")
+        self.assertIn("findings_generation_timeout", result.blocking_issues)
+
     def test_cli_from_evidence_bundle_replay_runs_phase04(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -414,6 +565,9 @@ class Phase04FindingsValidationTest(unittest.TestCase):
         self.assertIn("Validation Agent", validation_skill)
         self.assertIn("evidence_refs", validation_skill)
         self.assertIn("ValidationResult", validation_skill)
+        self.assertIn("validation_status", validation_skill)
+        self.assertIn("passed", validation_skill)
+        self.assertIn("requires_human_review", validation_skill)
 
     def test_normalize_request_preserves_execution_boundary_from_intake_json(self) -> None:
         normalized = normalize_request(
@@ -469,6 +623,22 @@ class FakeValidationRuntime:
     def invoke(self, payload: dict) -> dict:
         self.invocations.append(payload)
         return {"messages": [{"role": "assistant", "content": json.dumps(self.payload, ensure_ascii=False)}]}
+
+
+class FakeSequenceValidationRuntime:
+    def __init__(self, payloads: list[dict]) -> None:
+        self.payloads = list(payloads)
+        self.invocations: list[dict] = []
+
+    def invoke(self, payload: dict) -> dict:
+        self.invocations.append(payload)
+        response = self.payloads.pop(0)
+        return {"messages": [{"role": "assistant", "content": json.dumps(response, ensure_ascii=False)}]}
+
+
+class FakeTimeoutRuntime:
+    def invoke(self, payload: dict) -> dict:
+        raise TimeoutError("validation timed out")
 
 
 def _write_evidence_bundle(root: Path, *, request_id: str = "req_phase04") -> Path:
@@ -547,6 +717,51 @@ def _write_evidence_bundle(root: Path, *, request_id: str = "req_phase04") -> Pa
         "metadata": {"subagent": "evidence_structuring", "parent_agent": "mysql_analyzer"},
     }
     path = artifacts / f"{request_id}.evidence-bundle.json"
+    path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def _write_large_evidence_bundle(root: Path, *, request_id: str = "req_phase04") -> Path:
+    path = _write_evidence_bundle(root, request_id=request_id)
+    bundle = json.loads(path.read_text(encoding="utf-8"))
+    error_log = bundle["evidence_items"][0]
+    error_log["structured_payload"]["sample_events"] = [
+        {
+            "line_start": index,
+            "line_end": index,
+            "message": f"raw-log-line-should-not-enter-llm {index}",
+        }
+        for index in range(50)
+    ]
+    error_log["structured_payload"]["top_patterns"] = [
+        {
+            "pattern": f"Note Aborted connection {index}",
+            "count": 404 - index,
+            "semantic_hint": "aborted_connection",
+            "operational_relevance": "high",
+            "raw_refs": [{"content_ref": ".dbkit/artifacts/raw/rawev_error_log.txt", "line_start": 1, "line_end": 1}],
+        }
+        for index in range(25)
+    ]
+    bundle["evidence_items"].append(
+        {
+            "evidence_id": "ev_large_status",
+            "raw_evidence_id": "rawev_large_status",
+            "evidence_type": "mysql.variables",
+            "source": {"kind": "mysql", "tool_name": "collect_mysql_variables"},
+            "time_range": {},
+            "summary": "Variables payload contains full rows that must be compacted.",
+            "structured_payload": {
+                "rows": [
+                    {"Variable_name": f"variable_{index}", "Value": "raw-log-line-should-not-enter-llm"}
+                    for index in range(500)
+                ]
+            },
+            "raw_refs": [{"content_ref": ".dbkit/artifacts/raw/rawev_large_status.json"}],
+            "quality_flags": [],
+            "llm_safe": True,
+        }
+    )
     path.write_text(json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     return path
 

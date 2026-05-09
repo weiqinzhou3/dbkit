@@ -246,6 +246,8 @@ class Phase02EvidencePlanningCollectionTest(unittest.TestCase):
         self.assertEqual(calls[0]["name"], "dbkit-mysql-analyzer")
         self.assertEqual(calls[0]["skills"], ["/skills/mysql-analyzer/"])
         self.assertIn("MYSQL_SKILL", calls[0]["system_prompt"])
+        legacy_files_state_key = "files" + "_" + "update"
+        self.assertNotIn(legacy_files_state_key, calls[0])
 
     def test_deepagents_factory_registers_evidence_structuring_subagent(self) -> None:
         from dbkit.agents.evidence_structuring import EvidenceStructuringSubagentRegistration

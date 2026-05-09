@@ -40,6 +40,12 @@ class RuntimeConfig:
     max_discovered_files: int = 100
     max_evidence_file_size_bytes: int = 50_000_000
     blocked_paths: tuple[str, ...] = ()
+    phase04_max_prompt_chars: int = 30_000
+    phase04_findings_generation_timeout_seconds: int = 120
+    phase04_validation_timeout_seconds: int = 60
+    phase04_max_findings_generation_retries: int = 1
+    phase04_max_validation_retries: int = 1
+    phase04_max_agent_iterations: int = 6
 
 
 @dataclass(frozen=True)
@@ -143,6 +149,22 @@ def _load_runtime_config(data: dict[str, Any]) -> RuntimeConfig:
             data, "max_evidence_file_size_bytes", 50_000_000
         ),
         blocked_paths=tuple(_optional_string_list(data, "blocked_paths")),
+        phase04_max_prompt_chars=_optional_int(data, "phase04_max_prompt_chars", 30_000),
+        phase04_findings_generation_timeout_seconds=_optional_int(
+            data, "phase04_findings_generation_timeout_seconds", 120
+        ),
+        phase04_validation_timeout_seconds=_optional_int(
+            data, "phase04_validation_timeout_seconds", 60
+        ),
+        phase04_max_findings_generation_retries=_optional_int(
+            data, "phase04_max_findings_generation_retries", 1
+        ),
+        phase04_max_validation_retries=_optional_int(
+            data, "phase04_max_validation_retries", 1
+        ),
+        phase04_max_agent_iterations=_optional_int(
+            data, "phase04_max_agent_iterations", 6
+        ),
     )
 
 

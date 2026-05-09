@@ -35,6 +35,21 @@ ALLOWED_SEVERITIES = ("critical", "high", "medium", "low", "info")
 ALLOWED_VALIDATION_STATUSES = frozenset(
     {"passed", "downgraded", "blocked", "requires_human_review"}
 )
+VALIDATION_STATUS_ALIASES = {
+    "valid": "passed",
+    "pass": "passed",
+    "approved": "passed",
+    "supported": "passed",
+    "invalid": "blocked",
+    "fail": "blocked",
+    "failed": "blocked",
+    "unsupported": "blocked",
+    "needs_review": "requires_human_review",
+    "human_review": "requires_human_review",
+    "review_required": "requires_human_review",
+    "lower_confidence": "downgraded",
+    "confidence_downgraded": "downgraded",
+}
 FORBIDDEN_ANALYSIS_KEYS = frozenset(
     {"raw_evidence", "raw_logs", "root_cause_execution", "remediation_executed"}
 )
@@ -135,10 +150,24 @@ def validate_validation_result(payload: dict[str, Any], findings_draft: dict[str
             raise ValueError(f"ValidationResult.{field_name} must be a list")
     for item in payload["validated_findings"]:
         if item.get("validation_status") not in ALLOWED_VALIDATION_STATUSES:
-            raise ValueError("ValidationResult validation_status is invalid")
+            raise ValueError(
+                "validation_status must be one of "
+                "passed/downgraded/blocked/requires_human_review, "
+                f"got '{item.get('validation_status')}'"
+            )
         confidence = item.get("confidence_after_validation")
-        if confidence is not None and not 0 <= float(confidence) <= 1:
-            raise ValueError("confidence_after_validation must be between 0 and 1")
+        if confidence is not None:
+            try:
+                confidence_value = float(confidence)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "confidence_after_validation must be a number between 0.0 and 1.0"
+                ) from None
+            if not 0 <= confidence_value <= 1:
+                raise ValueError(
+                    "confidence_after_validation must be a number between 0.0 and 1.0"
+                )
+            item["confidence_after_validation"] = confidence_value
     payload.setdefault("request_id", findings_draft["request_id"])
     payload.setdefault("requires_human_review", False)
     payload.setdefault(

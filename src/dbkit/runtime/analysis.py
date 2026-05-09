@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from time import perf_counter_ns
 from typing import Any
@@ -12,6 +13,7 @@ from dbkit.runtime.json_extraction import extract_json_from_invoke_result
 from dbkit.runtime.observability import TelemetryRecorder
 from dbkit.schemas.analysis import (
     ALLOWED_SEVERITIES,
+    VALIDATION_STATUS_ALIASES,
     Phase04AnalysisResult,
     evidence_id_set,
     finding_by_id,
@@ -31,12 +33,25 @@ class Phase04AnalysisPipeline:
         mysql_analyzer_runtime: Any,
         validation_runtime: Any,
         repo_dir: Path | None = None,
+        max_prompt_chars: int = 30_000,
+        findings_generation_timeout_seconds: int = 120,
+        validation_timeout_seconds: int = 60,
+        max_findings_generation_retries: int = 1,
+        max_validation_retries: int = 1,
+        max_agent_iterations: int = 6,
     ) -> None:
         self.artifact_store = artifact_store
         self.telemetry = telemetry
         self.mysql_analyzer_runtime = mysql_analyzer_runtime
         self.validation_runtime = validation_runtime
         self.repo_dir = repo_dir or Path.cwd()
+        self.max_prompt_chars = max_prompt_chars
+        self.findings_generation_timeout_seconds = findings_generation_timeout_seconds
+        self.validation_timeout_seconds = validation_timeout_seconds
+        self.max_findings_generation_retries = max_findings_generation_retries
+        self.max_validation_retries = max_validation_retries
+        self.max_agent_iterations = max_agent_iterations
+        self._last_timeout_stage: str | None = None
 
     def run(
         self,
@@ -120,12 +135,24 @@ class Phase04AnalysisPipeline:
             evidence_item_count=len(evidence_bundle.get("evidence_items") or []),
             status="completed",
         )
-
-        findings_payload = self._invoke_findings_generation(
+        compact_context = self._create_compact_analysis_context(
             evidence_bundle=evidence_bundle,
             input_bundle_ref=input_bundle_ref,
         )
+
+        findings_payload = self._invoke_findings_generation(
+            evidence_bundle=evidence_bundle,
+            compact_context=compact_context,
+            input_bundle_ref=input_bundle_ref,
+        )
         if findings_payload is None:
+            if self._last_timeout_stage == "findings_generation":
+                return self._human_review_timeout(
+                    request_id=request_id,
+                    artifacts=artifacts,
+                    issues=("findings_generation_timeout",),
+                    started_ns=started_ns,
+                )
             return self._failed(
                 request_id=request_id,
                 artifacts=artifacts,
@@ -135,6 +162,7 @@ class Phase04AnalysisPipeline:
         findings_draft, findings_error = self._prepare_findings_draft(
             findings_payload=findings_payload,
             evidence_bundle=evidence_bundle,
+            compact_context=compact_context,
             input_bundle_ref=input_bundle_ref,
             artifacts=artifacts,
         )
@@ -162,6 +190,7 @@ class Phase04AnalysisPipeline:
 
         validation_payload = self._invoke_validation(
             evidence_bundle=evidence_bundle,
+            compact_context=compact_context,
             findings_draft=findings_draft,
             input_bundle_ref=input_bundle_ref,
             findings_artifact=findings_artifact.path,
@@ -173,13 +202,20 @@ class Phase04AnalysisPipeline:
                 issues=("validation_parse_failed",),
                 started_ns=started_ns,
             )
-        try:
-            validation_result = validate_validation_result(validation_payload, findings_draft)
-        except ValueError as exc:
+        validation_result, validation_error = self._prepare_validation_result(
+            validation_payload=validation_payload,
+            evidence_bundle=evidence_bundle,
+            compact_context=compact_context,
+            findings_draft=findings_draft,
+            input_bundle_ref=input_bundle_ref,
+            findings_artifact=findings_artifact.path,
+            artifacts=artifacts,
+        )
+        if validation_result is None:
             return self._failed(
                 request_id=request_id,
                 artifacts=artifacts,
-                issues=(f"validation_result_invalid: {exc}",),
+                issues=(f"validation_result_invalid: {validation_error}",),
                 started_ns=started_ns,
             )
 
@@ -273,14 +309,45 @@ class Phase04AnalysisPipeline:
             telemetry=tuple(self.telemetry.events),
         )
 
-    def _invoke_findings_generation(
+    def _create_compact_analysis_context(
         self,
         *,
         evidence_bundle: dict[str, Any],
         input_bundle_ref: str,
+    ) -> dict[str, Any]:
+        started_ns = perf_counter_ns()
+        request_id = str(evidence_bundle["request_id"])
+        before = len(json.dumps(evidence_bundle, ensure_ascii=False, sort_keys=True))
+        context = _compact_analysis_context(
+            evidence_bundle,
+            input_bundle_ref=input_bundle_ref,
+        )
+        context = _bound_compact_context(context, self.max_prompt_chars)
+        after = len(json.dumps(context, ensure_ascii=False, sort_keys=True))
+        self._emit(
+            "compact_analysis_context_created",
+            "Compact analysis context created for Phase-04 LLM calls",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            input_chars_before=before,
+            input_chars_after=after,
+            compression_ratio=round(after / before, 6) if before else 1,
+            max_prompt_chars=self.max_prompt_chars,
+            status="completed",
+            duration_ms=_duration_ms(started_ns),
+        )
+        return context
+
+    def _invoke_findings_generation(
+        self,
+        *,
+        evidence_bundle: dict[str, Any],
+        compact_context: dict[str, Any],
+        input_bundle_ref: str,
         retry_context: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         request_id = str(evidence_bundle["request_id"])
+        started_ns = perf_counter_ns()
         self._emit(
             "mysql_analyzer_findings_generation_started",
             "MySQL analyzer findings_generation started",
@@ -289,33 +356,51 @@ class Phase04AnalysisPipeline:
             mode="findings_generation",
             status="started",
         )
-        result = self.mysql_analyzer_runtime.invoke(
-            {
-                "mode": "findings_generation",
-                "input_evidence_bundle": input_bundle_ref,
-                "evidence_bundle": evidence_bundle,
-                "retry_context": retry_context or {},
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": (
-                            "Output only DBKit FindingsDraft JSON. Consume the "
-                            "EvidenceBundle only; do not read RawEvidence.\n\n"
-                            + (
-                                "Previous FindingsDraft was invalid. Fix these issues:\n"
-                                + json.dumps(retry_context, ensure_ascii=False, sort_keys=True)
-                                + "\n\n"
-                                if retry_context
-                                else ""
-                            )
-                            +
-                            "EvidenceBundle JSON:\n"
-                            + json.dumps(evidence_bundle, ensure_ascii=False, sort_keys=True)
-                        ),
-                    }
-                ],
-            }
-        )
+        payload = {
+            "mode": "findings_generation",
+            "input_evidence_bundle": input_bundle_ref,
+            "compact_analysis_context": compact_context,
+            "retry_context": retry_context or {},
+            "max_agent_iterations": self.max_agent_iterations,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Output only DBKit FindingsDraft JSON. Consume only the "
+                        "compact_analysis_context; do not read RawEvidence and do not "
+                        "request collection.\n\n"
+                        + (
+                            "Previous FindingsDraft was invalid. Fix these issues:\n"
+                            + json.dumps(retry_context, ensure_ascii=False, sort_keys=True)
+                            + "\n\n"
+                            if retry_context
+                            else ""
+                        )
+                        + "compact_analysis_context JSON:\n"
+                        + json.dumps(compact_context, ensure_ascii=False, sort_keys=True)
+                    ),
+                }
+            ],
+        }
+        try:
+            result = self._invoke_runtime_with_timeout(
+                self.mysql_analyzer_runtime,
+                payload,
+                timeout_seconds=self.findings_generation_timeout_seconds,
+            )
+        except TimeoutError:
+            self._last_timeout_stage = "findings_generation"
+            self._emit(
+                "mysql_analyzer_findings_generation_completed",
+                "MySQL analyzer findings_generation timed out",
+                request_id=request_id,
+                input_evidence_bundle=input_bundle_ref,
+                mode="findings_generation",
+                timeout_seconds=self.findings_generation_timeout_seconds,
+                status="timeout",
+                duration_ms=_duration_ms(started_ns),
+            )
+            return None
         parsed = extract_json_from_invoke_result(result)
         self._emit(
             "mysql_analyzer_findings_generation_completed",
@@ -324,6 +409,7 @@ class Phase04AnalysisPipeline:
             input_evidence_bundle=input_bundle_ref,
             mode="findings_generation",
             status="completed" if parsed is not None else "failed",
+            duration_ms=_duration_ms(started_ns),
         )
         return parsed
 
@@ -332,6 +418,7 @@ class Phase04AnalysisPipeline:
         *,
         findings_payload: dict[str, Any],
         evidence_bundle: dict[str, Any],
+        compact_context: dict[str, Any],
         input_bundle_ref: str,
         artifacts: list[Any],
     ) -> tuple[dict[str, Any] | None, str | None]:
@@ -352,6 +439,8 @@ class Phase04AnalysisPipeline:
             retry_attempt=0,
         )
         artifacts.append(invalid_artifact)
+        if self.max_findings_generation_retries < 1:
+            return None, errors[0]
         retry_context = {
             "validation_errors": list(errors),
             "allowed_schema": {
@@ -377,6 +466,7 @@ class Phase04AnalysisPipeline:
         )
         retry_payload = self._invoke_findings_generation(
             evidence_bundle=evidence_bundle,
+            compact_context=compact_context,
             input_bundle_ref=input_bundle_ref,
             retry_context=retry_context,
         )
@@ -480,6 +570,15 @@ class Phase04AnalysisPipeline:
             confidence_normalization_status=_confidence_status(confidence_events, ()),
             status="completed",
         )
+        self._emit(
+            "findings_draft_schema_validation_completed",
+            "FindingsDraft schema validation completed",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            retry_attempt=retry_attempt,
+            confidence_normalization_status=_confidence_status(confidence_events, ()),
+            status="completed",
+        )
         return draft, ()
 
     def _emit_category_events(
@@ -539,6 +638,25 @@ class Phase04AnalysisPipeline:
                 status="failed",
             )
 
+    def _invoke_runtime_with_timeout(
+        self,
+        runtime: Any,
+        payload: dict[str, Any],
+        *,
+        timeout_seconds: int,
+    ) -> Any:
+        if timeout_seconds <= 0:
+            return runtime.invoke(payload)
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(runtime.invoke, payload)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise TimeoutError("agent invocation timed out") from exc
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
     def _persist_invalid_findings_draft(
         self,
         *,
@@ -573,11 +691,14 @@ class Phase04AnalysisPipeline:
         self,
         *,
         evidence_bundle: dict[str, Any],
+        compact_context: dict[str, Any],
         findings_draft: dict[str, Any],
         input_bundle_ref: str,
         findings_artifact: Path,
+        retry_context: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         request_id = str(evidence_bundle["request_id"])
+        started_ns = perf_counter_ns()
         self._emit(
             "validation_started",
             "Validation agent started",
@@ -587,28 +708,317 @@ class Phase04AnalysisPipeline:
             finding_count=len(findings_draft.get("findings") or []),
             status="started",
         )
-        result = self.validation_runtime.invoke(
-            {
-                "mode": "validation",
+        payload = {
+            "mode": "validation",
+            "input_evidence_bundle": input_bundle_ref,
+            "findings_draft": findings_draft,
+            "compact_analysis_context": compact_context,
+            "retry_context": retry_context or {},
+            "max_agent_iterations": self.max_agent_iterations,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Output only DBKit ValidationResult JSON. Validate "
+                        "FindingsDraft against compact_analysis_context evidence_refs. "
+                        "Do not read RawEvidence and do not generate new findings.\n\n"
+                        + (
+                            "Previous ValidationResult was invalid. Fix these issues:\n"
+                            + json.dumps(retry_context, ensure_ascii=False, sort_keys=True)
+                            + "\n\n"
+                            if retry_context
+                            else ""
+                        )
+                        + "FindingsDraft JSON:\n"
+                        + json.dumps(findings_draft, ensure_ascii=False, sort_keys=True)
+                        + "\n\ncompact_analysis_context JSON:\n"
+                        + json.dumps(compact_context, ensure_ascii=False, sort_keys=True)
+                    ),
+                }
+            ],
+        }
+        try:
+            result = self._invoke_runtime_with_timeout(
+                self.validation_runtime,
+                payload,
+                timeout_seconds=self.validation_timeout_seconds,
+            )
+        except TimeoutError:
+            self._emit(
+                "validation_completed",
+                "Validation agent timed out",
+                request_id=request_id,
+                input_evidence_bundle=input_bundle_ref,
+                input_findings_artifact=_artifact_ref(findings_artifact, self.repo_dir),
+                timeout_seconds=self.validation_timeout_seconds,
+                status="timeout",
+                duration_ms=_duration_ms(started_ns),
+            )
+            return {
+                "request_id": request_id,
+                "phase": "phase-04",
+                "input_findings_artifact": _artifact_ref(findings_artifact, self.repo_dir),
                 "input_evidence_bundle": input_bundle_ref,
-                "findings_draft": findings_draft,
-                "evidence_bundle": evidence_bundle,
-                "messages": [
+                "validated_findings": [],
+                "blocked_findings": [
                     {
-                        "role": "user",
-                        "content": (
-                            "Output only DBKit ValidationResult JSON. Validate "
-                            "FindingsDraft against EvidenceBundle evidence_refs.\n\n"
-                            "FindingsDraft JSON:\n"
-                            + json.dumps(findings_draft, ensure_ascii=False, sort_keys=True)
-                            + "\n\nEvidenceBundle JSON:\n"
-                            + json.dumps(evidence_bundle, ensure_ascii=False, sort_keys=True)
-                        ),
+                        "finding_id": item.get("finding_id"),
+                        "reason": "validation_timeout",
+                        "validation_status": "blocked",
                     }
+                    for item in findings_draft.get("findings") or []
+                    if isinstance(item, dict)
                 ],
+                "downgraded_findings": [],
+                "requires_human_review": True,
+                "validation_summary": {
+                    "passed": 0,
+                    "blocked": len(findings_draft.get("findings") or []),
+                    "downgraded": 0,
+                },
             }
+        parsed = extract_json_from_invoke_result(result)
+        self._emit(
+            "validation_completed",
+            "Validation agent completed",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            input_findings_artifact=_artifact_ref(findings_artifact, self.repo_dir),
+            status="completed" if parsed is not None else "failed",
+            duration_ms=_duration_ms(started_ns),
         )
-        return extract_json_from_invoke_result(result)
+        return parsed
+
+    def _prepare_validation_result(
+        self,
+        *,
+        validation_payload: dict[str, Any],
+        evidence_bundle: dict[str, Any],
+        compact_context: dict[str, Any],
+        findings_draft: dict[str, Any],
+        input_bundle_ref: str,
+        findings_artifact: Path,
+        artifacts: list[Any],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        request_id = str(evidence_bundle["request_id"])
+        result, errors = self._validate_validation_result_attempt(
+            validation_payload=validation_payload,
+            findings_draft=findings_draft,
+            input_bundle_ref=input_bundle_ref,
+            retry_attempt=0,
+        )
+        if not errors:
+            return result, None
+
+        invalid_artifact = self._persist_invalid_validation_result(
+            request_id=request_id,
+            invalid_payload=validation_payload,
+            validation_errors=errors,
+            retry_attempt=0,
+        )
+        artifacts.append(invalid_artifact)
+        if self.max_validation_retries < 1:
+            return None, errors[0]
+
+        retry_context = {
+            "validation_errors": list(errors),
+            "allowed_schema": {
+                "validation_status": "one of passed/downgraded/blocked/requires_human_review",
+            },
+            "instructions": [
+                "Regenerate ValidationResult JSON only.",
+                "Do not re-analyze RawEvidence.",
+                "Do not generate new findings.",
+                "Only fix ValidationResult JSON schema.",
+                "Do not use valid, invalid, pass, fail, approved, warning, needs_review, or review_required for validation_status.",
+            ],
+        }
+        self._emit(
+            "validation_retry_requested",
+            "Validation retry requested by schema validation",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            validation_errors=list(errors),
+            retry_attempt=1,
+            status="retry_requested",
+        )
+        retry_payload = self._invoke_validation(
+            evidence_bundle=evidence_bundle,
+            compact_context=compact_context,
+            findings_draft=findings_draft,
+            input_bundle_ref=input_bundle_ref,
+            findings_artifact=findings_artifact,
+            retry_context=retry_context,
+        )
+        self._emit(
+            "validation_retry_completed",
+            "Validation retry completed",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            retry_attempt=1,
+            status="completed" if retry_payload is not None else "failed",
+        )
+        if retry_payload is None:
+            return None, "retry_parse_failed"
+        result, errors = self._validate_validation_result_attempt(
+            validation_payload=retry_payload,
+            findings_draft=findings_draft,
+            input_bundle_ref=input_bundle_ref,
+            retry_attempt=1,
+        )
+        if errors:
+            invalid_artifact = self._persist_invalid_validation_result(
+                request_id=request_id,
+                invalid_payload=retry_payload,
+                validation_errors=errors,
+                retry_attempt=1,
+            )
+            artifacts.append(invalid_artifact)
+            return None, errors[0]
+        return result, None
+
+    def _validate_validation_result_attempt(
+        self,
+        *,
+        validation_payload: dict[str, Any],
+        findings_draft: dict[str, Any],
+        input_bundle_ref: str,
+        retry_attempt: int,
+    ) -> tuple[dict[str, Any] | None, tuple[str, ...]]:
+        request_id = str(findings_draft["request_id"])
+        self._emit(
+            "validation_result_schema_validation_started",
+            "ValidationResult schema validation started",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            retry_attempt=retry_attempt,
+            status="started",
+        )
+        normalized_payload, status_events, status_errors = _normalize_validation_statuses(
+            validation_payload
+        )
+        self._emit_validation_status_events(
+            request_id=request_id,
+            status_events=status_events,
+            status_errors=status_errors,
+        )
+        errors = list(status_errors)
+        if errors:
+            self._emit(
+                "validation_result_schema_validation_failed",
+                "ValidationResult schema validation failed",
+                request_id=request_id,
+                input_evidence_bundle=input_bundle_ref,
+                validation_errors=errors,
+                retry_attempt=retry_attempt,
+                validation_status_normalization_status=_validation_status_status(
+                    status_events,
+                    status_errors,
+                ),
+                status="failed",
+            )
+            return None, tuple(errors)
+        try:
+            result = validate_validation_result(normalized_payload, findings_draft)
+        except ValueError as exc:
+            errors = [str(exc)]
+            self._emit(
+                "validation_result_schema_validation_failed",
+                "ValidationResult schema validation failed",
+                request_id=request_id,
+                input_evidence_bundle=input_bundle_ref,
+                validation_errors=errors,
+                retry_attempt=retry_attempt,
+                validation_status_normalization_status=_validation_status_status(
+                    status_events,
+                    tuple(errors),
+                ),
+                status="failed",
+            )
+            return None, tuple(errors)
+        self._emit(
+            "validation_result_schema_validation_passed",
+            "ValidationResult schema validation passed",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            retry_attempt=retry_attempt,
+            validation_status_normalization_status=_validation_status_status(
+                status_events,
+                (),
+            ),
+            status="completed",
+        )
+        self._emit(
+            "validation_result_schema_validation_completed",
+            "ValidationResult schema validation completed",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            retry_attempt=retry_attempt,
+            validation_status_normalization_status=_validation_status_status(
+                status_events,
+                (),
+            ),
+            status="completed",
+        )
+        return result, ()
+
+    def _emit_validation_status_events(
+        self,
+        *,
+        request_id: str,
+        status_events: tuple[dict[str, str], ...],
+        status_errors: tuple[str, ...],
+    ) -> None:
+        for event in status_events:
+            self._emit(
+                "validation_status_normalized",
+                "ValidationResult validation_status alias normalized",
+                request_id=request_id,
+                finding_id=event.get("finding_id"),
+                original_validation_status=event["original_validation_status"],
+                normalized_validation_status=event["normalized_validation_status"],
+                validation_status_normalization_status="normalized",
+                status="completed",
+            )
+        for error in status_errors:
+            self._emit(
+                "validation_status_invalid",
+                "ValidationResult validation_status failed validation",
+                request_id=request_id,
+                validation_error=error,
+                validation_status_normalization_status="invalid",
+                status="failed",
+            )
+
+    def _persist_invalid_validation_result(
+        self,
+        *,
+        request_id: str,
+        invalid_payload: dict[str, Any],
+        validation_errors: tuple[str, ...] | list[str],
+        retry_attempt: int,
+    ) -> Any:
+        artifact = self.artifact_store.persist_invalid_validation_result(
+            request_id,
+            {
+                "request_id": request_id,
+                "phase": "phase-04",
+                "status": "invalid",
+                "retry_attempt": retry_attempt,
+                "validation_errors": list(validation_errors),
+                "parsed_invalid_object": _sanitize_for_artifact(invalid_payload),
+            },
+        )
+        self._emit(
+            "artifact_written",
+            "Artifact written: InvalidValidationResult",
+            request_id=request_id,
+            kind=artifact.kind,
+            path=str(artifact.path),
+            retry_attempt=retry_attempt,
+            status="completed",
+        )
+        return artifact
 
     def _enforce_evidence_ref_validation(
         self,
@@ -801,6 +1211,39 @@ class Phase04AnalysisPipeline:
             lines.append(f"- {key}: `{value}`")
         return "\n".join(lines) + "\n"
 
+    def _human_review_timeout(
+        self,
+        *,
+        request_id: str,
+        artifacts: list[Any],
+        issues: tuple[str, ...],
+        started_ns: int,
+    ) -> Phase04AnalysisResult:
+        self._emit(
+            "phase04_completed",
+            "Phase-04 stopped with human review required after timeout",
+            request_id=request_id,
+            blocking_issues=list(issues),
+            duration_ms=_duration_ms(started_ns),
+            status="human_review_required",
+        )
+        telemetry_artifact = self.artifact_store.persist_analysis_telemetry(
+            request_id, self.telemetry.events
+        )
+        artifacts.append(telemetry_artifact)
+        return Phase04AnalysisResult(
+            request_id=request_id,
+            phase="phase-04",
+            status="human_review_required",
+            findings_draft=None,
+            validation_result=None,
+            verdict=None,
+            summary=None,
+            artifacts=tuple(artifacts),
+            telemetry=tuple(self.telemetry.events),
+            blocking_issues=issues,
+        )
+
     def _failed(
         self,
         *,
@@ -837,6 +1280,7 @@ class Phase04AnalysisPipeline:
     def _emit(self, event_type: str, message: str, **attributes: Any) -> None:
         attributes.setdefault("target_agent", "mysql_analyzer")
         attributes.setdefault("mode", "findings_generation")
+        attributes.setdefault("duration_ms", 0)
         self.telemetry.emit(
             event_type=event_type,
             stage="phase04",
@@ -866,6 +1310,198 @@ def _lineage_issue(
     if raw_index and not raw_index.endswith(f"{request_id}.raw-evidence-index.json"):
         return "artifact_lineage_mismatch"
     return None
+
+
+def _compact_analysis_context(
+    evidence_bundle: dict[str, Any],
+    *,
+    input_bundle_ref: str,
+) -> dict[str, Any]:
+    items = []
+    for item in evidence_bundle.get("evidence_items") or []:
+        if not isinstance(item, dict):
+            continue
+        items.append(_compact_evidence_item(item))
+    return {
+        "request_id": evidence_bundle.get("request_id"),
+        "phase": "phase-04",
+        "input_evidence_bundle": input_bundle_ref,
+        "incident": {
+            "event": evidence_bundle.get("event") or {},
+            "time_window": evidence_bundle.get("time_window") or {},
+        },
+        "coverage": {
+            "source_raw_evidence_count": evidence_bundle.get("source_raw_evidence_count"),
+            "processed_raw_evidence_count": evidence_bundle.get("processed_raw_evidence_count"),
+            "unavailable_evidence": _limit_list(
+                (evidence_bundle.get("coverage") or {}).get("unavailable_evidence"),
+                20,
+            ),
+        },
+        "quality": {
+            "overall_status": (evidence_bundle.get("quality") or {}).get("overall_status"),
+            "warnings": _limit_list((evidence_bundle.get("quality") or {}).get("warnings"), 20),
+        },
+        "evidence_items": items,
+        "artifact_refs": {
+            "evidence_bundle": input_bundle_ref,
+            "raw_evidence_index": evidence_bundle.get("input_raw_evidence_index"),
+        },
+        "processing_summary": {
+            key: (evidence_bundle.get("processing_summary") or {}).get(key)
+            for key in (
+                "estimated_tokens_after",
+                "estimated_tokens_before",
+                "compression_ratio",
+            )
+            if key in (evidence_bundle.get("processing_summary") or {})
+        },
+    }
+
+
+def _compact_evidence_item(item: dict[str, Any]) -> dict[str, Any]:
+    evidence_type = str(item.get("evidence_type") or "")
+    structured = item.get("structured_payload") or {}
+    compact: dict[str, Any] = {
+        "evidence_id": item.get("evidence_id"),
+        "evidence_type": evidence_type,
+        "summary": item.get("summary"),
+        "quality_flags": _limit_list(item.get("quality_flags"), 10),
+        "time_range": item.get("time_range") or {},
+        "raw_refs": [_compact_raw_ref(ref) for ref in _limit_list(item.get("raw_refs"), 10)],
+    }
+    if evidence_type == "mysql.error_log":
+        compact["error_log"] = {
+            "retained_lines": structured.get("retained_lines"),
+            "discarded_lines": structured.get("discarded_lines"),
+            "time_window_filter_status": structured.get("time_window_filter_status"),
+            "timezone_handling": structured.get("timezone_handling"),
+            "collection_time_window_coverage": structured.get("collection_time_window_coverage"),
+            "severity_counts": structured.get("severity_counts") or {},
+            "top_patterns": _compact_top_patterns(structured.get("top_patterns")),
+            "sample_events": [
+                _compact_sample_event(event)
+                for event in _limit_list(structured.get("sample_events"), 5)
+            ],
+        }
+    elif evidence_type == "mysql.processlist":
+        compact["processlist"] = {
+            "aggregates": _selected_dict(
+                structured,
+                ("total_processes", "user_counts", "command_counts", "state_counts"),
+            ),
+            "samples": _limit_list(structured.get("samples"), 10),
+        }
+    elif evidence_type in {"mysql.runtime_status", "mysql.variables"}:
+        compact["mysql_counters"] = _selected_dict(
+            structured,
+            ("selected_counters", "selected_variables", "top_counters", "summary"),
+        )
+    elif evidence_type in {"metrics.os_cpu", "metrics.os_memory", "metrics.os_disk"}:
+        compact["os_metrics"] = _selected_dict(
+            structured,
+            ("summary", "usage", "load_average", "cpu", "memory", "disk"),
+        )
+    else:
+        compact["structured_summary"] = _selected_dict(
+            structured,
+            ("summary", "status", "reason", "selected_counters", "selected_variables"),
+        )
+    return compact
+
+
+def _compact_top_patterns(patterns: Any) -> list[dict[str, Any]]:
+    result = []
+    for pattern in _limit_list(patterns, 10):
+        if not isinstance(pattern, dict):
+            continue
+        result.append(
+            {
+                "pattern": _trim_text(str(pattern.get("pattern") or ""), 240),
+                "count": pattern.get("count"),
+                "semantic_hint": pattern.get("semantic_hint"),
+                "operational_relevance": pattern.get("operational_relevance"),
+                "raw_refs": [
+                    _compact_raw_ref(ref)
+                    for ref in _limit_list(pattern.get("raw_refs"), 5)
+                ],
+            }
+        )
+    return result
+
+
+def _compact_sample_event(event: Any) -> dict[str, Any]:
+    if not isinstance(event, dict):
+        return {"value_type": type(event).__name__}
+    return {
+        "line_start": event.get("line_start"),
+        "line_end": event.get("line_end"),
+        "timestamp": event.get("timestamp"),
+        "severity": event.get("severity"),
+        "semantic_hint": event.get("semantic_hint"),
+        "message_length": len(str(event.get("message") or event.get("pattern") or "")),
+    }
+
+
+def _compact_raw_ref(ref: Any) -> dict[str, Any]:
+    if not isinstance(ref, dict):
+        return {}
+    return {
+        key: ref.get(key)
+        for key in ("content_ref", "line_start", "line_end", "raw_evidence_id")
+        if key in ref
+    }
+
+
+def _bound_compact_context(context: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    bounded = dict(context)
+    while len(json.dumps(bounded, ensure_ascii=False, sort_keys=True)) > max_chars:
+        items = list(bounded.get("evidence_items") or [])
+        if len(items) > 1:
+            bounded["evidence_items"] = items[:-1]
+            bounded["truncated"] = True
+            continue
+        bounded["quality"] = {
+            "overall_status": (bounded.get("quality") or {}).get("overall_status"),
+            "warnings": _limit_list((bounded.get("quality") or {}).get("warnings"), 5),
+        }
+        serialized = json.dumps(bounded, ensure_ascii=False, sort_keys=True)
+        if len(serialized) <= max_chars:
+            break
+        bounded = {
+            "request_id": context.get("request_id"),
+            "phase": "phase-04",
+            "input_evidence_bundle": context.get("input_evidence_bundle"),
+            "quality": bounded.get("quality"),
+            "evidence_items": [
+                {
+                    "evidence_id": item.get("evidence_id"),
+                    "evidence_type": item.get("evidence_type"),
+                    "summary": _trim_text(str(item.get("summary") or ""), 400),
+                }
+                for item in _limit_list(context.get("evidence_items"), 10)
+                if isinstance(item, dict)
+            ],
+            "truncated": True,
+        }
+        break
+    return bounded
+
+
+def _limit_list(value: Any, limit: int) -> list[Any]:
+    if not isinstance(value, list):
+        return []
+    return value[:limit]
+
+
+def _selected_dict(value: Any, keys: tuple[str, ...]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {key: value[key] for key in keys if key in value}
+
+
+def _trim_text(value: str, limit: int) -> str:
+    return value if len(value) <= limit else value[: limit - 3] + "..."
 
 
 def _normalize_confidence_values(
@@ -926,6 +1562,56 @@ def _confidence_status(
     if confidence_errors:
         return "invalid"
     if confidence_events:
+        return "normalized"
+    return "not_needed"
+
+
+def _normalize_validation_statuses(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], tuple[dict[str, str], ...], tuple[str, ...]]:
+    result = dict(payload)
+    validated = []
+    events: list[dict[str, str]] = []
+    errors: list[str] = []
+    for item in payload.get("validated_findings") or []:
+        if not isinstance(item, dict):
+            validated.append(item)
+            continue
+        copied = dict(item)
+        original = str(copied.get("validation_status") or "")
+        normalized = VALIDATION_STATUS_ALIASES.get(original, original)
+        if normalized != original:
+            copied["validation_status"] = normalized
+            events.append(
+                {
+                    "finding_id": str(copied.get("finding_id") or ""),
+                    "original_validation_status": original,
+                    "normalized_validation_status": normalized,
+                }
+            )
+        if normalized not in {
+            "passed",
+            "downgraded",
+            "blocked",
+            "requires_human_review",
+        }:
+            errors.append(
+                "validation_status must be one of "
+                "passed/downgraded/blocked/requires_human_review, "
+                f"got '{original}'"
+            )
+        validated.append(copied)
+    result["validated_findings"] = validated
+    return result, tuple(events), tuple(errors)
+
+
+def _validation_status_status(
+    status_events: tuple[dict[str, str], ...],
+    status_errors: tuple[str, ...],
+) -> str:
+    if status_errors:
+        return "invalid"
+    if status_events:
         return "normalized"
     return "not_needed"
 

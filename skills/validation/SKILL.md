@@ -32,6 +32,42 @@ Required fields:
 - `requires_human_review`
 - `validation_summary`
 
+`validated_findings[].validation_status` must be exactly one of:
+
+- `passed`
+- `downgraded`
+- `blocked`
+- `requires_human_review`
+
+Do not output aliases or informal statuses such as:
+
+- `valid`
+- `invalid`
+- `pass`
+- `failed`
+- `fail`
+- `approved`
+- `warning`
+- `needs_review`
+- `review_required`
+
+Use `requires_human_review` when a finding cannot be safely validated without a human.
+Use `downgraded` when the finding is partially supported but confidence or severity must be reduced.
+
+Example:
+
+```json
+{
+  "validated_findings": [
+    {
+      "finding_id": "finding_001",
+      "validation_status": "passed",
+      "confidence_after_validation": 0.74
+    }
+  ]
+}
+```
+
 ## Validation Rules
 
 Block or downgrade findings when:

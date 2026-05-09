@@ -257,6 +257,18 @@ class ArtifactStore:
         )
         return ArtifactRecord(kind="ValidationResult", path=path)
 
+    def persist_invalid_validation_result(
+        self,
+        request_id: str,
+        payload: dict[str, Any],
+    ) -> ArtifactRecord:
+        path = self.root / f"{request_id}.validation-result.invalid.json"
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return ArtifactRecord(kind="InvalidValidationResult", path=path)
+
     def persist_verdict(
         self,
         request_id: str,
