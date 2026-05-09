@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+from dbkit.agents.evidence_structuring import EvidenceStructuringSubagentRegistration
 
 
 class DeepAgentsRuntimeFactory:
@@ -41,17 +44,60 @@ class DeepAgentsRuntimeFactory:
                 name="dbkit-intake",
             )
 
-    def create_mysql_analyzer_runtime(self, skill_text: str) -> Any:
+    def create_mysql_analyzer_runtime(
+        self,
+        skill_text: str,
+        *,
+        evidence_structuring_subagent: EvidenceStructuringSubagentRegistration | None = None,
+        evidence_structuring_tools: Sequence[Any] = (),
+    ) -> Any:
+        create_deep_agent = self._create_deep_agent or self._load_create_deep_agent()
+        subagents = []
+        if evidence_structuring_subagent is not None:
+            evidence_structuring_subagent.validate()
+            evidence_skill_text = evidence_structuring_subagent.skill_path.read_text(
+                encoding="utf-8"
+            )
+            subagents.append(
+                {
+                    "name": evidence_structuring_subagent.name,
+                    "description": (
+                        "Transform DBKit Phase-02.1 RawEvidence into a bounded, "
+                        "deduplicated, LLM-safe EvidenceBundle. Use this after "
+                        "RawEvidence collection is complete and before any "
+                        "findings_generation work."
+                    ),
+                    "system_prompt": self._system_prompt(
+                        "evidence-structuring",
+                        evidence_skill_text,
+                    ),
+                    "skills": ["/skills/evidence/"],
+                    "tools": evidence_structuring_tools,
+                }
+            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return create_deep_agent(
+                model=self.model,
+                tools=[],
+                subagents=subagents or None,
+                skills=["/skills/mysql-analyzer/"],
+                backend=self._filesystem_backend(),
+                system_prompt=self._system_prompt("mysql-analyzer", skill_text),
+                name="dbkit-mysql-analyzer",
+            )
+
+    def create_evidence_structuring_runtime(self, skill_text: str) -> Any:
         create_deep_agent = self._create_deep_agent or self._load_create_deep_agent()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             return create_deep_agent(
                 model=self.model,
                 tools=[],
-                skills=["/skills/mysql-analyzer/"],
+                skills=["/skills/evidence/"],
                 backend=self._filesystem_backend(),
-                system_prompt=self._system_prompt("mysql-analyzer", skill_text),
-                name="dbkit-mysql-analyzer",
+                system_prompt=self._system_prompt("evidence-structuring", skill_text),
+                name="dbkit-evidence-structuring",
             )
 
     def _load_create_deep_agent(self) -> Callable[..., Any]:
@@ -83,6 +129,10 @@ class DeepAgentsRuntimeFactory:
                 "- `/workspace/` maps to configured `runtime.workspace_dir`.",
                 "- `/skills/` maps to configured `runtime.skills_dir`.",
                 "- `/agents/` maps to configured `runtime.agents_dir`.",
+                "",
+                "Repository artifacts must be accessed through `/repo/`.",
+                "For example, host/repo path `.dbkit/artifacts/x.json` maps to",
+                "`/repo/.dbkit/artifacts/x.json`, never `/.dbkit/artifacts/x.json`.",
                 "",
                 "When the user provides a host absolute path, convert it to the",
                 "corresponding `/workspace/` virtual path before calling `ls`,",

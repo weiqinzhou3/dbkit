@@ -90,6 +90,22 @@ class Phase02EvidencePlanningCollectionTest(unittest.TestCase):
 
             self.assertEqual(result.status, "raw_evidence_collected")
             self.assertEqual(len(result.raw_evidence), 1)
+            event_types = [event.event_type for event in result.telemetry]
+            self.assertIn("mysql_analyzer_evidence_planning_started", event_types)
+            self.assertIn("mysql_analyzer_evidence_planning_completed", event_types)
+            self.assertIn("raw_evidence_collection_completed", event_types)
+            raw_collection_event = [
+                event for event in result.telemetry
+                if event.event_type == "raw_evidence_collection_completed"
+            ][0]
+            self.assertEqual(
+                raw_collection_event.attributes["parent_agent"],
+                "mysql_analyzer",
+            )
+            self.assertEqual(
+                raw_collection_event.attributes["subagent"],
+                "evidence_structuring",
+            )
 
     def test_evidence_request_parse_failure_returns_blocked_artifact(self) -> None:
         normalized = _provided_evidence_request(files=["/workspace/mysql-error.log"])
@@ -230,6 +246,41 @@ class Phase02EvidencePlanningCollectionTest(unittest.TestCase):
         self.assertEqual(calls[0]["name"], "dbkit-mysql-analyzer")
         self.assertEqual(calls[0]["skills"], ["/skills/mysql-analyzer/"])
         self.assertIn("MYSQL_SKILL", calls[0]["system_prompt"])
+
+    def test_deepagents_factory_registers_evidence_structuring_subagent(self) -> None:
+        from dbkit.agents.evidence_structuring import EvidenceStructuringSubagentRegistration
+
+        calls = []
+
+        def fake_create_deep_agent(**kwargs):
+            calls.append(kwargs)
+            return object()
+
+        def build_evidence_bundle(raw_evidence_index: str) -> str:
+            return raw_evidence_index
+
+        registration = EvidenceStructuringSubagentRegistration.from_dirs(
+            skills_dir=Path("skills"),
+            agents_dir=Path("agents"),
+        )
+        runtime = DeepAgentsRuntimeFactory(
+            create_deep_agent=fake_create_deep_agent,
+            model=object(),
+        ).create_mysql_analyzer_runtime(
+            "MYSQL_SKILL",
+            evidence_structuring_subagent=registration,
+            evidence_structuring_tools=(build_evidence_bundle,),
+        )
+
+        self.assertIsNotNone(runtime)
+        subagents = calls[0]["subagents"]
+        self.assertEqual(subagents[0]["name"], "evidence_structuring")
+        self.assertEqual(subagents[0]["skills"], ["/skills/evidence/"])
+        self.assertIn(
+            "You are the Evidence Structuring Subagent for `mysql_analyzer`",
+            subagents[0]["system_prompt"],
+        )
+        self.assertEqual(subagents[0]["tools"], (build_evidence_bundle,))
 
     def test_pipeline_invokes_mysql_analyzer_in_evidence_planning_mode(self) -> None:
         case = self

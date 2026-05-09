@@ -6,11 +6,13 @@ The project focuses on transforming large-scale raw operational data into struct
 
 ## Current Phase
 
-Phase 02: Evidence Planning & Collection MVP.
+Phase 03: Evidence Structuring Subagent MVP.
 
 This phase connects a Phase-01 `NormalizedRequest` to MySQL Analyzer evidence
-planning, guarded collection planning, and deterministic RawEvidence collection.
-It does not produce findings, root cause, validation verdicts, or summaries.
+planning, guarded collection planning, deterministic RawEvidence collection,
+and automatic delegation to the `evidence_structuring` subagent. The normal
+workflow produces an EvidenceBundle and then stops. It does not produce
+findings, root cause, validation verdicts, or recommendations.
 
 Phase-02.1 default MySQL live collection uses `mysql.runtime_status` for
 `SHOW GLOBAL STATUS` and `mysql.variables` for `SHOW GLOBAL VARIABLES`.
@@ -120,6 +122,24 @@ Run the root entrypoint:
 ```bash
 python3.11 main.py --config config/config.yaml "请帮我分析这个 MySQL，今天17:00触发 mysql cpu usage > 85%，只需要分析本地文件，文件在/tmp/mysql_conn_full_mock/。"
 ```
+
+For normal MySQL live-collection workflows, DBKit asks `mysql_analyzer` to
+delegate to the DeepAgents `evidence_structuring` subagent after RawEvidence
+collection. The subagent calls the `build_evidence_bundle` evidence processing
+tool and writes:
+
+- `.dbkit/artifacts/<request_id>.raw-evidence-index.json`
+- `.dbkit/artifacts/<request_id>.evidence-bundle.json`
+
+Replay an existing raw evidence index for debug or regression testing:
+
+```bash
+python3.11 main.py --config config/config.yaml --from-raw-evidence .dbkit/artifacts/<request_id>.raw-evidence-index.json
+```
+
+`--from-raw-evidence` is a replay/debug entrypoint. It is not required for the
+normal Phase-03 workflow and is marked `mode=replay` /
+`subagent_invocation=false` in CLI output.
 
 Run with interactive intake supplement:
 

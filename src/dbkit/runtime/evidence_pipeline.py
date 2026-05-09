@@ -77,6 +77,8 @@ class EvidencePipeline:
         self.artifact_store = artifact_store
         self.telemetry = telemetry
         self.collectors = collectors
+        if getattr(self.collectors, "telemetry", None) is None:
+            self.collectors.telemetry = telemetry
         self.time_provider = time_provider or TimeProvider()
         self.guardrails = guardrails or CollectionGuardrails()
         self.mysql_analyzer_runtime = mysql_analyzer_runtime
@@ -93,6 +95,17 @@ class EvidencePipeline:
             stage="evidence_planning",
             message="Evidence planning started",
             attributes={"request_id": request.request_id},
+        )
+        self.telemetry.emit(
+            event_type="mysql_analyzer_evidence_planning_started",
+            stage="evidence_planning",
+            message="MySQL analyzer evidence planning started",
+            attributes={
+                "request_id": request.request_id,
+                "parent_agent": "mysql_analyzer",
+                "subagent": "evidence_structuring",
+                "status": "started",
+            },
         )
         if evidence_request_json is None:
             evidence_request_json = self._invoke_mysql_analyzer(request)
@@ -182,6 +195,17 @@ class EvidencePipeline:
             stage="evidence_planning",
             message="Evidence planning completed",
             attributes={"request_id": request.request_id},
+        )
+        self.telemetry.emit(
+            event_type="mysql_analyzer_evidence_planning_completed",
+            stage="evidence_planning",
+            message="MySQL analyzer evidence planning completed",
+            attributes={
+                "request_id": request.request_id,
+                "parent_agent": "mysql_analyzer",
+                "subagent": "evidence_structuring",
+                "status": "completed",
+            },
         )
         self.telemetry.emit(
             event_type="evidence_request_validated",
@@ -432,10 +456,26 @@ class EvidencePipeline:
                         "bytes": item.payload.get("bytes", 0),
                         "line_count": item.payload.get("line_count", 0),
                         "duration_ms": item.collection.get("duration_ms", 0),
+                        **_log_collection_telemetry_attributes(item),
                     },
                 )
+                log_attrs = _log_collection_telemetry_attributes(item)
+                if log_attrs:
+                    self.telemetry.emit(
+                        event_type="log_collection_strategy",
+                        stage="collection",
+                        message="Log collection strategy recorded",
+                        attributes={
+                            "request_id": request.request_id,
+                            "raw_evidence_id": item.raw_evidence_id,
+                            "tool_name": step.tool_name,
+                            "evidence_type": item.evidence_type,
+                            **log_attrs,
+                        },
+                    )
 
         summary = collection_summary(tuple(raw_items))
+        self._close_collectors(request)
         status = collection_status(tuple(raw_items))
         index_artifact = self.artifact_store.persist_raw_evidence_index(
             request.request_id,
@@ -467,6 +507,20 @@ class EvidencePipeline:
             stage="collection",
             message="Collection summary created",
             attributes={"request_id": request.request_id, **summary},
+        )
+        self.telemetry.emit(
+            event_type="raw_evidence_collection_completed",
+            stage="collection",
+            message="Raw evidence collection completed",
+            attributes={
+                "request_id": request.request_id,
+                "parent_agent": "mysql_analyzer",
+                "subagent": "evidence_structuring",
+                "raw_evidence_index": str(index_artifact.path),
+                "raw_evidence_count": len(raw_items),
+                "status": status,
+                **summary,
+            },
         )
         telemetry_artifact = self.artifact_store.persist_collection_telemetry(
             request.request_id, self.telemetry.events
@@ -755,6 +809,12 @@ class EvidencePipeline:
             return self.collection_dependency_checker(plan)
         return find_missing_collection_dependencies(plan, request)
 
+    def _close_collectors(self, request: NormalizedRequest) -> None:
+        close = getattr(self.collectors, "close", None)
+        if not callable(close):
+            return
+        close()
+
 
 def _source_paths_for_step(
     tool_name: str,
@@ -828,6 +888,25 @@ def _secret_refs_for_step(
         target = request.target or {}
     password_ref = target.get("password_ref")
     return (str(password_ref),) if password_ref else ()
+
+
+def _log_collection_telemetry_attributes(item: RawEvidence) -> dict[str, object]:
+    if item.evidence_type not in {"mysql.error_log", "mysql.slow_log"}:
+        return {}
+    metadata = item.metadata or {}
+    return {
+        key: metadata[key]
+        for key in (
+            "collection_strategy",
+            "time_window_aware",
+            "time_window_coverage",
+            "tail_lines",
+            "max_bytes",
+            "matched_lines",
+            "discarded_lines",
+        )
+        if key in metadata
+    }
 
 
 def json_dumps(payload: dict[str, Any]) -> str:

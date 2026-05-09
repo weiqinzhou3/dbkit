@@ -57,6 +57,10 @@ _ALLOWED_SQL = frozenset(
         "SHOW GLOBAL VARIABLES LIKE 'slow_query_log'",
         "SHOW GLOBAL VARIABLES LIKE 'log_output'",
         "SHOW GLOBAL VARIABLES LIKE 'datadir'",
+        "SHOW GLOBAL VARIABLES LIKE 'log_timestamps'",
+        "SHOW GLOBAL VARIABLES LIKE 'time_zone'",
+        "SHOW GLOBAL VARIABLES LIKE 'system_time_zone'",
+        "SELECT @@global.time_zone, @@system_time_zone",
     }
 )
 _ALLOWED_SSH_EXACT = frozenset(
@@ -150,16 +154,18 @@ def is_ssh_command_allowed(command: str) -> bool:
     if normalized in _ALLOWED_SSH_EXACT:
         return True
     if normalized.startswith("tail -n ") and " -- " in normalized:
-        return _valid_tail_command(normalized)
+        return _valid_tail_command(normalized, flag="-n")
+    if normalized.startswith("tail -c ") and " -- " in normalized:
+        return _valid_tail_command(normalized, flag="-c")
     if normalized.startswith("du -sh "):
         return "--" not in normalized and not any(token in normalized for token in (";", "&", "|", "`", "$("))
     return False
 
 
-def _valid_tail_command(command: str) -> bool:
+def _valid_tail_command(command: str, *, flag: str) -> bool:
     parts = command.split(" -- ", 1)
     prefix, path = parts[0], parts[1]
-    count = prefix.removeprefix("tail -n ").strip()
+    count = prefix.removeprefix(f"tail {flag} ").strip()
     if not count.isdigit() or int(count) <= 0:
         return False
     if not path.startswith("/"):

@@ -16,6 +16,9 @@ class SSHClient(Protocol):
     def tail(self, path: str, lines: int) -> str:
         ...
 
+    def tail_bytes(self, path: str, max_bytes: int) -> str:
+        ...
+
 
 class ParamikoSSHClient:
     def __init__(self, request: NormalizedRequest, password: str | None) -> None:
@@ -46,6 +49,10 @@ class ParamikoSSHClient:
 
     def tail(self, path: str, lines: int) -> str:
         command = f"tail -n {int(lines)} -- {path}"
+        return self.exec(command)
+
+    def tail_bytes(self, path: str, max_bytes: int) -> str:
+        command = f"tail -c {int(max_bytes)} -- {path}"
         return self.exec(command)
 
 

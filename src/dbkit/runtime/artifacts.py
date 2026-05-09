@@ -4,7 +4,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from dbkit.schemas.evidence import CollectionPlan, EvidenceRequest, RawEvidence, collection_summary
+from dbkit.schemas.evidence import (
+    CollectionPlan,
+    EvidenceBundle,
+    EvidenceItem,
+    EvidenceRequest,
+    RawEvidence,
+    collection_summary,
+)
 from dbkit.schemas.runtime import ArtifactRecord, NormalizedRequest, TelemetryEvent
 
 
@@ -182,6 +189,37 @@ class ArtifactStore:
         ]
         path.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
         return ArtifactRecord(kind="CollectionTelemetry", path=path)
+
+    def persist_evidence_bundle(self, bundle: EvidenceBundle) -> ArtifactRecord:
+        path = self.root / f"{bundle.request_id}.evidence-bundle.json"
+        path.write_text(
+            json.dumps(bundle.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return ArtifactRecord(kind="EvidenceBundle", path=path)
+
+    def persist_evidence_item(self, item: EvidenceItem) -> ArtifactRecord:
+        evidence_dir = self.root / "evidence"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        path = evidence_dir / f"{item.evidence_id}.json"
+        path.write_text(
+            json.dumps(item.to_dict(), ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return ArtifactRecord(kind="EvidenceItem", path=path)
+
+    def persist_evidence_processing_telemetry(
+        self,
+        request_id: str,
+        events: list[TelemetryEvent],
+    ) -> ArtifactRecord:
+        path = self.root / f"{request_id}.evidence-processing-telemetry.jsonl"
+        lines = [
+            json.dumps(e.to_dict(), ensure_ascii=False, sort_keys=True)
+            for e in events
+        ]
+        path.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
+        return ArtifactRecord(kind="EvidenceProcessingTelemetry", path=path)
 
 
 def _raw_evidence_index_entry(item: RawEvidence) -> dict[str, Any]:

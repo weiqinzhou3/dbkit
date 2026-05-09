@@ -1,6 +1,8 @@
 import json
+import sys
 import time
 import tempfile
+import types
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +18,7 @@ from dbkit.runtime.secret_store import SecretStore
 from dbkit.runtime.time_context import FixedTimeProvider
 from dbkit.schemas.evidence import CollectionStep, RawEvidence
 from dbkit.tools.collectors import CollectorRegistry
+from dbkit.tools.collectors.mysql.service import PyMySQLClient
 from dbkit.tools.normalize_request import normalize_request
 
 
@@ -31,6 +34,110 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
         self.assertTrue(any(dep.startswith("paramiko") for dep in dependencies))
         self.assertTrue(any(dep.startswith("PyMySQL") for dep in collection_extra))
         self.assertTrue(any(dep.startswith("paramiko") for dep in collection_extra))
+
+    def test_pymysql_client_fetches_all_closes_cursor_and_connection(self) -> None:
+        request = _live_request()
+        fake_connection = FakePyMySQLConnection(
+            rows=[{"Variable_name": "Threads_running", "Value": "3"}]
+        )
+        fake_module = FakePyMySQLModule(fake_connection)
+        old_module = sys.modules.get("pymysql")
+        sys.modules["pymysql"] = fake_module
+        telemetry = _telemetry()
+        try:
+            client = PyMySQLClient(
+                request,
+                "Root",
+                telemetry=telemetry,
+                connect_timeout_seconds=7,
+                read_timeout_seconds=11,
+                write_timeout_seconds=13,
+            )
+            rows = client.execute("SHOW GLOBAL STATUS")
+            client.close()
+        finally:
+            if old_module is None:
+                sys.modules.pop("pymysql", None)
+            else:
+                sys.modules["pymysql"] = old_module
+
+        self.assertEqual(rows, [{"Variable_name": "Threads_running", "Value": "3"}])
+        self.assertEqual(fake_module.connect_kwargs["autocommit"], True)
+        self.assertEqual(fake_module.connect_kwargs["charset"], "utf8mb4")
+        self.assertEqual(fake_module.connect_kwargs["connect_timeout"], 7)
+        self.assertEqual(fake_module.connect_kwargs["read_timeout"], 11)
+        self.assertEqual(fake_module.connect_kwargs["write_timeout"], 13)
+        self.assertIsNone(fake_module.connect_kwargs["database"])
+        self.assertEqual(fake_connection.cursor_obj.calls, ["execute", "fetchall", "cursor_close"])
+        self.assertTrue(fake_connection.closed)
+        self.assertEqual(
+            [
+                event.event_type
+                for event in telemetry.events
+                if event.event_type.startswith("mysql_")
+            ],
+            [
+                "mysql_connection_opened",
+                "mysql_query_started",
+                "mysql_query_completed",
+                "mysql_cursor_closed",
+                "mysql_connection_closed",
+            ],
+        )
+
+    def test_pymysql_client_closes_cursor_and_connection_on_query_exception(self) -> None:
+        request = _live_request()
+        fake_connection = FakePyMySQLConnection(rows=[], execute_error=RuntimeError("boom"))
+        fake_module = FakePyMySQLModule(fake_connection)
+        old_module = sys.modules.get("pymysql")
+        sys.modules["pymysql"] = fake_module
+        telemetry = _telemetry()
+        try:
+            client = PyMySQLClient(request, "Root", telemetry=telemetry)
+            with self.assertRaises(RuntimeError):
+                client.execute("SHOW GLOBAL STATUS")
+            client.close()
+        finally:
+            if old_module is None:
+                sys.modules.pop("pymysql", None)
+            else:
+                sys.modules["pymysql"] = old_module
+
+        self.assertEqual(fake_connection.cursor_obj.calls, ["execute", "cursor_close"])
+        self.assertTrue(fake_connection.closed)
+
+    def test_collector_registry_closes_reused_mysql_connection_after_multiple_collectors(self) -> None:
+        request = _live_request()
+        fake_mysql = ClosableFakeMySQLClient(_baseline_mysql_results())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            collectors = CollectorRegistry(
+                workspace_root=root / "workspace",
+                mysql_client_factory=lambda _request, _secrets: fake_mysql,
+                secret_store=SecretStore({"<SECRET_REF:mysql_password_001>": "Root"}),
+            )
+            result = EvidencePipeline(
+                artifact_store=ArtifactStore(root / "artifacts"),
+                telemetry=_telemetry(),
+                collectors=collectors,
+                time_provider=_time_provider(),
+            ).run(request, evidence_request_json=_evidence_request(request, _baseline_tools()))
+
+        self.assertEqual(result.status, "raw_evidence_collected")
+        self.assertEqual(fake_mysql.close_calls, 1)
+
+    def test_collector_registry_records_mysql_connection_close_failure(self) -> None:
+        telemetry = _telemetry()
+        registry = CollectorRegistry(workspace_root=Path("/tmp/workspace"), telemetry=telemetry)
+        registry._mysql_client = CloseFailingMySQLClient()
+
+        registry.close()
+
+        self.assertIn(
+            "mysql_connection_close_failed",
+            [event.event_type for event in telemetry.events],
+        )
 
     def test_missing_collection_dependencies_block_before_collectors_run(self) -> None:
         request = _live_request(with_ssh=True)
@@ -451,6 +558,99 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
             self.assertEqual(item.payload["line_count"], 1)
             self.assertIn("error line", Path(item.payload["content_ref"]).read_text(encoding="utf-8"))
 
+    def test_error_log_bounded_tail_fallback_records_unknown_time_window_coverage(self) -> None:
+        fake_mysql = FakeMySQLClient(_log_variables(error_log="/var/log/mysql/error.log"))
+        fake_ssh = FakeSSHClient({("tail", 5000, "/var/log/mysql/error.log"): "error line\n"})
+        request = _live_request(with_ssh=True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            registry = CollectorRegistry(
+                workspace_root=root / "workspace",
+                mysql_client_factory=lambda _request, _secrets: fake_mysql,
+                ssh_client_factory=lambda _request, _secrets: fake_ssh,
+                secret_store=SecretStore(
+                    {
+                        "<SECRET_REF:mysql_password_001>": "Root",
+                        "<SECRET_REF:ssh_password_001>": "Root",
+                    }
+                ),
+                log_prefer_time_window_scan=False,
+            )
+            item = registry.collect(
+                step=_step(1, "collect_mysql_error_log", "mysql.error_log"),
+                request=request,
+                raw_root=root / "raw",
+                started_at=_now(),
+                completed_at=_now(),
+            )[0]
+
+        self.assertEqual(item.collection["status"], "collected")
+        self.assertEqual(item.metadata["collection_strategy"], "bounded_tail_fallback")
+        self.assertFalse(item.metadata["time_window_aware"])
+        self.assertEqual(item.metadata["time_window_coverage"], "unknown")
+        self.assertEqual(item.metadata["tail_lines"], 5000)
+        self.assertIn("tail_lines may not cover requested time_window", item.metadata["coverage_warning"])
+
+    def test_error_log_time_window_scan_records_attempted_coverage_metadata(self) -> None:
+        fake_mysql = FakeMySQLClient(_log_variables(error_log="/var/log/mysql/error.log"))
+        fake_ssh = FakeSSHClient(
+            {
+                (
+                    "tail_bytes",
+                    52_428_800,
+                    "/var/log/mysql/error.log",
+                ): (
+                    "2026-05-08T10:00:00+08:00 [Warning] outside before\n"
+                    "2026-05-08T16:59:00+08:00 [ERROR] inside window\n"
+                    "continued detail\n"
+                    "2026-05-08T19:00:00+08:00 [ERROR] outside after\n"
+                )
+            }
+        )
+        request = _live_request(with_ssh=True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            registry = CollectorRegistry(
+                workspace_root=root / "workspace",
+                mysql_client_factory=lambda _request, _secrets: fake_mysql,
+                ssh_client_factory=lambda _request, _secrets: fake_ssh,
+                secret_store=SecretStore(
+                    {
+                        "<SECRET_REF:mysql_password_001>": "Root",
+                        "<SECRET_REF:ssh_password_001>": "Root",
+                    }
+                ),
+            )
+            item = registry.collect(
+                step=_step(1, "collect_mysql_error_log", "mysql.error_log"),
+                request=request,
+                raw_root=root / "raw",
+                started_at=_now(),
+                completed_at=_now(),
+            )[0]
+            content = Path(item.payload["content_ref"]).read_text(encoding="utf-8")
+
+        self.assertEqual(item.collection["status"], "collected")
+        self.assertEqual(item.metadata["collection_strategy"], "time_window_scan")
+        self.assertTrue(item.metadata["time_window_aware"])
+        self.assertEqual(item.metadata["time_window_coverage"], "attempted")
+        self.assertEqual(
+            item.metadata["source_timezone"]["mysql_log_timestamps"],
+            "UTC",
+        )
+        self.assertEqual(
+            item.metadata["source_timezone"]["inference"],
+            "mysql_error_log_uses_utc",
+        )
+        self.assertEqual(item.metadata["matched_lines"], 2)
+        self.assertEqual(item.metadata["discarded_lines"], 2)
+        self.assertIn("inside window", content)
+        self.assertIn("continued detail", content)
+        self.assertNotIn("outside before", content)
+        self.assertNotIn("outside after", content)
+
     def test_slow_log_disabled_returns_not_available(self) -> None:
         fake_mysql = FakeMySQLClient(_log_variables(slow_enabled=False))
         request = _live_request(with_ssh=True)
@@ -508,6 +708,7 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
         self.assertFalse(is_mysql_sql_allowed("DROP TABLE users"))
         self.assertFalse(is_mysql_sql_allowed("SET GLOBAL read_only=0"))
         self.assertTrue(is_ssh_command_allowed("tail -n 5000 -- /var/log/mysql/error.log"))
+        self.assertTrue(is_ssh_command_allowed("tail -c 52428800 -- /var/log/mysql/error.log"))
         self.assertFalse(is_ssh_command_allowed("rm -rf /var/log/mysql/error.log"))
         self.assertFalse(is_ssh_command_allowed("systemctl restart mysqld"))
 
@@ -648,6 +849,63 @@ class FakeMySQLClient:
         return self.results.get(sql, [])
 
 
+class ClosableFakeMySQLClient(FakeMySQLClient):
+    def __init__(self, results: dict[str, list[dict]]) -> None:
+        super().__init__(results)
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class CloseFailingMySQLClient:
+    def close(self) -> None:
+        raise RuntimeError("close failed")
+
+
+class FakePyMySQLCursor:
+    def __init__(self, *, rows: list[dict], execute_error: Exception | None = None) -> None:
+        self.rows = rows
+        self.execute_error = execute_error
+        self.calls: list[str] = []
+
+    def execute(self, sql: str) -> None:
+        self.calls.append("execute")
+        if self.execute_error is not None:
+            raise self.execute_error
+
+    def fetchall(self):
+        self.calls.append("fetchall")
+        return self.rows
+
+    def close(self) -> None:
+        self.calls.append("cursor_close")
+
+
+class FakePyMySQLConnection:
+    def __init__(self, *, rows: list[dict], execute_error: Exception | None = None) -> None:
+        self.cursor_obj = FakePyMySQLCursor(rows=rows, execute_error=execute_error)
+        self.closed = False
+
+    def cursor(self) -> FakePyMySQLCursor:
+        return self.cursor_obj
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakePyMySQLModule(types.SimpleNamespace):
+    def __init__(self, connection: FakePyMySQLConnection) -> None:
+        cursors = types.SimpleNamespace(DictCursor=object)
+        super().__init__(cursors=cursors)
+        self.connection = connection
+        self.connect_kwargs: dict = {}
+
+    def connect(self, **kwargs):
+        self.connect_kwargs = kwargs
+        return self.connection
+
+
 class DelayedMySQLClient(FakeMySQLClient):
     def __init__(self, results: dict[str, list[dict]], *, delay_seconds: float) -> None:
         super().__init__(results)
@@ -674,6 +932,9 @@ class FakeSSHClient:
 
     def tail(self, path: str, lines: int) -> str:
         return self.results.get(("tail", lines, path), "")
+
+    def tail_bytes(self, path: str, max_bytes: int) -> str:
+        return self.results.get(("tail_bytes", max_bytes, path), "")
 
 
 class RevisionAnalyzerRuntime:
@@ -733,7 +994,16 @@ def _live_request(*, with_ssh: bool = False):
                 "allow_ssh": with_ssh,
                 "allow_metrics_query": False,
             },
-            "event": {"event_time": "2026-05-08T17:00:00+08:00"},
+            "event": {
+                "event_time": "2026-05-08T17:00:00+08:00",
+                "time_window": {
+                    "start": "2026-05-08T11:00:00+08:00",
+                    "end": "2026-05-08T18:00:00+08:00",
+                    "before": "6h",
+                    "after": "1h",
+                    "source": "skill_default_from_event_time",
+                },
+            },
             "missing_fields": [],
         },
         phase="phase-02.1",
@@ -841,6 +1111,18 @@ def _log_variables(
         ],
         "SHOW GLOBAL VARIABLES LIKE 'datadir'": [
             {"Variable_name": "datadir", "Value": "/var/lib/mysql"}
+        ],
+        "SHOW GLOBAL VARIABLES LIKE 'log_timestamps'": [
+            {"Variable_name": "log_timestamps", "Value": "UTC"}
+        ],
+        "SHOW GLOBAL VARIABLES LIKE 'time_zone'": [
+            {"Variable_name": "time_zone", "Value": "SYSTEM"}
+        ],
+        "SHOW GLOBAL VARIABLES LIKE 'system_time_zone'": [
+            {"Variable_name": "system_time_zone", "Value": "CST"}
+        ],
+        "SELECT @@global.time_zone, @@system_time_zone": [
+            {"@@global.time_zone": "SYSTEM", "@@system_time_zone": "CST"}
         ],
     }
 

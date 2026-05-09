@@ -171,6 +171,73 @@ class EvidencePipelineResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class EvidenceItem:
+    evidence_id: str
+    raw_evidence_id: str
+    evidence_type: str
+    source: dict[str, Any]
+    time_range: dict[str, Any]
+    summary: str
+    structured_payload: dict[str, Any]
+    raw_refs: tuple[dict[str, Any], ...]
+    quality_flags: tuple[str, ...] = ()
+    llm_safe: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["raw_refs"] = list(self.raw_refs)
+        payload["quality_flags"] = list(self.quality_flags)
+        return payload
+
+
+@dataclass(frozen=True)
+class EvidenceBundle:
+    request_id: str
+    phase: str
+    bundle_id: str
+    input_raw_evidence_index: str
+    source_raw_evidence_count: int
+    processed_raw_evidence_count: int
+    time_window: dict[str, Any]
+    evidence_items: tuple[EvidenceItem, ...]
+    coverage: dict[str, Any]
+    quality: dict[str, Any]
+    processing_summary: dict[str, Any]
+    skipped_raw_evidence: tuple[dict[str, Any], ...]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "phase": self.phase,
+            "bundle_id": self.bundle_id,
+            "input_raw_evidence_index": self.input_raw_evidence_index,
+            "source_raw_evidence_count": self.source_raw_evidence_count,
+            "processed_raw_evidence_count": self.processed_raw_evidence_count,
+            "time_window": self.time_window,
+            "evidence_items": [item.to_dict() for item in self.evidence_items],
+            "coverage": self.coverage,
+            "quality": self.quality,
+            "processing_summary": self.processing_summary,
+            "skipped_raw_evidence": list(self.skipped_raw_evidence),
+            "metadata": self.metadata,
+        }
+
+
+@dataclass(frozen=True)
+class EvidenceStructuringResult:
+    request_id: str
+    phase: str
+    status: str
+    bundle: EvidenceBundle | None
+    bundle_artifact: Any | None
+    artifacts: tuple[Any, ...]
+    telemetry: tuple[Any, ...]
+    blocking_issues: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 def collection_summary(raw_evidence: tuple[RawEvidence, ...]) -> dict[str, int]:
     summary = {f"{status}_count": 0 for status in _SUMMARY_STATUSES}
     summary["raw_evidence_count"] = len(raw_evidence)
