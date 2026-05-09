@@ -167,6 +167,92 @@ class Phase04FindingsValidationTest(unittest.TestCase):
         self.assertTrue(any("findings_draft_invalid" in issue for issue in result.blocking_issues))
         self.assertIn("findings_generation_retry_requested", [event.event_type for event in result.telemetry])
 
+    def test_confidence_numeric_string_is_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_path = _write_evidence_bundle(root)
+            findings = _findings_payload("req_phase04")
+            findings["findings"][0]["confidence"] = "0.78"
+
+            result = Phase04AnalysisPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                mysql_analyzer_runtime=FakeAnalyzerRuntime(findings),
+                validation_runtime=FakeValidationRuntime(_validation_payload("req_phase04")),
+            ).run(bundle_path)
+
+            findings_payload = _artifact_payload(result.artifacts, "FindingsDraft")
+
+        self.assertEqual(result.status, "analysis_completed_with_warnings")
+        self.assertEqual(findings_payload["findings"][0]["confidence"], 0.78)
+        confidence_events = [
+            event for event in result.telemetry
+            if event.event_type == "finding_confidence_normalized"
+        ]
+        self.assertEqual(confidence_events[0].attributes["confidence_normalization_status"], "normalized")
+
+    def test_confidence_label_triggers_retry_and_valid_retry_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_path = _write_evidence_bundle(root)
+            first_findings = _findings_payload("req_phase04")
+            first_findings["findings"][0]["confidence"] = "high"
+            retry_findings = _findings_payload("req_phase04")
+            retry_findings["findings"][0]["confidence"] = 0.78
+            analyzer = FakeSequenceAnalyzerRuntime([first_findings, retry_findings])
+
+            result = Phase04AnalysisPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                mysql_analyzer_runtime=analyzer,
+                validation_runtime=FakeValidationRuntime(_validation_payload("req_phase04")),
+            ).run(bundle_path)
+
+            findings_payload = _artifact_payload(result.artifacts, "FindingsDraft")
+            invalid_payload = _artifact_payload(result.artifacts, "InvalidFindingsDraft")
+
+        self.assertEqual(result.status, "analysis_completed_with_warnings")
+        self.assertEqual(len(analyzer.invocations), 2)
+        self.assertEqual(findings_payload["findings"][0]["confidence"], 0.78)
+        self.assertIn(
+            "Finding.confidence must be a number between 0.0 and 1.0, got string 'high'",
+            invalid_payload["validation_errors"],
+        )
+        self.assertEqual(invalid_payload["retry_attempt"], 0)
+        event_types = [event.event_type for event in result.telemetry]
+        self.assertIn("findings_draft_schema_validation_failed", event_types)
+        self.assertIn("findings_generation_retry_requested", event_types)
+        self.assertIn("findings_generation_retry_completed", event_types)
+        self.assertIn("findings_draft_schema_validation_passed", event_types)
+
+    def test_confidence_label_retry_still_invalid_blocks_with_clear_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_path = _write_evidence_bundle(root)
+            first_findings = _findings_payload("req_phase04")
+            first_findings["findings"][0]["confidence"] = "high"
+            second_findings = _findings_payload("req_phase04")
+            second_findings["findings"][0]["confidence"] = "medium"
+            analyzer = FakeSequenceAnalyzerRuntime([first_findings, second_findings])
+
+            result = Phase04AnalysisPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                mysql_analyzer_runtime=analyzer,
+                validation_runtime=FakeValidationRuntime(_validation_payload("req_phase04")),
+            ).run(bundle_path)
+
+            invalid_payload = _artifact_payload(result.artifacts, "InvalidFindingsDraft")
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(len(analyzer.invocations), 2)
+        self.assertIn(
+            "findings_draft_invalid: Finding.confidence must be a number between 0.0 and 1.0, got string 'medium'",
+            result.blocking_issues,
+        )
+        self.assertEqual(invalid_payload["retry_attempt"], 1)
+        self.assertNotIn("Root@1234", json.dumps(invalid_payload, ensure_ascii=False))
+
     def test_cli_from_evidence_bundle_replay_runs_phase04(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -321,6 +407,8 @@ class Phase04FindingsValidationTest(unittest.TestCase):
         self.assertIn("Validation Handoff", mysql_skill)
         self.assertIn("FindingsDraft", mysql_skill)
         self.assertIn("Finding.category", mysql_skill)
+        self.assertIn("Finding.confidence", mysql_skill)
+        self.assertIn("Confidence must never be", mysql_skill)
         self.assertIn("Execution Boundary", intake_skill)
         self.assertIn("stop_after_phase", intake_skill)
         self.assertIn("Validation Agent", validation_skill)

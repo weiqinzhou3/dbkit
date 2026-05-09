@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from numbers import Real
 from typing import Any
 
 
@@ -177,8 +178,7 @@ def _validate_finding_shape(finding: Any) -> None:
         raise ValueError("Finding.category is invalid")
     if finding["severity"] not in ALLOWED_SEVERITIES:
         raise ValueError("Finding.severity is invalid")
-    if not 0 <= float(finding["confidence"]) <= 1:
-        raise ValueError("Finding.confidence must be between 0 and 1")
+    finding["confidence"] = _validated_confidence_value(finding["confidence"])
     evidence_refs = finding.get("evidence_refs")
     if not isinstance(evidence_refs, list) or not evidence_refs:
         raise ValueError("Finding.evidence_refs is required")
@@ -187,6 +187,29 @@ def _validate_finding_shape(finding: Any) -> None:
             raise ValueError("Finding.evidence_refs[].evidence_id is required")
         if not ref.get("evidence_type"):
             raise ValueError("Finding.evidence_refs[].evidence_type is required")
+
+
+def _validated_confidence_value(value: Any) -> float:
+    if isinstance(value, bool):
+        raise ValueError("Finding.confidence must be a number between 0.0 and 1.0")
+    if isinstance(value, Real):
+        confidence = float(value)
+    elif isinstance(value, str):
+        stripped = value.strip()
+        try:
+            confidence = float(stripped)
+        except ValueError:
+            raise ValueError(
+                "Finding.confidence must be a number between 0.0 and 1.0, "
+                f"got string '{value}'"
+            ) from None
+    else:
+        raise ValueError(
+            "Finding.confidence must be a number between 0.0 and 1.0"
+        )
+    if not 0 <= confidence <= 1:
+        raise ValueError("Finding.confidence must be a number between 0.0 and 1.0")
+    return confidence
 
 
 def _reject_forbidden_keys(payload: dict[str, Any], name: str) -> None:

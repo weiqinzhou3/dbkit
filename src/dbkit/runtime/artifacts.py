@@ -233,6 +233,18 @@ class ArtifactStore:
         )
         return ArtifactRecord(kind="FindingsDraft", path=path)
 
+    def persist_invalid_findings_draft(
+        self,
+        request_id: str,
+        payload: dict[str, Any],
+    ) -> ArtifactRecord:
+        path = self.root / f"{request_id}.findings-draft.invalid.json"
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return ArtifactRecord(kind="InvalidFindingsDraft", path=path)
+
     def persist_validation_result(
         self,
         request_id: str,

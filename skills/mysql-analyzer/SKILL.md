@@ -279,6 +279,15 @@ Each finding must include:
 - `missing_evidence`
 - `recommended_next_checks`
 
+Example finding fields:
+
+```json
+{
+  "severity": "high",
+  "confidence": 0.78
+}
+```
+
 `Finding.category` must be exactly one of:
 
 - `connection`
@@ -295,6 +304,33 @@ Each finding must include:
 
 Do not output aliases such as `connectivity`, `connection_issue`,
 `mysql_unreachable`, `cpu_spike`, `lock_wait`, or `slow_queries`.
+
+`Finding.severity` must be exactly one of:
+
+- `critical`
+- `high`
+- `medium`
+- `low`
+- `info`
+
+`Finding.confidence` must be a JSON number between `0.0` and `1.0`.
+
+Allowed confidence examples:
+
+- `0.78`
+- `0.6`
+- `0.35`
+
+Forbidden confidence values:
+
+- `"high"`
+- `"medium"`
+- `"low"`
+- `"likely"`
+- `"uncertain"`
+
+Do not put severity labels into confidence.
+Confidence must never be `"high"`, `"medium"`, or `"low"`.
 
 Do not produce final verdict directly; output FindingsDraft for Validation Agent.
 

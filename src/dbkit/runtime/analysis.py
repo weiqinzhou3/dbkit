@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from time import perf_counter_ns
 from typing import Any
@@ -135,6 +136,7 @@ class Phase04AnalysisPipeline:
             findings_payload=findings_payload,
             evidence_bundle=evidence_bundle,
             input_bundle_ref=input_bundle_ref,
+            artifacts=artifacts,
         )
         if findings_draft is None:
             return self._failed(
@@ -331,7 +333,97 @@ class Phase04AnalysisPipeline:
         findings_payload: dict[str, Any],
         evidence_bundle: dict[str, Any],
         input_bundle_ref: str,
+        artifacts: list[Any],
     ) -> tuple[dict[str, Any] | None, str | None]:
+        request_id = str(evidence_bundle["request_id"])
+        draft, errors = self._validate_findings_draft_attempt(
+            findings_payload=findings_payload,
+            evidence_bundle=evidence_bundle,
+            input_bundle_ref=input_bundle_ref,
+            retry_attempt=0,
+        )
+        if not errors:
+            return draft, None
+
+        invalid_artifact = self._persist_invalid_findings_draft(
+            request_id=request_id,
+            invalid_payload=findings_payload,
+            validation_errors=errors,
+            retry_attempt=0,
+        )
+        artifacts.append(invalid_artifact)
+        retry_context = {
+            "validation_errors": list(errors),
+            "allowed_schema": {
+                "severity": "one of critical/high/medium/low/info",
+                "confidence": "numeric value between 0.0 and 1.0, for example 0.78",
+            },
+            "instructions": [
+                "Regenerate FindingsDraft JSON only.",
+                "Do not re-analyze RawEvidence.",
+                "Do not read raw logs.",
+                "Only fix FindingsDraft JSON schema.",
+                "Do not use high, medium, or low for confidence.",
+            ],
+        }
+        self._emit(
+            "findings_generation_retry_requested",
+            "Findings generation retry requested by schema validation",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            validation_errors=list(errors),
+            retry_attempt=1,
+            status="retry_requested",
+        )
+        retry_payload = self._invoke_findings_generation(
+            evidence_bundle=evidence_bundle,
+            input_bundle_ref=input_bundle_ref,
+            retry_context=retry_context,
+        )
+        self._emit(
+            "findings_generation_retry_completed",
+            "Findings generation retry completed",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            retry_attempt=1,
+            status="completed" if retry_payload is not None else "failed",
+        )
+        if retry_payload is None:
+            return None, "retry_parse_failed"
+        draft, errors = self._validate_findings_draft_attempt(
+            findings_payload=retry_payload,
+            evidence_bundle=evidence_bundle,
+            input_bundle_ref=input_bundle_ref,
+            retry_attempt=1,
+        )
+        if errors:
+            invalid_artifact = self._persist_invalid_findings_draft(
+                request_id=request_id,
+                invalid_payload=retry_payload,
+                validation_errors=errors,
+                retry_attempt=1,
+            )
+            artifacts.append(invalid_artifact)
+            return None, errors[0]
+        return draft, None
+
+    def _validate_findings_draft_attempt(
+        self,
+        *,
+        findings_payload: dict[str, Any],
+        evidence_bundle: dict[str, Any],
+        input_bundle_ref: str,
+        retry_attempt: int,
+    ) -> tuple[dict[str, Any] | None, tuple[str, ...]]:
+        request_id = str(evidence_bundle["request_id"])
+        self._emit(
+            "findings_draft_schema_validation_started",
+            "FindingsDraft schema validation started",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            retry_attempt=retry_attempt,
+            status="started",
+        )
         normalized_payload, category_events, invalid_categories = normalize_findings_categories(
             findings_payload
         )
@@ -340,54 +432,55 @@ class Phase04AnalysisPipeline:
             category_events=category_events,
             invalid_categories=invalid_categories,
         )
+        errors: list[str] = []
         if invalid_categories:
-            retry_context = {
-                "reason": "invalid_finding_category",
-                "invalid_categories": list(invalid_categories),
-                "allowed_categories": [
-                    "connection",
-                    "availability",
-                    "performance",
-                    "high_cpu",
-                    "lock_contention",
-                    "slow_query",
-                    "configuration",
-                    "resource_pressure",
-                    "log_signal",
-                    "service_state",
-                    "unknown",
-                ],
-            }
+            errors.append(f"Finding.category is invalid: {','.join(invalid_categories)}")
+        normalized_payload, confidence_events, confidence_errors = _normalize_confidence_values(
+            normalized_payload
+        )
+        self._emit_confidence_events(
+            request_id=request_id,
+            confidence_events=confidence_events,
+            confidence_errors=confidence_errors,
+        )
+        errors.extend(confidence_errors)
+        if errors:
             self._emit(
-                "findings_generation_retry_requested",
-                "Findings generation retry requested by category validation",
-                request_id=str(evidence_bundle["request_id"]),
+                "findings_draft_schema_validation_failed",
+                "FindingsDraft schema validation failed",
+                request_id=request_id,
                 input_evidence_bundle=input_bundle_ref,
-                category_validation_status="retry_requested",
-                invalid_categories=list(invalid_categories),
-                status="retry_requested",
+                validation_errors=errors,
+                retry_attempt=retry_attempt,
+                confidence_normalization_status=_confidence_status(confidence_events, confidence_errors),
+                status="failed",
             )
-            retry_payload = self._invoke_findings_generation(
-                evidence_bundle=evidence_bundle,
-                input_bundle_ref=input_bundle_ref,
-                retry_context=retry_context,
-            )
-            if retry_payload is None:
-                return None, "retry_parse_failed"
-            normalized_payload, category_events, invalid_categories = normalize_findings_categories(
-                retry_payload
-            )
-            self._emit_category_events(
-                request_id=str(evidence_bundle["request_id"]),
-                category_events=category_events,
-                invalid_categories=invalid_categories,
-            )
-            if invalid_categories:
-                return None, f"Finding.category is invalid: {','.join(invalid_categories)}"
+            return None, tuple(errors)
         try:
-            return validate_findings_draft(normalized_payload, evidence_bundle), None
+            draft = validate_findings_draft(normalized_payload, evidence_bundle)
         except ValueError as exc:
-            return None, str(exc)
+            errors = [str(exc)]
+            self._emit(
+                "findings_draft_schema_validation_failed",
+                "FindingsDraft schema validation failed",
+                request_id=request_id,
+                input_evidence_bundle=input_bundle_ref,
+                validation_errors=errors,
+                retry_attempt=retry_attempt,
+                confidence_normalization_status=_confidence_status(confidence_events, tuple(errors)),
+                status="failed",
+            )
+            return None, tuple(errors)
+        self._emit(
+            "findings_draft_schema_validation_passed",
+            "FindingsDraft schema validation passed",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            retry_attempt=retry_attempt,
+            confidence_normalization_status=_confidence_status(confidence_events, ()),
+            status="completed",
+        )
+        return draft, ()
 
     def _emit_category_events(
         self,
@@ -417,6 +510,64 @@ class Phase04AnalysisPipeline:
                 category_validation_status="invalid",
                 status="failed",
             )
+
+    def _emit_confidence_events(
+        self,
+        *,
+        request_id: str,
+        confidence_events: tuple[dict[str, Any], ...],
+        confidence_errors: tuple[str, ...],
+    ) -> None:
+        for event in confidence_events:
+            self._emit(
+                "finding_confidence_normalized",
+                "Finding confidence normalized",
+                request_id=request_id,
+                finding_id=event["finding_id"],
+                original_confidence=event["original_confidence"],
+                normalized_confidence=event["normalized_confidence"],
+                confidence_normalization_status="normalized",
+                status="completed",
+            )
+        for error in confidence_errors:
+            self._emit(
+                "finding_confidence_invalid",
+                "Finding confidence failed validation",
+                request_id=request_id,
+                validation_error=error,
+                confidence_normalization_status="invalid",
+                status="failed",
+            )
+
+    def _persist_invalid_findings_draft(
+        self,
+        *,
+        request_id: str,
+        invalid_payload: dict[str, Any],
+        validation_errors: tuple[str, ...] | list[str],
+        retry_attempt: int,
+    ) -> Any:
+        artifact = self.artifact_store.persist_invalid_findings_draft(
+            request_id,
+            {
+                "request_id": request_id,
+                "phase": "phase-04",
+                "status": "invalid",
+                "retry_attempt": retry_attempt,
+                "validation_errors": list(validation_errors),
+                "parsed_invalid_object": _sanitize_for_artifact(invalid_payload),
+            },
+        )
+        self._emit(
+            "artifact_written",
+            "Artifact written: InvalidFindingsDraft",
+            request_id=request_id,
+            kind=artifact.kind,
+            path=str(artifact.path),
+            retry_attempt=retry_attempt,
+            status="completed",
+        )
+        return artifact
 
     def _invoke_validation(
         self,
@@ -715,6 +866,89 @@ def _lineage_issue(
     if raw_index and not raw_index.endswith(f"{request_id}.raw-evidence-index.json"):
         return "artifact_lineage_mismatch"
     return None
+
+
+def _normalize_confidence_values(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], tuple[str, ...]]:
+    result = dict(payload)
+    findings = []
+    events: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for finding in payload.get("findings") or []:
+        if not isinstance(finding, dict):
+            findings.append(finding)
+            continue
+        copied = dict(finding)
+        confidence = copied.get("confidence")
+        finding_id = str(copied.get("finding_id") or "")
+        if isinstance(confidence, bool):
+            errors.append("Finding.confidence must be a number between 0.0 and 1.0")
+        elif isinstance(confidence, (int, float)):
+            value = float(confidence)
+            if 0 <= value <= 1:
+                copied["confidence"] = value
+            else:
+                errors.append("Finding.confidence must be a number between 0.0 and 1.0")
+        elif isinstance(confidence, str):
+            try:
+                value = float(confidence.strip())
+            except ValueError:
+                errors.append(
+                    "Finding.confidence must be a number between 0.0 and 1.0, "
+                    f"got string '{confidence}'"
+                )
+            else:
+                if 0 <= value <= 1:
+                    copied["confidence"] = value
+                    events.append(
+                        {
+                            "finding_id": finding_id,
+                            "original_confidence": confidence,
+                            "normalized_confidence": value,
+                        }
+                    )
+                else:
+                    errors.append(
+                        "Finding.confidence must be a number between 0.0 and 1.0"
+                    )
+        else:
+            errors.append("Finding.confidence must be a number between 0.0 and 1.0")
+        findings.append(copied)
+    result["findings"] = findings
+    return result, tuple(events), tuple(errors)
+
+
+def _confidence_status(
+    confidence_events: tuple[dict[str, Any], ...],
+    confidence_errors: tuple[str, ...],
+) -> str:
+    if confidence_errors:
+        return "invalid"
+    if confidence_events:
+        return "normalized"
+    return "not_needed"
+
+
+def _sanitize_for_artifact(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _sanitize_for_artifact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_artifact(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_artifact(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_text(value)
+    return value
+
+
+def _sanitize_text(value: str) -> str:
+    text = re.sub(r"<SECRET_REF:[^>]+>", "<SECRET_REF:redacted>", value)
+    secret_like = re.compile(
+        r"(?i)(password|passwd|pwd|token|secret|api_key|authorization)\s*[:=]\s*[^,\s}]+"
+    )
+    text = secret_like.sub(lambda match: match.group(1) + "=<redacted>", text)
+    return text
 
 
 def _duration_ms(started_ns: int) -> int:
