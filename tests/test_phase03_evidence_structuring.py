@@ -136,6 +136,7 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
                     "260509 16:00:01 [Note] MySQL old style timestamp in window thread 12\n"
                     "2026-05-09T19:00:00.000000Z [ERROR] Outside after UTC window\n"
                 ),
+                source_timezone={"os_timezone_offset": "+0800"},
             )
             result = EvidenceStructuringPipeline(
                 artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
@@ -209,6 +210,84 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
         self.assertIn("parser_partial", item["quality_flags"])
         self.assertNotIn("mysql.error_log parser failed", bundle["quality"]["warnings"])
 
+    def test_error_log_filters_utc_timestamps_against_plus_8_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = _write_error_log_fixture(
+                root,
+                (
+                    "2026-05-09T02:59:59.000000Z [ERROR] outside before utc\n"
+                    "2026-05-09T03:00:00.000000Z [ERROR] inside utc lower bound\n"
+                    "2026-05-09T10:00:00.000000Z [Warning] inside utc upper bound\n"
+                    "2026-05-09T10:00:01.000000Z [ERROR] outside after utc\n"
+                ),
+            )
+            result = EvidenceStructuringPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+            ).run(index_path)
+            bundle = json.loads(result.bundle_artifact.path.read_text(encoding="utf-8"))
+
+        item = bundle["evidence_items"][0]
+        payload = item["structured_payload"]
+        self.assertEqual(payload["retained_lines"], 2)
+        self.assertEqual(payload["discarded_lines"], 2)
+        self.assertEqual(payload["timezone_handling"], "normalized_to_utc")
+        self.assertEqual(payload["source_timezone"], "UTC")
+        self.assertEqual(item["time_range"]["start_utc"], "2026-05-09T03:00:00+00:00")
+        self.assertEqual(item["time_range"]["end_utc"], "2026-05-09T10:00:00+00:00")
+        patterns = json.dumps(payload["top_patterns"], ensure_ascii=False)
+        self.assertIn("inside utc lower bound", patterns)
+        self.assertNotIn("outside before utc", patterns)
+
+    def test_error_log_infers_naive_timestamp_timezone_from_log_timestamps_utc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = _write_error_log_fixture(
+                root,
+                (
+                    "2026-05-09 02:59:59 [ERROR] outside before inferred utc\n"
+                    "2026-05-09 03:00:00 [ERROR] inside inferred utc\n"
+                    "2026-05-09 10:00:01 [ERROR] outside after inferred utc\n"
+                ),
+                source_timezone={"mysql_log_timestamps": "UTC"},
+            )
+            result = EvidenceStructuringPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+            ).run(index_path)
+            bundle = json.loads(result.bundle_artifact.path.read_text(encoding="utf-8"))
+
+        item = bundle["evidence_items"][0]
+        payload = item["structured_payload"]
+        self.assertEqual(payload["retained_lines"], 1)
+        self.assertEqual(payload["discarded_lines"], 2)
+        self.assertEqual(payload["timezone_handling"], "inferred")
+        self.assertEqual(payload["source_timezone"], "UTC")
+        patterns = json.dumps(payload["top_patterns"], ensure_ascii=False)
+        self.assertIn("inside inferred utc", patterns)
+        self.assertNotIn("outside before inferred utc", patterns)
+
+    def test_error_log_naive_timestamp_without_timezone_inference_is_marked_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = _write_error_log_fixture(
+                root,
+                "2026-05-09 03:00:00 [ERROR] naive timestamp without inference\n",
+                source_timezone={},
+            )
+            result = EvidenceStructuringPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+            ).run(index_path)
+            bundle = json.loads(result.bundle_artifact.path.read_text(encoding="utf-8"))
+
+        item = bundle["evidence_items"][0]
+        payload = item["structured_payload"]
+        self.assertEqual(payload["timezone_handling"], "failed")
+        self.assertEqual(payload["source_timezone"], "unknown")
+        self.assertIn("timezone_inference_failed", item["quality_flags"])
+
 
 def _write_raw_evidence_fixture(root: Path, *, missing_content_ref: bool = False) -> Path:
     artifacts = root / ".dbkit" / "artifacts"
@@ -275,7 +354,12 @@ def _write_text_raw(raw_dir: Path, request_id: str, raw_id: str, evidence_type: 
     return _raw_index_item(request_id, raw_id, evidence_type, path, bytes_count=path.stat().st_size, line_count=len(content.splitlines()))
 
 
-def _write_error_log_fixture(root: Path, content: str) -> Path:
+def _write_error_log_fixture(
+    root: Path,
+    content: str,
+    *,
+    source_timezone: dict | None = None,
+) -> Path:
     artifacts = root / ".dbkit" / "artifacts"
     raw_dir = artifacts / "raw"
     raw_dir.mkdir(parents=True)
@@ -285,6 +369,8 @@ def _write_error_log_fixture(root: Path, content: str) -> Path:
     entry["metadata"]["time_window_aware"] = False
     entry["metadata"]["time_window_coverage"] = "unknown"
     entry["metadata"]["coverage_warning"] = "tail_lines may not cover requested time_window"
+    if source_timezone is not None:
+        entry["metadata"]["source_timezone"] = source_timezone
     index = {
         "request_id": request_id,
         "phase": "phase-02.1",
@@ -322,7 +408,7 @@ def _raw_index_item(
         "source": {"kind": "mysql" if evidence_type.startswith("mysql.") else "ssh", "tool_name": f"tool_{raw_id}", "path": str(content_ref) if content_ref else None},
         "collection": collection,
         "payload": {"content_ref": str(content_ref) if content_ref else None, "bytes": bytes_count, "line_count": line_count},
-        "metadata": {"time_window": {"start": "2026-05-09T10:00:00+08:00", "end": "2026-05-09T17:00:00+08:00", "source": "skill_default_from_event_time"}},
+        "metadata": {"time_window": {"start": "2026-05-09T11:00:00+08:00", "end": "2026-05-09T18:00:00+08:00", "source": "skill_default_from_event_time"}},
     }
 
 

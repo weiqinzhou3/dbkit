@@ -4,7 +4,7 @@ import json
 import re
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -246,7 +246,11 @@ def estimate_tokens(text: str) -> int:
 
 
 def _parse_log(raw: dict[str, Any], raw_text: str, *, log_name: str) -> EvidenceItem:
-    parsed = parse_log_for_time_window(raw_text, _time_window(raw))
+    parsed = parse_log_for_time_window(
+        raw_text,
+        _time_window(raw),
+        source_timezone=_source_timezone(raw),
+    )
     retained_lines = parsed.retained_lines
     patterns: dict[str, dict[str, Any]] = {}
     for event in parsed.retained_events:
@@ -305,6 +309,8 @@ def _parse_log(raw: dict[str, Any], raw_text: str, *, log_name: str) -> Evidence
             "discarded_events": len(parsed.discarded_events),
             "timestamp_parse_status": parsed.timestamp_parse_status,
             "time_window_filter_status": parsed.time_window_filter_status,
+            "timezone_handling": parsed.timezone_handling,
+            "source_timezone": parsed.source_timezone,
             "collection_time_window_coverage": coverage,
             "severity_counts": dict(severity_counts),
             "top_patterns": top_patterns,
@@ -322,6 +328,8 @@ def _parse_log(raw: dict[str, Any], raw_text: str, *, log_name: str) -> Evidence
         raw_text=raw_text,
         raw_refs=_line_refs(raw, retained_lines) or _fallback_log_ref(raw, parsed.total_lines),
         timestamp_parse_status=parsed.timestamp_parse_status,
+        timezone_handling=parsed.timezone_handling,
+        source_timezone=parsed.source_timezone,
         quality_flags=tuple(dict.fromkeys(flags)),
     )
 
@@ -333,6 +341,7 @@ class LogEvent:
     lines: tuple[str, ...]
     timestamp: datetime | None
     timestamp_line_parsed: bool
+    timestamp_had_timezone: bool = False
 
     @property
     def first_line(self) -> str:
@@ -350,14 +359,21 @@ class ParsedLogWindow:
     discarded_lines: tuple[tuple[int, str], ...]
     timestamp_parse_status: str
     time_window_filter_status: str
+    timezone_handling: str
+    source_timezone: str
     quality_flags: tuple[str, ...]
 
 
 def filter_log_text_to_time_window(
     raw_text: str,
     time_window: dict[str, Any],
+    source_timezone: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    parsed = parse_log_for_time_window(raw_text, time_window)
+    parsed = parse_log_for_time_window(
+        raw_text,
+        time_window,
+        source_timezone=source_timezone,
+    )
     retained_text = "\n".join(line for _, line in parsed.retained_lines)
     if retained_text:
         retained_text += "\n"
@@ -369,22 +385,34 @@ def filter_log_text_to_time_window(
         "discarded_events": len(parsed.discarded_events),
         "timestamp_parse_status": parsed.timestamp_parse_status,
         "time_window_filter_status": parsed.time_window_filter_status,
+        "timezone_handling": parsed.timezone_handling,
+        "source_timezone": parsed.source_timezone,
     }
 
 
 def parse_log_for_time_window(
     raw_text: str,
     time_window: dict[str, Any],
+    source_timezone: dict[str, Any] | None = None,
 ) -> ParsedLogWindow:
     lines = raw_text.splitlines()
-    events = _split_log_events(lines, time_window)
+    source_tz = _infer_source_timezone(source_timezone or {})
+    events = _split_log_events(lines, source_tz)
     retained_events: list[LogEvent] = []
     discarded_events: list[LogEvent] = []
     retained_lines: list[tuple[int, str]] = []
     discarded_lines: list[tuple[int, str]] = []
     parsed_timestamp_lines = sum(1 for event in events if event.timestamp_line_parsed)
     unparseable_lines = sum(1 for event in events for _line in event.lines) - parsed_timestamp_lines
-    window_available = bool(_parse_dt(time_window.get("start")) or _parse_dt(time_window.get("end")))
+    start = _parse_dt(time_window.get("start"))
+    end = _parse_dt(time_window.get("end"))
+    start_utc = _to_utc(start) if start else None
+    end_utc = _to_utc(end) if end else None
+    window_available = bool(start_utc or end_utc)
+    naive_events_without_timezone = [
+        event for event in events
+        if event.timestamp is not None and not event.timestamp_had_timezone and source_tz is None
+    ]
 
     for event in events:
         event_lines = list(zip(range(event.line_start, event.line_end + 1), event.lines))
@@ -392,7 +420,15 @@ def parse_log_for_time_window(
             retained_events.append(event)
             retained_lines.extend(event_lines)
             continue
-        if not window_available or _in_window(event.timestamp, time_window):
+        event_utc = _to_utc(event.timestamp)
+        if event_utc is None or (
+            event_utc.tzinfo is None
+            and ((start_utc and start_utc.tzinfo is not None) or (end_utc and end_utc.tzinfo is not None))
+        ):
+            retained_events.append(event)
+            retained_lines.extend(event_lines)
+            continue
+        if not window_available or _in_window_utc(event_utc, start_utc, end_utc):
             retained_events.append(event)
             retained_lines.extend(event_lines)
         else:
@@ -420,6 +456,13 @@ def parse_log_for_time_window(
         flags.append("timestamp_parse_partial")
     if filter_status in {"partial", "unavailable"}:
         flags.append(f"time_window_filter_{filter_status}")
+    timezone_handling, source_timezone_label = _timezone_status(
+        events,
+        source_tz,
+        naive_events_without_timezone,
+    )
+    if timezone_handling == "failed":
+        flags.append("timezone_inference_failed")
 
     return ParsedLogWindow(
         total_lines=len(lines),
@@ -431,6 +474,8 @@ def parse_log_for_time_window(
         discarded_lines=tuple(discarded_lines),
         timestamp_parse_status=timestamp_status,
         time_window_filter_status=filter_status,
+        timezone_handling=timezone_handling,
+        source_timezone=source_timezone_label,
         quality_flags=tuple(dict.fromkeys(flags)),
     )
 
@@ -443,6 +488,8 @@ def _item(
     raw_text: str,
     raw_refs: tuple[dict[str, Any], ...] | None = None,
     timestamp_parse_status: str = "not_applicable",
+    timezone_handling: str = "not_applicable",
+    source_timezone: str = "unknown",
     quality_flags: tuple[str, ...] = (),
 ) -> EvidenceItem:
     content_ref = str((raw.get("payload") or {}).get("content_ref") or "")
@@ -454,6 +501,8 @@ def _item(
         "line_end": max(1, len(raw_text.splitlines())),
     },)
     window = _time_window(raw)
+    start = _parse_dt(window.get("start"))
+    end = _parse_dt(window.get("end"))
     return EvidenceItem(
         evidence_id=evidence_id,
         raw_evidence_id=str(raw["raw_evidence_id"]),
@@ -462,7 +511,11 @@ def _item(
         time_range={
             "start": window.get("start"),
             "end": window.get("end"),
+            "start_utc": _format_utc(start),
+            "end_utc": _format_utc(end),
             "timestamp_parse_status": timestamp_parse_status,
+            "timezone_handling": timezone_handling,
+            "source_timezone": source_timezone,
         },
         summary=summary,
         structured_payload=_strip_forbidden(structured_payload),
@@ -521,17 +574,17 @@ def _event_ref(raw: dict[str, Any], event: LogEvent) -> dict[str, Any]:
 
 def _split_log_events(
     lines: list[str],
-    time_window: dict[str, Any],
+    source_tz: tzinfo | None,
 ) -> tuple[LogEvent, ...]:
     events: list[LogEvent] = []
     current_start = 1
     current_lines: list[str] = []
     current_ts: datetime | None = None
     current_parsed = False
-    default_tz = _window_tzinfo(time_window)
+    current_had_timezone = False
 
     def flush(end_line: int) -> None:
-        nonlocal current_lines, current_start, current_ts, current_parsed
+        nonlocal current_lines, current_start, current_ts, current_parsed, current_had_timezone
         if not current_lines:
             return
         events.append(
@@ -541,20 +594,23 @@ def _split_log_events(
                 lines=tuple(current_lines),
                 timestamp=current_ts,
                 timestamp_line_parsed=current_parsed,
+                timestamp_had_timezone=current_had_timezone,
             )
         )
         current_lines = []
         current_ts = None
         current_parsed = False
+        current_had_timezone = False
 
     for line_number, line in enumerate(lines, start=1):
-        timestamp = _extract_timestamp(line, default_tz=default_tz)
-        if timestamp is not None:
+        parsed = _extract_timestamp(line, default_tz=source_tz)
+        if parsed.timestamp is not None:
             flush(line_number - 1)
             current_start = line_number
             current_lines = [line]
-            current_ts = timestamp
+            current_ts = parsed.timestamp
             current_parsed = True
+            current_had_timezone = parsed.had_timezone
         else:
             if not current_lines:
                 current_start = line_number
@@ -563,11 +619,17 @@ def _split_log_events(
     return tuple(events)
 
 
+@dataclass(frozen=True)
+class ParsedTimestamp:
+    timestamp: datetime | None
+    had_timezone: bool = False
+
+
 def _extract_timestamp_with_default_tz(
     line: str,
     *,
     default_tz: tzinfo | None = None,
-) -> datetime | None:
+) -> ParsedTimestamp:
     iso_match = re.search(
         r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)",
         line,
@@ -578,11 +640,12 @@ def _extract_timestamp_with_default_tz(
             value = value[:-1] + "+00:00"
         try:
             parsed = datetime.fromisoformat(value)
-            if parsed.tzinfo is None and default_tz is not None:
-                return parsed.replace(tzinfo=default_tz)
-            return parsed
+            had_timezone = parsed.tzinfo is not None
+            if not had_timezone and default_tz is not None:
+                parsed = parsed.replace(tzinfo=default_tz)
+            return ParsedTimestamp(parsed, had_timezone=had_timezone)
         except ValueError:
-            return None
+            return ParsedTimestamp(None)
 
     space_match = re.search(
         r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)",
@@ -593,30 +656,31 @@ def _extract_timestamp_with_default_tz(
         fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in value else "%Y-%m-%d %H:%M:%S"
         try:
             parsed = datetime.strptime(value, fmt)
-            return parsed.replace(tzinfo=default_tz) if default_tz else parsed
+            if default_tz is not None:
+                parsed = parsed.replace(tzinfo=default_tz)
+            return ParsedTimestamp(parsed, had_timezone=False)
         except ValueError:
-            return None
+            return ParsedTimestamp(None)
 
     old_match = re.search(r"\b(\d{6})\s+(\d{2}:\d{2}:\d{2})\b", line)
     if old_match:
         value = old_match.group(1) + " " + old_match.group(2)
         try:
             parsed = datetime.strptime(value, "%y%m%d %H:%M:%S")
-            return parsed.replace(tzinfo=default_tz) if default_tz else parsed
+            if default_tz is not None:
+                parsed = parsed.replace(tzinfo=default_tz)
+            return ParsedTimestamp(parsed, had_timezone=False)
         except ValueError:
-            return None
+            return ParsedTimestamp(None)
 
-    return None
+    return ParsedTimestamp(None)
 
 
-def _extract_timestamp(line: str, *, default_tz: tzinfo | None = None) -> datetime | None:
+def _extract_timestamp(line: str, *, default_tz: tzinfo | None = None) -> ParsedTimestamp:
     return _extract_timestamp_with_default_tz(line, default_tz=default_tz)
 
 
-def _in_window(timestamp: datetime, window: dict[str, Any]) -> bool:
-    start = _parse_dt(window.get("start"))
-    end = _parse_dt(window.get("end"))
-    timestamp = _align_datetime_timezone(timestamp, start or end)
+def _in_window_utc(timestamp: datetime, start: datetime | None, end: datetime | None) -> bool:
     if start and timestamp < start:
         return False
     if end and timestamp > end:
@@ -633,26 +697,86 @@ def _parse_dt(value: Any) -> datetime | None:
         return None
 
 
-def _align_datetime_timezone(value: datetime, reference: datetime | None) -> datetime:
-    if reference is None:
+def _to_utc(value: datetime | None) -> datetime | None:
+    if value is None or value.tzinfo is None:
         return value
-    if value.tzinfo is None and reference.tzinfo is not None:
-        return value.replace(tzinfo=reference.tzinfo)
-    if value.tzinfo is not None and reference.tzinfo is None:
-        return value.replace(tzinfo=None)
-    return value
+    return value.astimezone(timezone.utc)
 
 
-def _window_tzinfo(window: dict[str, Any]) -> tzinfo | None:
-    for key in ("start", "end"):
-        parsed = _parse_dt(window.get(key))
-        if parsed and parsed.tzinfo is not None:
-            return parsed.tzinfo
+def _format_utc(value: datetime | None) -> str | None:
+    utc_value = _to_utc(value)
+    return utc_value.isoformat() if utc_value is not None else None
+
+
+def _infer_source_timezone(source_timezone: dict[str, Any]) -> tzinfo | None:
+    log_timestamps = str(source_timezone.get("mysql_log_timestamps") or "").upper()
+    if log_timestamps == "UTC":
+        return timezone.utc
+    offset = _parse_timezone_offset(str(source_timezone.get("os_timezone_offset") or ""))
+    if offset is not None:
+        return offset
     return None
+
+
+def _timezone_status(
+    events: tuple[LogEvent, ...],
+    source_tz: tzinfo | None,
+    naive_events_without_timezone: list[LogEvent],
+) -> tuple[str, str]:
+    timestamped = [event for event in events if event.timestamp is not None]
+    if not timestamped:
+        return "failed", "unknown"
+    if naive_events_without_timezone:
+        return "failed", "unknown"
+    if any(event.timestamp_had_timezone for event in timestamped):
+        return "normalized_to_utc", _source_label_from_events(timestamped)
+    if source_tz is not None:
+        return "inferred", _tz_label(source_tz)
+    return "failed", "unknown"
+
+
+def _source_label_from_events(events: list[LogEvent]) -> str:
+    labels = {_tz_label(event.timestamp.tzinfo) for event in events if event.timestamp and event.timestamp.tzinfo}
+    if len(labels) == 1:
+        return next(iter(labels))
+    if labels:
+        return "mixed"
+    return "unknown"
+
+
+def _tz_label(value: tzinfo | None) -> str:
+    if value is None:
+        return "unknown"
+    offset = value.utcoffset(None)
+    if offset == timedelta(0):
+        return "UTC"
+    if offset is None:
+        return "unknown"
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    total_minutes = abs(total_minutes)
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def _parse_timezone_offset(value: str) -> timezone | None:
+    match = re.fullmatch(r"([+-])(\d{2})(?::?(\d{2}))", value.strip())
+    if not match:
+        return None
+    sign, hours, minutes = match.groups()
+    delta = timedelta(hours=int(hours), minutes=int(minutes))
+    if sign == "-":
+        delta = -delta
+    return timezone(delta)
 
 
 def _time_window(raw: dict[str, Any]) -> dict[str, Any]:
     return dict(((raw.get("metadata") or {}).get("time_window") or {}))
+
+
+def _source_timezone(raw: dict[str, Any]) -> dict[str, Any]:
+    source_timezone = (raw.get("metadata") or {}).get("source_timezone")
+    return dict(source_timezone) if isinstance(source_timezone, dict) else {}
 
 
 def _log_pattern(line: str) -> str:

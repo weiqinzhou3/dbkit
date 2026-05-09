@@ -77,6 +77,8 @@ class EvidencePipeline:
         self.artifact_store = artifact_store
         self.telemetry = telemetry
         self.collectors = collectors
+        if getattr(self.collectors, "telemetry", None) is None:
+            self.collectors.telemetry = telemetry
         self.time_provider = time_provider or TimeProvider()
         self.guardrails = guardrails or CollectionGuardrails()
         self.mysql_analyzer_runtime = mysql_analyzer_runtime
@@ -451,6 +453,7 @@ class EvidencePipeline:
                     )
 
         summary = collection_summary(tuple(raw_items))
+        self._close_collectors(request)
         status = collection_status(tuple(raw_items))
         index_artifact = self.artifact_store.persist_raw_evidence_index(
             request.request_id,
@@ -769,6 +772,12 @@ class EvidencePipeline:
         if self.collection_dependency_checker is not None:
             return self.collection_dependency_checker(plan)
         return find_missing_collection_dependencies(plan, request)
+
+    def _close_collectors(self, request: NormalizedRequest) -> None:
+        close = getattr(self.collectors, "close", None)
+        if not callable(close):
+            return
+        close()
 
 
 def _source_paths_for_step(

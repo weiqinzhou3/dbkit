@@ -17,7 +17,11 @@ _LOG_VARIABLE_SQL = (
     "SHOW GLOBAL VARIABLES LIKE 'slow_query_log'",
     "SHOW GLOBAL VARIABLES LIKE 'log_output'",
     "SHOW GLOBAL VARIABLES LIKE 'datadir'",
+    "SHOW GLOBAL VARIABLES LIKE 'log_timestamps'",
+    "SHOW GLOBAL VARIABLES LIKE 'time_zone'",
+    "SHOW GLOBAL VARIABLES LIKE 'system_time_zone'",
 )
+_TIMEZONE_SQL = "SELECT @@global.time_zone, @@system_time_zone"
 
 
 def discover_mysql_log_paths(
@@ -111,7 +115,11 @@ def collect_mysql_log_file(
             except Exception:
                 scan_content = ""
             if scan_content:
-                filtered_content, stats = filter_log_text_to_time_window(scan_content, time_window)
+                filtered_content, stats = filter_log_text_to_time_window(
+                    scan_content,
+                    time_window,
+                    source_timezone=_source_timezone(discovery),
+                )
                 scan_bytes = len(scan_content.encode("utf-8"))
                 coverage = (
                     "partial_or_unknown"
@@ -129,8 +137,9 @@ def collect_mysql_log_file(
                     "discarded_events": stats["discarded_events"],
                     "tail_lines": int(tail_lines),
                     "max_bytes": int(max_bytes),
-                    "time_window_scan_max_bytes": int(time_window_scan_max_bytes),
-                }
+                        "time_window_scan_max_bytes": int(time_window_scan_max_bytes),
+                        "source_timezone": _source_timezone(discovery),
+                    }
                 if coverage == "partial_or_unknown":
                     metadata["coverage_warning"] = "scan chunk may not cover requested time_window"
                 return text_raw_evidence(
@@ -170,6 +179,7 @@ def collect_mysql_log_file(
                 "coverage_warning": "tail_lines may not cover requested time_window",
                 "tail_lines": int(tail_lines),
                 "max_bytes": int(max_bytes),
+                "source_timezone": _source_timezone(discovery),
             },
         )
     except Exception as exc:
@@ -191,6 +201,11 @@ def _tail_bytes(ssh_client: Any, path: str, max_bytes: int) -> str:
     return str(ssh_client.exec(f"tail -c {int(max_bytes)} -- {path}"))
 
 
+def _source_timezone(discovery: dict[str, Any]) -> dict[str, Any]:
+    source_timezone = discovery.get("source_timezone")
+    return dict(source_timezone) if isinstance(source_timezone, dict) else {}
+
+
 def discover_log_paths(mysql_client: MySQLClient) -> dict[str, Any]:
     values: dict[str, str] = {}
     for sql in _LOG_VARIABLE_SQL:
@@ -200,8 +215,19 @@ def discover_log_paths(mysql_client: MySQLClient) -> dict[str, Any]:
         for row in rows:
             name = str(row.get("Variable_name") or row.get("variable_name") or "")
             values[name] = str(row.get("Value") or row.get("value") or "")
+    if not is_mysql_sql_allowed(_TIMEZONE_SQL):
+        raise RuntimeError(f"blocked unsafe SQL: {_TIMEZONE_SQL}")
+    timezone_rows = mysql_client.execute(_TIMEZONE_SQL)
+    timezone_row = timezone_rows[0] if timezone_rows else {}
     datadir = values.get("datadir", "")
     log_output = values.get("log_output", "FILE").upper()
+    source_timezone = {
+        "mysql_log_timestamps": values.get("log_timestamps"),
+        "mysql_time_zone": values.get("time_zone") or timezone_row.get("@@global.time_zone"),
+        "mysql_system_time_zone": values.get("system_time_zone")
+        or timezone_row.get("@@system_time_zone"),
+        "inference": _timezone_inference(values),
+    }
     if log_output == "TABLE":
         return {
             "error_log_path": None,
@@ -209,6 +235,7 @@ def discover_log_paths(mysql_client: MySQLClient) -> dict[str, Any]:
             "slow_query_log_enabled": _truthy(values.get("slow_query_log")),
             "log_output": log_output,
             "datadir": datadir,
+            "source_timezone": source_timezone,
             "reason": "log_output_table_not_supported_in_phase_02_1",
         }
     return {
@@ -217,6 +244,7 @@ def discover_log_paths(mysql_client: MySQLClient) -> dict[str, Any]:
         "slow_query_log_enabled": _truthy(values.get("slow_query_log")),
         "log_output": log_output,
         "datadir": datadir,
+        "source_timezone": source_timezone,
     }
 
 
@@ -241,3 +269,11 @@ def _resolve_path(path: str | None, datadir: str) -> str | None:
 
 def _truthy(value: str | None) -> bool:
     return str(value or "").strip().upper() in {"ON", "1", "YES", "TRUE"}
+
+
+def _timezone_inference(values: dict[str, str]) -> str:
+    if str(values.get("log_timestamps") or "").upper() == "UTC":
+        return "mysql_error_log_uses_utc"
+    if str(values.get("log_timestamps") or "").upper() == "SYSTEM":
+        return "mysql_error_log_uses_system_timezone"
+    return "unknown"

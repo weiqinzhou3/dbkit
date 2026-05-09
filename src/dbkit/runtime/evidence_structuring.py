@@ -425,6 +425,8 @@ class EvidenceStructuringPipeline:
                 bundle_warnings.append("error_log parsed with partial timestamp coverage")
             if "timestamp_parse_failed" in item.quality_flags:
                 bundle_warnings.append("error_log timestamp parsing unavailable")
+            if "timezone_inference_failed" in item.quality_flags:
+                bundle_warnings.append("error_log timezone inference failed")
         if deprecated:
             bundle_warnings.append("deprecated duplicate MySQL metrics evidence skipped")
         quality = {

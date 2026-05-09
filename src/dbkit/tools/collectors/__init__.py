@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from dbkit.runtime.secret_store import SecretStore
+from dbkit.runtime.observability import TelemetryRecorder
 from dbkit.schemas.evidence import CollectionStep, RawEvidence
 from dbkit.schemas.runtime import NormalizedRequest
 from dbkit.tools.collectors.common import error_raw_evidence, text_raw_evidence
@@ -34,6 +35,10 @@ class CollectorRegistry:
         log_max_bytes: int = 10_485_760,
         log_time_window_scan_max_bytes: int = 52_428_800,
         log_prefer_time_window_scan: bool = True,
+        mysql_connect_timeout_seconds: int = 5,
+        mysql_read_timeout_seconds: int = 30,
+        mysql_write_timeout_seconds: int = 30,
+        telemetry: TelemetryRecorder | None = None,
     ) -> None:
         self.workspace_root = workspace_root
         self.mysql_client_factory = mysql_client_factory or _default_mysql_client
@@ -43,6 +48,10 @@ class CollectorRegistry:
         self.log_max_bytes = log_max_bytes
         self.log_time_window_scan_max_bytes = log_time_window_scan_max_bytes
         self.log_prefer_time_window_scan = log_prefer_time_window_scan
+        self.mysql_connect_timeout_seconds = mysql_connect_timeout_seconds
+        self.mysql_read_timeout_seconds = mysql_read_timeout_seconds
+        self.mysql_write_timeout_seconds = mysql_write_timeout_seconds
+        self.telemetry = telemetry
         self._mysql_client: Any | None = None
         self._ssh_client: Any | None = None
 
@@ -227,7 +236,17 @@ class CollectorRegistry:
 
     def _mysql(self, request: NormalizedRequest) -> Any:
         if self._mysql_client is None:
-            self._mysql_client = self.mysql_client_factory(request, self.secret_store)
+            if self.mysql_client_factory is _default_mysql_client:
+                self._mysql_client = _default_mysql_client(
+                    request,
+                    self.secret_store,
+                    telemetry=self.telemetry,
+                    connect_timeout_seconds=self.mysql_connect_timeout_seconds,
+                    read_timeout_seconds=self.mysql_read_timeout_seconds,
+                    write_timeout_seconds=self.mysql_write_timeout_seconds,
+                )
+            else:
+                self._mysql_client = self.mysql_client_factory(request, self.secret_store)
         return self._mysql_client
 
     def _ssh(self, request: NormalizedRequest) -> Any:
@@ -337,10 +356,40 @@ class CollectorRegistry:
         relative = host_path.relative_to(self.workspace_root)
         return "/workspace/" + relative.as_posix()
 
+    def close(self) -> None:
+        mysql_client = self._mysql_client
+        close = getattr(mysql_client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:
+                if self.telemetry is not None:
+                    self.telemetry.emit(
+                        event_type="mysql_connection_close_failed",
+                        stage="mysql_connection",
+                        message="MySQL connection close failed",
+                        attributes={"error": type(exc).__name__},
+                    )
 
-def _default_mysql_client(request: NormalizedRequest, secret_store: SecretStore) -> PyMySQLClient:
+
+def _default_mysql_client(
+    request: NormalizedRequest,
+    secret_store: SecretStore,
+    *,
+    telemetry: TelemetryRecorder | None = None,
+    connect_timeout_seconds: int = 5,
+    read_timeout_seconds: int = 30,
+    write_timeout_seconds: int = 30,
+) -> PyMySQLClient:
     target = request.target or {}
-    return PyMySQLClient(request, secret_store.get(str(target.get("password_ref") or "")))
+    return PyMySQLClient(
+        request,
+        secret_store.get(str(target.get("password_ref") or "")),
+        telemetry=telemetry,
+        connect_timeout_seconds=connect_timeout_seconds,
+        read_timeout_seconds=read_timeout_seconds,
+        write_timeout_seconds=write_timeout_seconds,
+    )
 
 
 def _default_ssh_client(request: NormalizedRequest, secret_store: SecretStore) -> ParamikoSSHClient:

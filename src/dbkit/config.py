@@ -52,6 +52,7 @@ class AgentConfig:
 class MySQLCollectionConfig:
     connect_timeout_seconds: int = 5
     read_timeout_seconds: int = 30
+    write_timeout_seconds: int = 30
 
 
 @dataclass(frozen=True)
@@ -166,6 +167,7 @@ def _load_collection_config(data: dict[str, Any] | None) -> CollectionConfig:
         mysql=MySQLCollectionConfig(
             connect_timeout_seconds=_optional_int(mysql, "connect_timeout_seconds", 5),
             read_timeout_seconds=_optional_int(mysql, "read_timeout_seconds", 30),
+            write_timeout_seconds=_optional_int(mysql, "write_timeout_seconds", 30),
         ),
         ssh=SSHCollectionConfig(
             connect_timeout_seconds=_optional_int(ssh, "connect_timeout_seconds", 5),

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dbkit.runtime.collection_guardrails import is_mysql_sql_allowed
+from dbkit.runtime.observability import TelemetryRecorder
 from dbkit.schemas.evidence import CollectionStep, RawEvidence
 from dbkit.schemas.runtime import NormalizedRequest
 from dbkit.tools.collectors.common import error_raw_evidence, json_raw_evidence
@@ -13,10 +14,25 @@ class MySQLClient(Protocol):
     def execute(self, sql: str) -> list[dict[str, Any]]:
         ...
 
+    def close(self) -> None:
+        ...
+
 
 class PyMySQLClient:
-    def __init__(self, request: NormalizedRequest, password: str | None) -> None:
+    def __init__(
+        self,
+        request: NormalizedRequest,
+        password: str | None,
+        *,
+        telemetry: TelemetryRecorder | None = None,
+        connect_timeout_seconds: int = 5,
+        read_timeout_seconds: int = 30,
+        write_timeout_seconds: int = 30,
+    ) -> None:
         target = request.target or {}
+        self.request_id = request.request_id
+        self.telemetry = telemetry
+        self._closed = False
         try:
             import pymysql
         except ImportError as exc:
@@ -26,16 +42,66 @@ class PyMySQLClient:
             port=int(target.get("port") or 3306),
             user=str(target.get("username") or ""),
             password=password or "",
-            connect_timeout=5,
-            read_timeout=30,
+            database=None,
+            autocommit=True,
+            charset="utf8mb4",
+            connect_timeout=int(connect_timeout_seconds),
+            read_timeout=int(read_timeout_seconds),
+            write_timeout=int(write_timeout_seconds),
             cursorclass=pymysql.cursors.DictCursor,
+        )
+        self._emit(
+            "mysql_connection_opened",
+            "MySQL connection opened",
+            host=str(target.get("host") or ""),
+            port=int(target.get("port") or 3306),
         )
 
     def execute(self, sql: str) -> list[dict[str, Any]]:
-        with self._connection.cursor() as cursor:
+        self._emit("mysql_query_started", "MySQL query started", sql=_safe_sql_label(sql))
+        cursor = self._connection.cursor()
+        try:
             cursor.execute(sql)
             rows = cursor.fetchall()
-        return [dict(row) for row in rows]
+            result = [dict(row) for row in rows]
+            self._emit(
+                "mysql_query_completed",
+                "MySQL query completed",
+                sql=_safe_sql_label(sql),
+                row_count=len(result),
+            )
+            return result
+        finally:
+            cursor.close()
+            self._emit(
+                "mysql_cursor_closed",
+                "MySQL cursor closed",
+                sql=_safe_sql_label(sql),
+            )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            self._connection.close()
+            self._closed = True
+            self._emit("mysql_connection_closed", "MySQL connection closed")
+        except Exception as exc:
+            self._emit(
+                "mysql_connection_close_failed",
+                "MySQL connection close failed",
+                error=type(exc).__name__,
+            )
+
+    def _emit(self, event_type: str, message: str, **attributes: object) -> None:
+        if self.telemetry is None:
+            return
+        self.telemetry.emit(
+            event_type=event_type,
+            stage="mysql_connection",
+            message=message,
+            attributes={"request_id": self.request_id, **attributes},
+        )
 
 
 _SERVICE_SQL = {
@@ -49,6 +115,7 @@ _SERVICE_SQL = {
 _METADATA_SQL = (
     "SELECT VERSION()",
     "SELECT @@hostname, @@port, @@datadir, @@log_error, @@slow_query_log_file",
+    "SELECT @@global.time_zone, @@system_time_zone",
 )
 
 
@@ -183,6 +250,10 @@ def collect_mysql_metrics_snapshot(
 def _ensure_sql_allowed(sql: str) -> None:
     if not is_mysql_sql_allowed(sql):
         raise RuntimeError(f"blocked unsafe SQL: {sql}")
+
+
+def _safe_sql_label(sql: str) -> str:
+    return " ".join(sql.strip().split())
 
 
 def _with_original_tool(item: RawEvidence, tool_name: str) -> RawEvidence:

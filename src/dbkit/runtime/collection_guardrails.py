@@ -57,6 +57,10 @@ _ALLOWED_SQL = frozenset(
         "SHOW GLOBAL VARIABLES LIKE 'slow_query_log'",
         "SHOW GLOBAL VARIABLES LIKE 'log_output'",
         "SHOW GLOBAL VARIABLES LIKE 'datadir'",
+        "SHOW GLOBAL VARIABLES LIKE 'log_timestamps'",
+        "SHOW GLOBAL VARIABLES LIKE 'time_zone'",
+        "SHOW GLOBAL VARIABLES LIKE 'system_time_zone'",
+        "SELECT @@global.time_zone, @@system_time_zone",
     }
 )
 _ALLOWED_SSH_EXACT = frozenset(

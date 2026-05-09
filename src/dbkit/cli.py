@@ -122,6 +122,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             log_max_bytes=config.collection.logs.max_bytes,
             log_time_window_scan_max_bytes=config.collection.logs.time_window_scan_max_bytes,
             log_prefer_time_window_scan=config.collection.logs.prefer_time_window_scan,
+            mysql_connect_timeout_seconds=config.collection.mysql.connect_timeout_seconds,
+            mysql_read_timeout_seconds=config.collection.mysql.read_timeout_seconds,
+            mysql_write_timeout_seconds=config.collection.mysql.write_timeout_seconds,
         ),
         time_provider=TimeProvider(
             timezone=config.runtime.timezone,
