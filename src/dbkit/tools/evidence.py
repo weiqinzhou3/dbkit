@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -210,19 +211,7 @@ def parse_mysql_error_log(raw: dict[str, Any], raw_text: str, raw_payload: Any) 
 
 
 def parse_mysql_slow_log(raw: dict[str, Any], raw_text: str, raw_payload: Any) -> EvidenceItem:
-    patterns = Counter(_slow_digest(line) for line in raw_text.splitlines() if line.strip())
-    return _item(
-        raw,
-        summary=f"Slow log contains {sum(patterns.values())} retained lines grouped into {len(patterns)} patterns.",
-        structured_payload={
-            "top_query_patterns": [{"pattern": pattern, "count": count} for pattern, count in patterns.most_common(10)],
-            "retained_lines": sum(patterns.values()),
-            "discarded_lines": 0,
-        },
-        raw_text=raw_text,
-        timestamp_parse_status="failed",
-        quality_flags=("timestamp_parse_failed",),
-    )
+    return _parse_log(raw, raw_text, log_name="Slow log")
 
 
 def parse_os_cpu_snapshot(raw: dict[str, Any], raw_text: str, raw_payload: Any) -> EvidenceItem:
@@ -257,36 +246,192 @@ def estimate_tokens(text: str) -> int:
 
 
 def _parse_log(raw: dict[str, Any], raw_text: str, *, log_name: str) -> EvidenceItem:
-    window = _time_window(raw)
-    lines = raw_text.splitlines()
-    retained: list[tuple[int, str]] = []
-    discarded = 0
-    parsed_timestamps = 0
-    for index, line in enumerate(lines, start=1):
-        timestamp = _extract_timestamp(line)
-        if timestamp is None:
-            retained.append((index, line))
+    parsed = parse_log_for_time_window(raw_text, _time_window(raw))
+    retained_lines = parsed.retained_lines
+    patterns: dict[str, dict[str, Any]] = {}
+    for event in parsed.retained_events:
+        pattern = _log_pattern(event.first_line)
+        if not pattern:
             continue
-        parsed_timestamps += 1
-        if _in_window(timestamp, window):
-            retained.append((index, line))
-        else:
-            discarded += 1
-    status = "ok" if parsed_timestamps else "failed"
-    patterns = Counter(_log_pattern(line) for _, line in retained if line.strip())
-    flags = () if status == "ok" else ("timestamp_parse_failed",)
+        entry = patterns.setdefault(
+            pattern,
+            {
+                "pattern": pattern,
+                "count": 0,
+                "raw_refs": [],
+            },
+        )
+        entry["count"] += 1
+        entry["raw_refs"].append(_event_ref(raw, event))
+
+    flags = list(parsed.quality_flags)
+    coverage = str(raw.get("metadata", {}).get("time_window_coverage") or "unknown")
+    if coverage in {"unknown", "partial_or_unknown"}:
+        flags.append("time_window_coverage_unknown")
+    if not parsed.retained_events and parsed.discarded_events:
+        flags.extend(["out_of_time_window", "low_signal"])
+
+    severity_counts = Counter(
+        severity
+        for severity in (_severity(event.first_line) for event in parsed.retained_events)
+        if severity
+    )
+    top_patterns = sorted(
+        patterns.values(),
+        key=lambda item: (-int(item["count"]), str(item["pattern"])),
+    )[:10]
+    for pattern in top_patterns:
+        pattern["raw_refs"] = pattern["raw_refs"][:3]
+
+    if parsed.retained_lines:
+        summary = (
+            f"{log_name} parsed with {len(parsed.retained_lines)} retained lines "
+            f"inside the requested time window."
+        )
+    elif parsed.discarded_lines:
+        summary = f"{log_name} parsed but no lines matched the requested time window."
+    else:
+        summary = f"{log_name} parsed with partial timestamp coverage."
     return _item(
         raw,
-        summary=f"{log_name} has {len(retained)} retained lines and {len(patterns)} top patterns.",
+        summary=summary,
         structured_payload={
-            "top_patterns": [{"pattern": pattern, "count": count} for pattern, count in patterns.most_common(10)],
-            "retained_lines": len(retained),
-            "discarded_lines": discarded,
+            "total_lines": parsed.total_lines,
+            "parsed_timestamp_lines": parsed.parsed_timestamp_lines,
+            "unparseable_lines": parsed.unparseable_lines,
+            "retained_lines": len(parsed.retained_lines),
+            "discarded_lines": len(parsed.discarded_lines),
+            "retained_events": len(parsed.retained_events),
+            "discarded_events": len(parsed.discarded_events),
+            "timestamp_parse_status": parsed.timestamp_parse_status,
+            "time_window_filter_status": parsed.time_window_filter_status,
+            "collection_time_window_coverage": coverage,
+            "severity_counts": dict(severity_counts),
+            "top_patterns": top_patterns,
+            "sample_events": [
+                {
+                    "line_start": event.line_start,
+                    "line_end": event.line_end,
+                    "timestamp": event.timestamp.isoformat() if event.timestamp else None,
+                    "severity": _severity(event.first_line),
+                    "sample": _sample("\n".join(event.lines), 300),
+                }
+                for event in parsed.retained_events[:5]
+            ],
         },
         raw_text=raw_text,
-        raw_refs=_line_refs(raw, retained),
-        timestamp_parse_status=status,
-        quality_flags=flags,
+        raw_refs=_line_refs(raw, retained_lines) or _fallback_log_ref(raw, parsed.total_lines),
+        timestamp_parse_status=parsed.timestamp_parse_status,
+        quality_flags=tuple(dict.fromkeys(flags)),
+    )
+
+
+@dataclass(frozen=True)
+class LogEvent:
+    line_start: int
+    line_end: int
+    lines: tuple[str, ...]
+    timestamp: datetime | None
+    timestamp_line_parsed: bool
+
+    @property
+    def first_line(self) -> str:
+        return self.lines[0] if self.lines else ""
+
+
+@dataclass(frozen=True)
+class ParsedLogWindow:
+    total_lines: int
+    parsed_timestamp_lines: int
+    unparseable_lines: int
+    retained_events: tuple[LogEvent, ...]
+    discarded_events: tuple[LogEvent, ...]
+    retained_lines: tuple[tuple[int, str], ...]
+    discarded_lines: tuple[tuple[int, str], ...]
+    timestamp_parse_status: str
+    time_window_filter_status: str
+    quality_flags: tuple[str, ...]
+
+
+def filter_log_text_to_time_window(
+    raw_text: str,
+    time_window: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    parsed = parse_log_for_time_window(raw_text, time_window)
+    retained_text = "\n".join(line for _, line in parsed.retained_lines)
+    if retained_text:
+        retained_text += "\n"
+    return retained_text, {
+        "total_lines": parsed.total_lines,
+        "matched_lines": len(parsed.retained_lines),
+        "discarded_lines": len(parsed.discarded_lines),
+        "matched_events": len(parsed.retained_events),
+        "discarded_events": len(parsed.discarded_events),
+        "timestamp_parse_status": parsed.timestamp_parse_status,
+        "time_window_filter_status": parsed.time_window_filter_status,
+    }
+
+
+def parse_log_for_time_window(
+    raw_text: str,
+    time_window: dict[str, Any],
+) -> ParsedLogWindow:
+    lines = raw_text.splitlines()
+    events = _split_log_events(lines, time_window)
+    retained_events: list[LogEvent] = []
+    discarded_events: list[LogEvent] = []
+    retained_lines: list[tuple[int, str]] = []
+    discarded_lines: list[tuple[int, str]] = []
+    parsed_timestamp_lines = sum(1 for event in events if event.timestamp_line_parsed)
+    unparseable_lines = sum(1 for event in events for _line in event.lines) - parsed_timestamp_lines
+    window_available = bool(_parse_dt(time_window.get("start")) or _parse_dt(time_window.get("end")))
+
+    for event in events:
+        event_lines = list(zip(range(event.line_start, event.line_end + 1), event.lines))
+        if event.timestamp is None:
+            retained_events.append(event)
+            retained_lines.extend(event_lines)
+            continue
+        if not window_available or _in_window(event.timestamp, time_window):
+            retained_events.append(event)
+            retained_lines.extend(event_lines)
+        else:
+            discarded_events.append(event)
+            discarded_lines.extend(event_lines)
+
+    if parsed_timestamp_lines == 0:
+        timestamp_status = "failed"
+    elif unparseable_lines > 0:
+        timestamp_status = "partial"
+    else:
+        timestamp_status = "ok"
+
+    if parsed_timestamp_lines == 0:
+        filter_status = "unavailable"
+    elif unparseable_lines > 0:
+        filter_status = "partial"
+    else:
+        filter_status = "applied"
+
+    flags: list[str] = []
+    if timestamp_status == "failed":
+        flags.extend(["timestamp_parse_failed", "parser_partial"])
+    elif timestamp_status == "partial":
+        flags.append("timestamp_parse_partial")
+    if filter_status in {"partial", "unavailable"}:
+        flags.append(f"time_window_filter_{filter_status}")
+
+    return ParsedLogWindow(
+        total_lines=len(lines),
+        parsed_timestamp_lines=parsed_timestamp_lines,
+        unparseable_lines=unparseable_lines,
+        retained_events=tuple(retained_events),
+        discarded_events=tuple(discarded_events),
+        retained_lines=tuple(retained_lines),
+        discarded_lines=tuple(discarded_lines),
+        timestamp_parse_status=timestamp_status,
+        time_window_filter_status=filter_status,
+        quality_flags=tuple(dict.fromkeys(flags)),
     )
 
 
@@ -356,19 +501,122 @@ def _line_refs(raw: dict[str, Any], retained: list[tuple[int, str]]) -> tuple[di
     },)
 
 
-def _extract_timestamp(line: str) -> datetime | None:
-    match = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:\d{2})?)", line)
-    if not match:
-        return None
-    try:
-        return datetime.fromisoformat(match.group(1))
-    except ValueError:
-        return None
+def _fallback_log_ref(raw: dict[str, Any], total_lines: int) -> tuple[dict[str, Any], ...]:
+    return ({
+        "raw_evidence_id": raw["raw_evidence_id"],
+        "content_ref": str((raw.get("payload") or {}).get("content_ref") or ""),
+        "line_start": 1,
+        "line_end": min(max(total_lines, 1), 1),
+    },)
+
+
+def _event_ref(raw: dict[str, Any], event: LogEvent) -> dict[str, Any]:
+    return {
+        "raw_evidence_id": raw["raw_evidence_id"],
+        "content_ref": str((raw.get("payload") or {}).get("content_ref") or ""),
+        "line_start": event.line_start,
+        "line_end": event.line_end,
+    }
+
+
+def _split_log_events(
+    lines: list[str],
+    time_window: dict[str, Any],
+) -> tuple[LogEvent, ...]:
+    events: list[LogEvent] = []
+    current_start = 1
+    current_lines: list[str] = []
+    current_ts: datetime | None = None
+    current_parsed = False
+    default_tz = _window_tzinfo(time_window)
+
+    def flush(end_line: int) -> None:
+        nonlocal current_lines, current_start, current_ts, current_parsed
+        if not current_lines:
+            return
+        events.append(
+            LogEvent(
+                line_start=current_start,
+                line_end=end_line,
+                lines=tuple(current_lines),
+                timestamp=current_ts,
+                timestamp_line_parsed=current_parsed,
+            )
+        )
+        current_lines = []
+        current_ts = None
+        current_parsed = False
+
+    for line_number, line in enumerate(lines, start=1):
+        timestamp = _extract_timestamp(line, default_tz=default_tz)
+        if timestamp is not None:
+            flush(line_number - 1)
+            current_start = line_number
+            current_lines = [line]
+            current_ts = timestamp
+            current_parsed = True
+        else:
+            if not current_lines:
+                current_start = line_number
+            current_lines.append(line)
+    flush(len(lines))
+    return tuple(events)
+
+
+def _extract_timestamp_with_default_tz(
+    line: str,
+    *,
+    default_tz: tzinfo | None = None,
+) -> datetime | None:
+    iso_match = re.search(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)",
+        line,
+    )
+    if iso_match:
+        value = iso_match.group(1)
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None and default_tz is not None:
+                return parsed.replace(tzinfo=default_tz)
+            return parsed
+        except ValueError:
+            return None
+
+    space_match = re.search(
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)",
+        line,
+    )
+    if space_match:
+        value = space_match.group(1)
+        fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in value else "%Y-%m-%d %H:%M:%S"
+        try:
+            parsed = datetime.strptime(value, fmt)
+            return parsed.replace(tzinfo=default_tz) if default_tz else parsed
+        except ValueError:
+            return None
+
+    old_match = re.search(r"\b(\d{6})\s+(\d{2}:\d{2}:\d{2})\b", line)
+    if old_match:
+        value = old_match.group(1) + " " + old_match.group(2)
+        try:
+            parsed = datetime.strptime(value, "%y%m%d %H:%M:%S")
+            return parsed.replace(tzinfo=default_tz) if default_tz else parsed
+        except ValueError:
+            return None
+
+    return None
+
+
+def _extract_timestamp(line: str, *, default_tz: tzinfo | None = None) -> datetime | None:
+    return _extract_timestamp_with_default_tz(line, default_tz=default_tz)
 
 
 def _in_window(timestamp: datetime, window: dict[str, Any]) -> bool:
     start = _parse_dt(window.get("start"))
     end = _parse_dt(window.get("end"))
+    timestamp = _align_datetime_timezone(timestamp, start or end)
     if start and timestamp < start:
         return False
     if end and timestamp > end:
@@ -385,14 +633,50 @@ def _parse_dt(value: Any) -> datetime | None:
         return None
 
 
+def _align_datetime_timezone(value: datetime, reference: datetime | None) -> datetime:
+    if reference is None:
+        return value
+    if value.tzinfo is None and reference.tzinfo is not None:
+        return value.replace(tzinfo=reference.tzinfo)
+    if value.tzinfo is not None and reference.tzinfo is None:
+        return value.replace(tzinfo=None)
+    return value
+
+
+def _window_tzinfo(window: dict[str, Any]) -> tzinfo | None:
+    for key in ("start", "end"):
+        parsed = _parse_dt(window.get(key))
+        if parsed and parsed.tzinfo is not None:
+            return parsed.tzinfo
+    return None
+
+
 def _time_window(raw: dict[str, Any]) -> dict[str, Any]:
     return dict(((raw.get("metadata") or {}).get("time_window") or {}))
 
 
 def _log_pattern(line: str) -> str:
     value = re.sub(r"^\d{4}-\d{2}-\d{2}T\S+\s*", "", line)
+    value = re.sub(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s*", "", value)
+    value = re.sub(r"^\d{6}\s+\d{2}:\d{2}:\d{2}\s*", "", value)
+    value = re.sub(r"\bthread\s+\d+\b", "thread <num>", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b", "<ip:port>", value)
     value = re.sub(r"\b\d+\b", "<num>", value)
     return _sample(value.strip(), 180)
+
+
+def _severity(line: str) -> str | None:
+    match = re.search(r"\[(ERROR|Warning|Note|System|MY-\d+)\]", line, re.IGNORECASE)
+    if not match:
+        return None
+    value = match.group(1)
+    if value.upper() == "ERROR":
+        return "ERROR"
+    if value.lower() == "warning":
+        return "Warning"
+    if value.lower() == "note":
+        return "Note"
+    return value
 
 
 def _slow_digest(line: str) -> str:

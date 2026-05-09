@@ -124,6 +124,91 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
         self.assertEqual(result.status, "evidence_guardrails_failed")
         self.assertIn("content_ref missing for collected raw evidence", result.blocking_issues[0])
 
+    def test_error_log_parser_filters_multiple_timestamp_formats_and_continuations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = _write_error_log_fixture(
+                root,
+                (
+                    "2026-05-09T11:00:01.123456+08:00 [Warning] Aborted connection 10 from 10.0.0.1:52100\n"
+                    "continuation detail for aborted connection\n"
+                    "2026-05-09 09:59:59 [ERROR] Outside before window\n"
+                    "260509 16:00:01 [Note] MySQL old style timestamp in window thread 12\n"
+                    "2026-05-09T19:00:00.000000Z [ERROR] Outside after UTC window\n"
+                ),
+            )
+            result = EvidenceStructuringPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+            ).run(index_path)
+            bundle = json.loads(result.bundle_artifact.path.read_text(encoding="utf-8"))
+            expected_content_ref = _last_error_log_content_ref(root)
+
+        item = bundle["evidence_items"][0]
+        payload = item["structured_payload"]
+        self.assertEqual(item["evidence_type"], "mysql.error_log")
+        self.assertEqual(payload["total_lines"], 5)
+        self.assertEqual(payload["parsed_timestamp_lines"], 4)
+        self.assertEqual(payload["unparseable_lines"], 1)
+        self.assertEqual(payload["retained_lines"], 3)
+        self.assertEqual(payload["discarded_lines"], 2)
+        self.assertEqual(payload["retained_events"], 2)
+        self.assertEqual(payload["discarded_events"], 2)
+        self.assertEqual(payload["timestamp_parse_status"], "partial")
+        self.assertEqual(payload["time_window_filter_status"], "partial")
+        patterns = json.dumps(payload["top_patterns"], ensure_ascii=False)
+        self.assertIn("Warning", patterns)
+        self.assertIn("Note", patterns)
+        self.assertNotIn("Outside before window", patterns)
+        self.assertTrue(item["raw_refs"])
+        self.assertEqual(item["raw_refs"][0]["content_ref"], expected_content_ref)
+
+    def test_error_log_all_lines_outside_window_still_creates_low_signal_item(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = _write_error_log_fixture(
+                root,
+                (
+                    "2026-05-09T09:00:00+08:00 [ERROR] before window\n"
+                    "2026-05-09T19:00:00+08:00 [ERROR] after window\n"
+                ),
+            )
+            result = EvidenceStructuringPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+            ).run(index_path)
+            bundle = json.loads(result.bundle_artifact.path.read_text(encoding="utf-8"))
+
+        item = bundle["evidence_items"][0]
+        payload = item["structured_payload"]
+        self.assertEqual(payload["retained_lines"], 0)
+        self.assertEqual(payload["discarded_lines"], 2)
+        self.assertEqual(payload["retained_events"], 0)
+        self.assertIn("out_of_time_window", item["quality_flags"])
+        self.assertIn("low_signal", item["quality_flags"])
+        self.assertNotIn("mysql.error_log", json.dumps(bundle["skipped_raw_evidence"], ensure_ascii=False))
+
+    def test_error_log_unparseable_lines_do_not_fail_parser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = _write_error_log_fixture(
+                root,
+                "unparseable startup line\nanother unparseable line\n",
+            )
+            result = EvidenceStructuringPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+            ).run(index_path)
+            bundle = json.loads(result.bundle_artifact.path.read_text(encoding="utf-8"))
+
+        item = bundle["evidence_items"][0]
+        payload = item["structured_payload"]
+        self.assertEqual(payload["timestamp_parse_status"], "failed")
+        self.assertEqual(payload["time_window_filter_status"], "unavailable")
+        self.assertIn("timestamp_parse_failed", item["quality_flags"])
+        self.assertIn("parser_partial", item["quality_flags"])
+        self.assertNotIn("mysql.error_log parser failed", bundle["quality"]["warnings"])
+
 
 def _write_raw_evidence_fixture(root: Path, *, missing_content_ref: bool = False) -> Path:
     artifacts = root / ".dbkit" / "artifacts"
@@ -188,6 +273,32 @@ def _write_text_raw(raw_dir: Path, request_id: str, raw_id: str, evidence_type: 
     path = raw_dir / f"{raw_id}.txt"
     path.write_text(content, encoding="utf-8")
     return _raw_index_item(request_id, raw_id, evidence_type, path, bytes_count=path.stat().st_size, line_count=len(content.splitlines()))
+
+
+def _write_error_log_fixture(root: Path, content: str) -> Path:
+    artifacts = root / ".dbkit" / "artifacts"
+    raw_dir = artifacts / "raw"
+    raw_dir.mkdir(parents=True)
+    request_id = "req_error_log"
+    entry = _write_text_raw(raw_dir, request_id, "rawev_error_log_only", "mysql.error_log", content)
+    entry["metadata"]["collection_strategy"] = "bounded_tail_fallback"
+    entry["metadata"]["time_window_aware"] = False
+    entry["metadata"]["time_window_coverage"] = "unknown"
+    entry["metadata"]["coverage_warning"] = "tail_lines may not cover requested time_window"
+    index = {
+        "request_id": request_id,
+        "phase": "phase-02.1",
+        "raw_evidence_count": 1,
+        "raw_evidence": [entry],
+    }
+    index_path = artifacts / f"{request_id}.raw-evidence-index.json"
+    index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    return index_path
+
+
+def _last_error_log_content_ref(root: Path) -> str:
+    raw_dir = root / ".dbkit" / "artifacts" / "raw"
+    return str(next(raw_dir.glob("rawev_error_log_only*.txt")))
 
 
 def _raw_index_item(

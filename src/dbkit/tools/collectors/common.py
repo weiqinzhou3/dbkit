@@ -21,6 +21,7 @@ def text_raw_evidence(
     status: str = "collected",
     reason: str | None = None,
     data: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> RawEvidence:
     started = perf_counter()
     raw_root.mkdir(parents=True, exist_ok=True)
@@ -45,6 +46,9 @@ def text_raw_evidence(
     }
     if data is not None:
         payload["data"] = data
+    item_metadata = {"time_window": time_window_metadata(request)}
+    if metadata:
+        item_metadata.update(metadata)
     return RawEvidence(
         raw_evidence_id=raw_id,
         request_id=request.request_id,
@@ -52,7 +56,7 @@ def text_raw_evidence(
         source=source,
         collection=collection,
         payload=payload,
-        metadata={"time_window": time_window_metadata(request)},
+        metadata=item_metadata,
     )
 
 
@@ -67,6 +71,7 @@ def json_raw_evidence(
     completed_at: str,
     status: str = "collected",
     reason: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> RawEvidence:
     return text_raw_evidence(
         step=step,
@@ -79,6 +84,7 @@ def json_raw_evidence(
         status=status,
         reason=reason,
         data=data,
+        metadata=metadata,
     )
 
 
@@ -92,6 +98,7 @@ def error_raw_evidence(
     error: str,
     source_kind: str = "tool",
     reason: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> RawEvidence:
     raw_id = stable_id("rawev", request.request_id, step.step_id, status, error)
     collection: dict[str, Any] = {
@@ -103,6 +110,9 @@ def error_raw_evidence(
     }
     if reason:
         collection["reason"] = reason
+    item_metadata = {"time_window": time_window_metadata(request)}
+    if metadata:
+        item_metadata.update(metadata)
     return RawEvidence(
         raw_evidence_id=raw_id,
         request_id=request.request_id,
@@ -115,7 +125,7 @@ def error_raw_evidence(
         },
         collection=collection,
         payload={"content_ref": None, "bytes": 0, "line_count": 0},
-        metadata={"time_window": time_window_metadata(request)},
+        metadata=item_metadata,
     )
 
 

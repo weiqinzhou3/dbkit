@@ -432,8 +432,23 @@ class EvidencePipeline:
                         "bytes": item.payload.get("bytes", 0),
                         "line_count": item.payload.get("line_count", 0),
                         "duration_ms": item.collection.get("duration_ms", 0),
+                        **_log_collection_telemetry_attributes(item),
                     },
                 )
+                log_attrs = _log_collection_telemetry_attributes(item)
+                if log_attrs:
+                    self.telemetry.emit(
+                        event_type="log_collection_strategy",
+                        stage="collection",
+                        message="Log collection strategy recorded",
+                        attributes={
+                            "request_id": request.request_id,
+                            "raw_evidence_id": item.raw_evidence_id,
+                            "tool_name": step.tool_name,
+                            "evidence_type": item.evidence_type,
+                            **log_attrs,
+                        },
+                    )
 
         summary = collection_summary(tuple(raw_items))
         status = collection_status(tuple(raw_items))
@@ -828,6 +843,25 @@ def _secret_refs_for_step(
         target = request.target or {}
     password_ref = target.get("password_ref")
     return (str(password_ref),) if password_ref else ()
+
+
+def _log_collection_telemetry_attributes(item: RawEvidence) -> dict[str, object]:
+    if item.evidence_type not in {"mysql.error_log", "mysql.slow_log"}:
+        return {}
+    metadata = item.metadata or {}
+    return {
+        key: metadata[key]
+        for key in (
+            "collection_strategy",
+            "time_window_aware",
+            "time_window_coverage",
+            "tail_lines",
+            "max_bytes",
+            "matched_lines",
+            "discarded_lines",
+        )
+        if key in metadata
+    }
 
 
 def json_dumps(payload: dict[str, Any]) -> str:

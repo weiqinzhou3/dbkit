@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from time import perf_counter_ns
 from typing import Any
 
 from dbkit.runtime.artifacts import ArtifactStore
@@ -262,6 +263,7 @@ class EvidenceStructuringPipeline:
                 raw_evidence_id=raw_id,
                 evidence_type=evidence_type,
             )
+            parser_started_ns = perf_counter_ns()
             try:
                 item = parse_raw_evidence(raw, raw_text, raw_payload)
             except Exception as exc:  # pragma: no cover - defensive parser boundary
@@ -282,6 +284,8 @@ class EvidenceStructuringPipeline:
                     error=type(exc).__name__,
                 )
                 continue
+            parser_duration_ms = max(0, (perf_counter_ns() - parser_started_ns) // 1_000_000)
+            structured = item.structured_payload
             self._emit(
                 "time_window_filter_completed",
                 "Time window filtering completed",
@@ -289,6 +293,14 @@ class EvidenceStructuringPipeline:
                 raw_evidence_id=raw_id,
                 evidence_type=evidence_type,
                 timestamp_parse_status=item.time_range.get("timestamp_parse_status"),
+                total_lines=structured.get("total_lines"),
+                parsed_timestamp_lines=structured.get("parsed_timestamp_lines"),
+                unparseable_lines=structured.get("unparseable_lines"),
+                retained_lines=structured.get("retained_lines"),
+                discarded_lines=structured.get("discarded_lines"),
+                time_window_filter_status=structured.get("time_window_filter_status"),
+                collection_time_window_coverage=structured.get("collection_time_window_coverage"),
+                duration_ms=parser_duration_ms,
             )
             self._emit(
                 "evidence_parser_completed",
@@ -296,6 +308,8 @@ class EvidenceStructuringPipeline:
                 request_id=request_id,
                 raw_evidence_id=raw_id,
                 evidence_type=evidence_type,
+                status="partial" if item.quality_flags else "completed",
+                duration_ms=parser_duration_ms,
             )
             evidence_items.append(item)
             self._emit(
@@ -401,6 +415,16 @@ class EvidenceStructuringPipeline:
             round(structured_bytes / raw_bytes, 6) if raw_bytes > 0 else 1.0
         )
         bundle_warnings = list(dict.fromkeys(warnings))
+        for item in evidence_items:
+            if item.evidence_type != "mysql.error_log":
+                continue
+            if "time_window_coverage_unknown" in item.quality_flags:
+                bundle_warnings.append("error_log collection coverage unknown")
+                bundle_warnings.append("error_log time_window may be incomplete")
+            if "timestamp_parse_partial" in item.quality_flags:
+                bundle_warnings.append("error_log parsed with partial timestamp coverage")
+            if "timestamp_parse_failed" in item.quality_flags:
+                bundle_warnings.append("error_log timestamp parsing unavailable")
         if deprecated:
             bundle_warnings.append("deprecated duplicate MySQL metrics evidence skipped")
         quality = {

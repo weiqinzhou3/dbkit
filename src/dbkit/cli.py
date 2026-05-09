@@ -119,6 +119,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             workspace_root=config.runtime.workspace_dir,
             secret_store=SecretStore(result.secret_values),
             log_tail_lines=config.collection.logs.tail_lines,
+            log_max_bytes=config.collection.logs.max_bytes,
+            log_time_window_scan_max_bytes=config.collection.logs.time_window_scan_max_bytes,
+            log_prefer_time_window_scan=config.collection.logs.prefer_time_window_scan,
         ),
         time_provider=TimeProvider(
             timezone=config.runtime.timezone,

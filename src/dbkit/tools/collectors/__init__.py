@@ -31,12 +31,18 @@ class CollectorRegistry:
         ssh_client_factory: SSHClientFactory | None = None,
         secret_store: SecretStore | None = None,
         log_tail_lines: int = 5000,
+        log_max_bytes: int = 10_485_760,
+        log_time_window_scan_max_bytes: int = 52_428_800,
+        log_prefer_time_window_scan: bool = True,
     ) -> None:
         self.workspace_root = workspace_root
         self.mysql_client_factory = mysql_client_factory or _default_mysql_client
         self.ssh_client_factory = ssh_client_factory or _default_ssh_client
         self.secret_store = secret_store or SecretStore()
         self.log_tail_lines = log_tail_lines
+        self.log_max_bytes = log_max_bytes
+        self.log_time_window_scan_max_bytes = log_time_window_scan_max_bytes
+        self.log_prefer_time_window_scan = log_prefer_time_window_scan
         self._mysql_client: Any | None = None
         self._ssh_client: Any | None = None
 
@@ -138,6 +144,9 @@ class CollectorRegistry:
                     started_at=started_at,
                     completed_at=completed_at,
                     tail_lines=self.log_tail_lines,
+                    max_bytes=self.log_max_bytes,
+                    time_window_scan_max_bytes=self.log_time_window_scan_max_bytes,
+                    prefer_time_window_scan=self.log_prefer_time_window_scan,
                 ),
             )
         if step.tool_name in {"collect_mysql_metrics_snapshot", "collect_metrics_snapshot"}:
@@ -199,6 +208,9 @@ class CollectorRegistry:
                     started_at=started_at,
                     completed_at=completed_at,
                     tail_lines=self.log_tail_lines,
+                    max_bytes=self.log_max_bytes,
+                    time_window_scan_max_bytes=self.log_time_window_scan_max_bytes,
+                    prefer_time_window_scan=self.log_prefer_time_window_scan,
                 ),
             )
         return (

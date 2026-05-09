@@ -64,6 +64,8 @@ class SSHCollectionConfig:
 class LogCollectionConfig:
     max_bytes: int = 10_485_760
     tail_lines: int = 5000
+    time_window_scan_max_bytes: int = 52_428_800
+    prefer_time_window_scan: bool = True
 
 
 @dataclass(frozen=True)
@@ -172,6 +174,12 @@ def _load_collection_config(data: dict[str, Any] | None) -> CollectionConfig:
         logs=LogCollectionConfig(
             max_bytes=_optional_int(logs, "max_bytes", 10_485_760),
             tail_lines=_optional_int(logs, "tail_lines", 5000),
+            time_window_scan_max_bytes=_optional_int(
+                logs, "time_window_scan_max_bytes", 52_428_800
+            ),
+            prefer_time_window_scan=_optional_bool(
+                logs, "prefer_time_window_scan", True
+            ),
         ),
         metrics=MetricsCollectionConfig(
             mysqld_exporter_url=_optional_string(metrics, "mysqld_exporter_url"),

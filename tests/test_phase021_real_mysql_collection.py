@@ -451,6 +451,91 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
             self.assertEqual(item.payload["line_count"], 1)
             self.assertIn("error line", Path(item.payload["content_ref"]).read_text(encoding="utf-8"))
 
+    def test_error_log_bounded_tail_fallback_records_unknown_time_window_coverage(self) -> None:
+        fake_mysql = FakeMySQLClient(_log_variables(error_log="/var/log/mysql/error.log"))
+        fake_ssh = FakeSSHClient({("tail", 5000, "/var/log/mysql/error.log"): "error line\n"})
+        request = _live_request(with_ssh=True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            registry = CollectorRegistry(
+                workspace_root=root / "workspace",
+                mysql_client_factory=lambda _request, _secrets: fake_mysql,
+                ssh_client_factory=lambda _request, _secrets: fake_ssh,
+                secret_store=SecretStore(
+                    {
+                        "<SECRET_REF:mysql_password_001>": "Root",
+                        "<SECRET_REF:ssh_password_001>": "Root",
+                    }
+                ),
+                log_prefer_time_window_scan=False,
+            )
+            item = registry.collect(
+                step=_step(1, "collect_mysql_error_log", "mysql.error_log"),
+                request=request,
+                raw_root=root / "raw",
+                started_at=_now(),
+                completed_at=_now(),
+            )[0]
+
+        self.assertEqual(item.collection["status"], "collected")
+        self.assertEqual(item.metadata["collection_strategy"], "bounded_tail_fallback")
+        self.assertFalse(item.metadata["time_window_aware"])
+        self.assertEqual(item.metadata["time_window_coverage"], "unknown")
+        self.assertEqual(item.metadata["tail_lines"], 5000)
+        self.assertIn("tail_lines may not cover requested time_window", item.metadata["coverage_warning"])
+
+    def test_error_log_time_window_scan_records_attempted_coverage_metadata(self) -> None:
+        fake_mysql = FakeMySQLClient(_log_variables(error_log="/var/log/mysql/error.log"))
+        fake_ssh = FakeSSHClient(
+            {
+                (
+                    "tail_bytes",
+                    52_428_800,
+                    "/var/log/mysql/error.log",
+                ): (
+                    "2026-05-08T10:00:00+08:00 [Warning] outside before\n"
+                    "2026-05-08T16:59:00+08:00 [ERROR] inside window\n"
+                    "continued detail\n"
+                    "2026-05-08T19:00:00+08:00 [ERROR] outside after\n"
+                )
+            }
+        )
+        request = _live_request(with_ssh=True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            registry = CollectorRegistry(
+                workspace_root=root / "workspace",
+                mysql_client_factory=lambda _request, _secrets: fake_mysql,
+                ssh_client_factory=lambda _request, _secrets: fake_ssh,
+                secret_store=SecretStore(
+                    {
+                        "<SECRET_REF:mysql_password_001>": "Root",
+                        "<SECRET_REF:ssh_password_001>": "Root",
+                    }
+                ),
+            )
+            item = registry.collect(
+                step=_step(1, "collect_mysql_error_log", "mysql.error_log"),
+                request=request,
+                raw_root=root / "raw",
+                started_at=_now(),
+                completed_at=_now(),
+            )[0]
+            content = Path(item.payload["content_ref"]).read_text(encoding="utf-8")
+
+        self.assertEqual(item.collection["status"], "collected")
+        self.assertEqual(item.metadata["collection_strategy"], "time_window_scan")
+        self.assertTrue(item.metadata["time_window_aware"])
+        self.assertEqual(item.metadata["time_window_coverage"], "attempted")
+        self.assertEqual(item.metadata["matched_lines"], 2)
+        self.assertEqual(item.metadata["discarded_lines"], 2)
+        self.assertIn("inside window", content)
+        self.assertIn("continued detail", content)
+        self.assertNotIn("outside before", content)
+        self.assertNotIn("outside after", content)
+
     def test_slow_log_disabled_returns_not_available(self) -> None:
         fake_mysql = FakeMySQLClient(_log_variables(slow_enabled=False))
         request = _live_request(with_ssh=True)
@@ -508,6 +593,7 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
         self.assertFalse(is_mysql_sql_allowed("DROP TABLE users"))
         self.assertFalse(is_mysql_sql_allowed("SET GLOBAL read_only=0"))
         self.assertTrue(is_ssh_command_allowed("tail -n 5000 -- /var/log/mysql/error.log"))
+        self.assertTrue(is_ssh_command_allowed("tail -c 52428800 -- /var/log/mysql/error.log"))
         self.assertFalse(is_ssh_command_allowed("rm -rf /var/log/mysql/error.log"))
         self.assertFalse(is_ssh_command_allowed("systemctl restart mysqld"))
 
@@ -675,6 +761,9 @@ class FakeSSHClient:
     def tail(self, path: str, lines: int) -> str:
         return self.results.get(("tail", lines, path), "")
 
+    def tail_bytes(self, path: str, max_bytes: int) -> str:
+        return self.results.get(("tail_bytes", max_bytes, path), "")
+
 
 class RevisionAnalyzerRuntime:
     def __init__(self, *, first_payload: dict, second_payload: dict) -> None:
@@ -733,7 +822,16 @@ def _live_request(*, with_ssh: bool = False):
                 "allow_ssh": with_ssh,
                 "allow_metrics_query": False,
             },
-            "event": {"event_time": "2026-05-08T17:00:00+08:00"},
+            "event": {
+                "event_time": "2026-05-08T17:00:00+08:00",
+                "time_window": {
+                    "start": "2026-05-08T11:00:00+08:00",
+                    "end": "2026-05-08T18:00:00+08:00",
+                    "before": "6h",
+                    "after": "1h",
+                    "source": "skill_default_from_event_time",
+                },
+            },
             "missing_fields": [],
         },
         phase="phase-02.1",
