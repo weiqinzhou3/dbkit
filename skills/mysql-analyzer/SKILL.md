@@ -279,6 +279,23 @@ Each finding must include:
 - `missing_evidence`
 - `recommended_next_checks`
 
+`Finding.category` must be exactly one of:
+
+- `connection`
+- `availability`
+- `performance`
+- `high_cpu`
+- `lock_contention`
+- `slow_query`
+- `configuration`
+- `resource_pressure`
+- `log_signal`
+- `service_state`
+- `unknown`
+
+Do not output aliases such as `connectivity`, `connection_issue`,
+`mysql_unreachable`, `cpu_spike`, `lock_wait`, or `slow_queries`.
+
 Do not produce final verdict directly; output FindingsDraft for Validation Agent.
 
 ## Validation Handoff

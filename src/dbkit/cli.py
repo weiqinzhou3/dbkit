@@ -248,6 +248,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_collection_artifact(evidence_result)
         return 1
 
+    if _stop_after_phase(result.normalized_request) == "phase-02.1":
+        print(f"phase={evidence_result.phase}")
+        print(f"status={evidence_result.status}")
+        _print_collection_summary(evidence_result, result.normalized_request.input_mode)
+        _print_collection_artifact(evidence_result)
+        return 0 if evidence_result.status in {
+            "raw_evidence_collected",
+            "collection_completed_with_warnings",
+        } else 1
+
     if not index_artifacts:
         print(f"phase={evidence_result.phase}")
         print("status=blocked")
@@ -323,6 +333,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     if structuring_result.status != "evidence_bundle_created":
         return 1
 
+    if structuring_result.request_id != evidence_result.request_id:
+        collection_telemetry.emit(
+            event_type="artifact_lineage_checked",
+            stage="lineage",
+            message="EvidenceBundle request_id does not match RawEvidence index request_id",
+            attributes={
+                "request_id": evidence_result.request_id,
+                "raw_evidence_index": str(raw_evidence_index_path),
+                "evidence_bundle_artifact": str(structuring_result.bundle_artifact.path)
+                if structuring_result.bundle_artifact is not None
+                else None,
+                "lineage_check_status": "failed",
+                "reason": "artifact_lineage_mismatch",
+            },
+        )
+        artifact_store.persist_evidence_processing_telemetry(
+            evidence_result.request_id, collection_telemetry.events
+        )
+        print("phase=phase-03")
+        print("status=blocked")
+        print("reason=artifact_lineage_mismatch")
+        print(f"raw_evidence_artifact={raw_evidence_index_path}")
+        if structuring_result.bundle_artifact is not None:
+            print(f"evidence_bundle_artifact={structuring_result.bundle_artifact.path}")
+        return 1
+
+    if _stop_after_phase(result.normalized_request) == "phase-03":
+        return 0
+
     if structuring_result.bundle_artifact is None:
         print("phase=phase-04")
         print("status=blocked")
@@ -337,7 +376,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             _validation_skill(config.runtime.skills_dir)
         ),
         repo_dir=config.runtime.repo_dir,
-    ).run(structuring_result.bundle_artifact.path)
+    ).run(
+        structuring_result.bundle_artifact.path,
+        expected_request_id=evidence_result.request_id,
+    )
     _print_phase04_result(phase04_result)
     return 0 if phase04_result.status in {
         "analysis_completed",
@@ -452,6 +494,13 @@ def _print_phase04_result(result) -> None:
             print(f"analysis_telemetry={artifact.path}")
     if result.blocking_issues:
         print(f"blocking_issues={';'.join(result.blocking_issues)}")
+
+
+def _stop_after_phase(normalized_request) -> str | None:
+    value = (normalized_request.metadata or {}).get("stop_after_phase")
+    if value in {"phase-02.1", "phase-03"}:
+        return str(value)
+    return None
 
 
 def _read_supplement(rendered_user_message: str) -> str:

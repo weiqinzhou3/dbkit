@@ -49,6 +49,7 @@ def normalize_request(
         evidence_plan = _evidence_plan(llm_json.get("evidence_plan"))
         normalizer = "llm_intake_plus_normalize_request"
         llm_metadata = _optional_mapping(llm_json.get("metadata")) or {}
+        execution_boundary = _execution_boundary(llm_json, llm_metadata)
     else:
         target_domain = "mysql" if "mysql" in text.lower() else "mysql"
         target_agent = "mysql_analyzer"
@@ -63,6 +64,7 @@ def normalize_request(
         evidence_plan = _evidence_plan(None)
         normalizer = "deterministic_fallback"
         llm_metadata = {}
+        execution_boundary = {}
 
     missing_fields = _detect_missing_fields(
         input_mode=input_mode,
@@ -79,6 +81,7 @@ def normalize_request(
         "normalizer": normalizer,
         "skill": "skills/intake/SKILL.md",
         **llm_metadata,
+        **execution_boundary,
     }
     if llm_intake_failed:
         metadata["llm_intake_failed"] = True
@@ -322,6 +325,36 @@ def _evidence_plan(value: object) -> dict[str, Any]:
             "missing_evidence": list(value.get("missing_evidence") or []),
         }
     return {"required_evidence": [], "provided_evidence": [], "missing_evidence": []}
+
+
+def _execution_boundary(
+    llm_json: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, str]:
+    execution_goal = str(
+        llm_json.get("execution_goal")
+        or metadata.get("execution_goal")
+        or ""
+    ).strip()
+    stop_after_phase = str(
+        llm_json.get("stop_after_phase")
+        or metadata.get("stop_after_phase")
+        or ""
+    ).strip()
+    if execution_goal not in {
+        "evidence_collection_only",
+        "evidence_bundle_only",
+        "analysis_verdict",
+    }:
+        execution_goal = ""
+    if stop_after_phase not in {"phase-02.1", "phase-03", "phase-04"}:
+        stop_after_phase = ""
+    result: dict[str, str] = {}
+    if execution_goal:
+        result["execution_goal"] = execution_goal
+    if stop_after_phase:
+        result["stop_after_phase"] = stop_after_phase
+    return result
 
 
 def _missing_from_llm(llm_json: dict[str, Any] | None) -> tuple[str, ...]:

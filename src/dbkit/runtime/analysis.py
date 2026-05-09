@@ -14,6 +14,7 @@ from dbkit.schemas.analysis import (
     Phase04AnalysisResult,
     evidence_id_set,
     finding_by_id,
+    normalize_findings_categories,
     validate_evidence_bundle_payload,
     validate_findings_draft,
     validate_validation_result,
@@ -36,23 +37,18 @@ class Phase04AnalysisPipeline:
         self.validation_runtime = validation_runtime
         self.repo_dir = repo_dir or Path.cwd()
 
-    def run(self, evidence_bundle_path: str | Path) -> Phase04AnalysisResult:
+    def run(
+        self,
+        evidence_bundle_path: str | Path,
+        *,
+        expected_request_id: str | None = None,
+    ) -> Phase04AnalysisResult:
         started_ns = perf_counter_ns()
         bundle_path = Path(evidence_bundle_path)
         request_id = "unknown"
         artifacts: list[Any] = []
-        self._emit(
-            "phase04_started",
-            "Phase-04 findings, validation, verdict, and summary started",
-            request_id=request_id,
-            input_evidence_bundle=str(bundle_path),
-            status="started",
-        )
-
         try:
-            evidence_bundle = validate_evidence_bundle_payload(
-                json.loads(bundle_path.read_text(encoding="utf-8"))
-            )
+            loaded_bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             return self._failed(
                 request_id=request_id,
@@ -60,9 +56,61 @@ class Phase04AnalysisPipeline:
                 issues=(f"evidence_bundle_load_failed: {exc}",),
                 started_ns=started_ns,
             )
+        if not isinstance(loaded_bundle, dict) or not loaded_bundle.get("request_id"):
+            return self._failed(
+                request_id=expected_request_id or "unknown",
+                artifacts=artifacts,
+                issues=("request_id_missing",),
+                started_ns=started_ns,
+            )
+        try:
+            evidence_bundle = validate_evidence_bundle_payload(loaded_bundle)
+        except ValueError as exc:
+            return self._failed(
+                request_id=expected_request_id or str(loaded_bundle.get("request_id")),
+                artifacts=artifacts,
+                issues=(f"evidence_bundle_load_failed: {exc}",),
+                started_ns=started_ns,
+            )
 
         request_id = str(evidence_bundle["request_id"])
         input_bundle_ref = _artifact_ref(bundle_path, self.repo_dir)
+        self._emit(
+            "phase04_started",
+            "Phase-04 findings, validation, verdict, and summary started",
+            request_id=expected_request_id or request_id,
+            input_evidence_bundle=input_bundle_ref,
+            status="started",
+        )
+        lineage_issue = _lineage_issue(
+            expected_request_id=expected_request_id,
+            evidence_bundle=evidence_bundle,
+            input_bundle_ref=input_bundle_ref,
+        )
+        if lineage_issue is not None:
+            self._emit(
+                "artifact_lineage_checked",
+                "Artifact lineage check failed",
+                request_id=expected_request_id or request_id,
+                input_evidence_bundle=input_bundle_ref,
+                lineage_check_status="failed",
+                reason=lineage_issue,
+                status="blocked",
+            )
+            return self._failed(
+                request_id=expected_request_id or request_id,
+                artifacts=artifacts,
+                issues=("artifact_lineage_mismatch",),
+                started_ns=started_ns,
+            )
+        self._emit(
+            "artifact_lineage_checked",
+            "Artifact lineage check passed",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            lineage_check_status="passed",
+            status="completed",
+        )
         self._emit(
             "evidence_bundle_loaded",
             "EvidenceBundle loaded",
@@ -83,13 +131,16 @@ class Phase04AnalysisPipeline:
                 issues=("findings_generation_parse_failed",),
                 started_ns=started_ns,
             )
-        try:
-            findings_draft = validate_findings_draft(findings_payload, evidence_bundle)
-        except ValueError as exc:
+        findings_draft, findings_error = self._prepare_findings_draft(
+            findings_payload=findings_payload,
+            evidence_bundle=evidence_bundle,
+            input_bundle_ref=input_bundle_ref,
+        )
+        if findings_draft is None:
             return self._failed(
                 request_id=request_id,
                 artifacts=artifacts,
-                issues=(f"findings_draft_invalid: {exc}",),
+                issues=(f"findings_draft_invalid: {findings_error}",),
                 started_ns=started_ns,
             )
 
@@ -225,6 +276,7 @@ class Phase04AnalysisPipeline:
         *,
         evidence_bundle: dict[str, Any],
         input_bundle_ref: str,
+        retry_context: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         request_id = str(evidence_bundle["request_id"])
         self._emit(
@@ -240,12 +292,21 @@ class Phase04AnalysisPipeline:
                 "mode": "findings_generation",
                 "input_evidence_bundle": input_bundle_ref,
                 "evidence_bundle": evidence_bundle,
+                "retry_context": retry_context or {},
                 "messages": [
                     {
                         "role": "user",
                         "content": (
                             "Output only DBKit FindingsDraft JSON. Consume the "
                             "EvidenceBundle only; do not read RawEvidence.\n\n"
+                            + (
+                                "Previous FindingsDraft was invalid. Fix these issues:\n"
+                                + json.dumps(retry_context, ensure_ascii=False, sort_keys=True)
+                                + "\n\n"
+                                if retry_context
+                                else ""
+                            )
+                            +
                             "EvidenceBundle JSON:\n"
                             + json.dumps(evidence_bundle, ensure_ascii=False, sort_keys=True)
                         ),
@@ -263,6 +324,99 @@ class Phase04AnalysisPipeline:
             status="completed" if parsed is not None else "failed",
         )
         return parsed
+
+    def _prepare_findings_draft(
+        self,
+        *,
+        findings_payload: dict[str, Any],
+        evidence_bundle: dict[str, Any],
+        input_bundle_ref: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        normalized_payload, category_events, invalid_categories = normalize_findings_categories(
+            findings_payload
+        )
+        self._emit_category_events(
+            request_id=str(evidence_bundle["request_id"]),
+            category_events=category_events,
+            invalid_categories=invalid_categories,
+        )
+        if invalid_categories:
+            retry_context = {
+                "reason": "invalid_finding_category",
+                "invalid_categories": list(invalid_categories),
+                "allowed_categories": [
+                    "connection",
+                    "availability",
+                    "performance",
+                    "high_cpu",
+                    "lock_contention",
+                    "slow_query",
+                    "configuration",
+                    "resource_pressure",
+                    "log_signal",
+                    "service_state",
+                    "unknown",
+                ],
+            }
+            self._emit(
+                "findings_generation_retry_requested",
+                "Findings generation retry requested by category validation",
+                request_id=str(evidence_bundle["request_id"]),
+                input_evidence_bundle=input_bundle_ref,
+                category_validation_status="retry_requested",
+                invalid_categories=list(invalid_categories),
+                status="retry_requested",
+            )
+            retry_payload = self._invoke_findings_generation(
+                evidence_bundle=evidence_bundle,
+                input_bundle_ref=input_bundle_ref,
+                retry_context=retry_context,
+            )
+            if retry_payload is None:
+                return None, "retry_parse_failed"
+            normalized_payload, category_events, invalid_categories = normalize_findings_categories(
+                retry_payload
+            )
+            self._emit_category_events(
+                request_id=str(evidence_bundle["request_id"]),
+                category_events=category_events,
+                invalid_categories=invalid_categories,
+            )
+            if invalid_categories:
+                return None, f"Finding.category is invalid: {','.join(invalid_categories)}"
+        try:
+            return validate_findings_draft(normalized_payload, evidence_bundle), None
+        except ValueError as exc:
+            return None, str(exc)
+
+    def _emit_category_events(
+        self,
+        *,
+        request_id: str,
+        category_events: tuple[dict[str, str], ...],
+        invalid_categories: tuple[str, ...],
+    ) -> None:
+        for event in category_events:
+            self._emit(
+                "finding_category_normalized",
+                "Finding category alias normalized",
+                request_id=request_id,
+                finding_id=event["finding_id"],
+                original_category=event["original_category"],
+                normalized_category=event["normalized_category"],
+                category_validation_status="normalized",
+                status="completed",
+            )
+        for category in invalid_categories:
+            self._emit(
+                "finding_category_invalid",
+                "Finding category failed validation",
+                request_id=request_id,
+                original_category=category,
+                normalized_category=category,
+                category_validation_status="invalid",
+                status="failed",
+            )
 
     def _invoke_validation(
         self,
@@ -542,6 +696,25 @@ class Phase04AnalysisPipeline:
 
 def _artifact_ref(path: str | Path, repo_dir: Path) -> str:
     return to_repo_relative_path(Path(path), repo_dir=repo_dir)
+
+
+def _lineage_issue(
+    *,
+    expected_request_id: str | None,
+    evidence_bundle: dict[str, Any],
+    input_bundle_ref: str,
+) -> str | None:
+    request_id = str(evidence_bundle.get("request_id") or "")
+    if not request_id:
+        return "request_id_missing"
+    if expected_request_id is not None and request_id != expected_request_id:
+        return "artifact_lineage_mismatch"
+    if input_bundle_ref and not input_bundle_ref.endswith(f"{request_id}.evidence-bundle.json"):
+        return "artifact_lineage_mismatch"
+    raw_index = str(evidence_bundle.get("input_raw_evidence_index") or "")
+    if raw_index and not raw_index.endswith(f"{request_id}.raw-evidence-index.json"):
+        return "artifact_lineage_mismatch"
+    return None
 
 
 def _duration_ms(started_ns: int) -> int:

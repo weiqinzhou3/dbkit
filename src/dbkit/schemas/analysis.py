@@ -19,6 +19,17 @@ ALLOWED_FINDING_CATEGORIES = frozenset(
         "unknown",
     }
 )
+FINDING_CATEGORY_ALIASES = {
+    "connectivity": "connection",
+    "connection_issue": "connection",
+    "connection_refused": "connection",
+    "mysql_unreachable": "availability",
+    "service_down": "service_state",
+    "mysqld_down": "service_state",
+    "cpu_spike": "high_cpu",
+    "lock_wait": "lock_contention",
+    "slow_queries": "slow_query",
+}
 ALLOWED_SEVERITIES = ("critical", "high", "medium", "low", "info")
 ALLOWED_VALIDATION_STATUSES = frozenset(
     {"passed", "downgraded", "blocked", "requires_human_review"}
@@ -80,6 +91,36 @@ def validate_findings_draft(payload: dict[str, Any], evidence_bundle: dict[str, 
     payload.setdefault("insufficient_evidence", [])
     payload.setdefault("metadata", {})
     return payload
+
+
+def normalize_findings_categories(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], tuple[dict[str, str], ...], tuple[str, ...]]:
+    result = dict(payload)
+    findings = []
+    normalized_events: list[dict[str, str]] = []
+    invalid_categories: list[str] = []
+    for finding in payload.get("findings") or []:
+        if not isinstance(finding, dict):
+            findings.append(finding)
+            continue
+        copied = dict(finding)
+        original = str(copied.get("category") or "")
+        normalized = FINDING_CATEGORY_ALIASES.get(original, original)
+        if normalized != original:
+            copied["category"] = normalized
+            normalized_events.append(
+                {
+                    "finding_id": str(copied.get("finding_id") or ""),
+                    "original_category": original,
+                    "normalized_category": normalized,
+                }
+            )
+        if normalized not in ALLOWED_FINDING_CATEGORIES:
+            invalid_categories.append(normalized)
+        findings.append(copied)
+    result["findings"] = findings
+    return result, tuple(normalized_events), tuple(invalid_categories)
 
 
 def validate_validation_result(payload: dict[str, Any], findings_draft: dict[str, Any]) -> dict[str, Any]:

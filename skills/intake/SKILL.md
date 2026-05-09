@@ -378,6 +378,44 @@ For `provided_evidence`, all collection permissions must be false.
 
 For `hybrid`, set only the allowed supplement methods to true.
 
+## Execution Boundary
+
+Classify explicit user limits on how far the current workflow may run.
+
+If the user says only to do evidence planning, only raw evidence collection,
+only collect evidence, current stage only collection, or explicitly says not to
+do root-cause analysis, output:
+
+```json
+{
+  "execution_goal": "evidence_collection_only",
+  "stop_after_phase": "phase-02.1"
+}
+```
+
+If the user says only to clean or structure evidence, only generate
+EvidenceBundle, or not to do final analysis, output:
+
+```json
+{
+  "execution_goal": "evidence_bundle_only",
+  "stop_after_phase": "phase-03"
+}
+```
+
+If the user asks to analyze the reason, determine the incident, output
+conclusion, output summary, output verdict, or does not explicitly forbid
+root-cause or final analysis, output:
+
+```json
+{
+  "execution_goal": "analysis_verdict",
+  "stop_after_phase": "phase-04"
+}
+```
+
+Do not hide these fields in prose. Put them in the JSON output.
+
 ## Alert Parsing
 
 If the user describes an alert, populate `event.alerts`.
