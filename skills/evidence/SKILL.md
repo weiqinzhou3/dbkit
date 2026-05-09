@@ -23,6 +23,16 @@ evidence processing tool with the RawEvidence index path. That tool performs
 the allowed deterministic loading, parsing, filtering, aggregation,
 deduplication, raw reference validation, and bundle persistence work.
 
+Use the `raw_evidence_index` path provided by runtime exactly as given. Do not
+prepend `/` to relative artifact paths. If runtime provides a repository
+artifact path, it must be a DeepAgents virtual path under `/repo/`, for example
+`/repo/.dbkit/artifacts/<request_id>.raw-evidence-index.json`.
+
+When you inspect `payload.content_ref`, do not turn
+`.dbkit/artifacts/raw/<raw_evidence_id>.json` into
+`/.dbkit/artifacts/raw/<raw_evidence_id>.json`. Repository artifact
+`content_ref` values are read through `/repo/.dbkit/...` virtual paths.
+
 Runtime registers, wires, validates, persists artifacts, emits telemetry, and enforces guardrails. Runtime is not the semantic owner of evidence structuring.
 
 You may select evidence processing tools. You must not call live collection tools. You must not request additional collection.

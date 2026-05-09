@@ -13,7 +13,6 @@ class MainEntrypointTest(unittest.TestCase):
         import main
 
         output = io.StringIO()
-
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.yaml"
             config_path.write_text(
@@ -51,7 +50,6 @@ class MainEntrypointTest(unittest.TestCase):
         from dbkit.schemas.runtime import ArtifactRecord, NormalizedRequest, RouteDecision, RuntimeResult
 
         output = io.StringIO()
-
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             artifact_path = root / "failed.json"
@@ -264,7 +262,6 @@ class MainEntrypointTest(unittest.TestCase):
         from dbkit.schemas.runtime import ArtifactRecord, NormalizedRequest, RouteDecision, RuntimeResult
 
         output = io.StringIO()
-
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             artifact_path = root / "collection-blocked.json"
@@ -377,6 +374,7 @@ class MainEntrypointTest(unittest.TestCase):
         from dbkit.schemas.runtime import ArtifactRecord, NormalizedRequest, RouteDecision, RuntimeResult
 
         output = io.StringIO()
+        case = self
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -453,8 +451,17 @@ class MainEntrypointTest(unittest.TestCase):
                     self.calls.append(payload)
                     if payload.get("mode") != "evidence_structuring_delegation":
                         return {"messages": [{"role": "assistant", "content": "{}"}]}
+                    case.assertEqual(
+                        payload["raw_evidence_index"],
+                        "/repo/.dbkit/artifacts/req_cli_phase03.raw-evidence-index.json",
+                    )
+                    case.assertFalse(payload["raw_evidence_index"].startswith("/.dbkit/"))
+                    case.assertIn(
+                        "/repo/.dbkit/artifacts/req_cli_phase03.raw-evidence-index.json",
+                        payload["messages"][0]["content"],
+                    )
                     self.evidence_structuring_tools[0].invoke(
-                        {"raw_evidence_index": str(index_path)}
+                        {"raw_evidence_index": payload["raw_evidence_index"]}
                     )
                     return {
                         "messages": [
@@ -509,7 +516,7 @@ class MainEntrypointTest(unittest.TestCase):
                 agent=AgentConfig(),
                 runtime=RuntimeConfig(
                     artifact_dir=artifact_root,
-                    repo_dir=Path("."),
+                    repo_dir=root,
                     workspace_dir=root / "workspace",
                     skills_dir=Path("skills"),
                     agents_dir=Path("agents"),
@@ -546,6 +553,20 @@ class MainEntrypointTest(unittest.TestCase):
         self.assertIn("evidence_structuring_model_call_started", event_types)
         self.assertIn("evidence_subagent_invocation_completed", event_types)
         self.assertIn("evidence_bundle_created", event_types)
+        delegation_event = [
+            event for event in events
+            if event["event_type"] == "evidence_subagent_delegation_started"
+        ][0]
+        delegation_attrs = delegation_event["attributes"]
+        self.assertEqual(
+            delegation_attrs["raw_evidence_index_repo_relative"],
+            ".dbkit/artifacts/req_cli_phase03.raw-evidence-index.json",
+        )
+        self.assertEqual(
+            delegation_attrs["raw_evidence_index_virtual_path"],
+            "/repo/.dbkit/artifacts/req_cli_phase03.raw-evidence-index.json",
+        )
+        self.assertEqual(delegation_attrs["filesystem_root"], "/repo")
         for event in events:
             if event["event_type"].startswith("evidence_"):
                 attrs = event.get("attributes") or {}

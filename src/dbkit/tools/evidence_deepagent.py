@@ -8,6 +8,7 @@ from typing import Any
 from langchain_core.tools import StructuredTool
 
 from dbkit.agents.evidence_structuring import EvidenceStructuringSubagentRegistration
+from dbkit.runtime.artifact_paths import to_host_path
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.evidence_structuring import EvidenceStructuringPipeline
 from dbkit.runtime.observability import TelemetryRecorder
@@ -20,14 +21,16 @@ def create_evidence_structuring_tools(
     telemetry: TelemetryRecorder,
     subagent_registration: EvidenceStructuringSubagentRegistration,
     result_sink: Callable[[EvidenceStructuringResult], None],
+    repo_dir: Path,
 ) -> tuple[Any, ...]:
     def build_evidence_bundle(raw_evidence_index: str) -> str:
         """Build an EvidenceBundle from a DBKit RawEvidence index artifact."""
+        host_index_path = to_host_path(raw_evidence_index, repo_dir=repo_dir)
         result = EvidenceStructuringPipeline(
             artifact_store=artifact_store,
             telemetry=telemetry,
             subagent_registration=subagent_registration,
-        ).run(Path(raw_evidence_index))
+        ).run(host_index_path)
         result_sink(result)
         payload = {
             "status": result.status,

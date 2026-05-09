@@ -1120,6 +1120,18 @@ mysql_analyzer delegation prompt
   -> build_evidence_bundle evidence processing tool
 ```
 
+Artifact paths passed to DeepAgents subagents must use DBKit virtual filesystem
+paths:
+
+```text
+host_path: /Users/.../dbkit/.dbkit/artifacts/<request_id>.raw-evidence-index.json
+repo_relative_path: .dbkit/artifacts/<request_id>.raw-evidence-index.json
+deepagents_virtual_path: /repo/.dbkit/artifacts/<request_id>.raw-evidence-index.json
+```
+
+Runtime must pass `/repo/.dbkit/...` paths to the subagent. It must never pass
+`/.dbkit/...`.
+
 ## 22.2 Replay Phase-03 from Existing RawEvidence
 
 Phase-03 must also support a repeatable replay entrypoint from an existing raw

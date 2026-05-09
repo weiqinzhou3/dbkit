@@ -8,6 +8,10 @@ from dbkit.agents.evidence_structuring import EvidenceStructuringSubagentRegistr
 from dbkit.agents.mysql_analyzer import MySQLAnalyzerAgent
 from dbkit.config import DEFAULT_CONFIG_PATH, load_app_config
 from dbkit.model_provider import build_agent_model
+from dbkit.runtime.artifact_paths import (
+    to_deepagents_repo_virtual_path,
+    to_repo_relative_path,
+)
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.deepagents_runtime import DeepAgentsRuntimeFactory
 from dbkit.runtime.evidence_delegation import EvidenceStructuringDelegator
@@ -146,6 +150,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         telemetry=collection_telemetry,
         subagent_registration=subagent_registration,
         result_sink=evidence_structuring_results.append,
+        repo_dir=config.runtime.repo_dir,
     )
     analyzer_runtime = runtime_factory.create_mysql_analyzer_runtime(
         mysql_analyzer.skill_text,
@@ -211,6 +216,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     raw_evidence_index_path = index_artifacts[0].path
+    raw_evidence_index_repo_relative = to_repo_relative_path(
+        raw_evidence_index_path,
+        repo_dir=config.runtime.repo_dir,
+    )
+    raw_evidence_index_virtual_path = to_deepagents_repo_virtual_path(
+        raw_evidence_index_path,
+        repo_dir=config.runtime.repo_dir,
+    )
     collection_telemetry.emit(
         event_type="evidence_subagent_delegation_started",
         stage="evidence_structuring",
@@ -219,13 +232,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             "request_id": evidence_result.request_id,
             "parent_agent": "mysql_analyzer",
             "subagent": "evidence_structuring",
-            "raw_evidence_index": str(raw_evidence_index_path),
+            "raw_evidence_index": raw_evidence_index_virtual_path,
+            "raw_evidence_index_repo_relative": raw_evidence_index_repo_relative,
+            "raw_evidence_index_virtual_path": raw_evidence_index_virtual_path,
+            "artifact_root": str(artifact_root),
+            "filesystem_root": "/repo",
             "status": "started",
         },
     )
     structuring_result = EvidenceStructuringDelegator(
         mysql_analyzer_runtime=analyzer_runtime,
         telemetry=collection_telemetry,
+        repo_dir=config.runtime.repo_dir,
+        artifact_root=artifact_root,
     ).run(
         request_id=evidence_result.request_id,
         raw_evidence_index=raw_evidence_index_path,

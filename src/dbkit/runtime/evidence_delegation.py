@@ -4,6 +4,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from dbkit.runtime.artifact_paths import (
+    to_deepagents_repo_virtual_path,
+    to_repo_relative_path,
+)
 from dbkit.runtime.observability import TelemetryRecorder
 from dbkit.schemas.evidence import EvidenceStructuringResult
 
@@ -14,9 +18,13 @@ class EvidenceStructuringDelegator:
         *,
         mysql_analyzer_runtime: Any,
         telemetry: TelemetryRecorder,
+        repo_dir: Path,
+        artifact_root: Path,
     ) -> None:
         self.mysql_analyzer_runtime = mysql_analyzer_runtime
         self.telemetry = telemetry
+        self.repo_dir = repo_dir
+        self.artifact_root = artifact_root
 
     def run(
         self,
@@ -26,11 +34,17 @@ class EvidenceStructuringDelegator:
         result_sink: list[EvidenceStructuringResult],
     ) -> EvidenceStructuringResult | None:
         index_path = Path(raw_evidence_index)
+        repo_relative_path = to_repo_relative_path(index_path, repo_dir=self.repo_dir)
+        virtual_path = to_deepagents_repo_virtual_path(index_path, repo_dir=self.repo_dir)
         base_attrs = {
             "request_id": request_id,
             "parent_agent": "mysql_analyzer",
             "subagent": "evidence_structuring",
-            "raw_evidence_index": str(index_path),
+            "raw_evidence_index": virtual_path,
+            "raw_evidence_index_repo_relative": repo_relative_path,
+            "raw_evidence_index_virtual_path": virtual_path,
+            "artifact_root": str(self.artifact_root),
+            "filesystem_root": "/repo",
         }
         self.telemetry.emit(
             event_type="mysql_analyzer_delegates_evidence_structuring_started",
@@ -58,11 +72,14 @@ class EvidenceStructuringDelegator:
         invoke(
             {
                 "mode": "evidence_structuring_delegation",
-                "raw_evidence_index": str(index_path),
+                "raw_evidence_index": virtual_path,
                 "messages": [
                     {
                         "role": "user",
-                        "content": _delegation_prompt(index_path),
+                        "content": _delegation_prompt(
+                            raw_evidence_index_repo_relative=repo_relative_path,
+                            raw_evidence_index_virtual_path=virtual_path,
+                        ),
                     }
                 ],
             }
@@ -99,12 +116,18 @@ class EvidenceStructuringDelegator:
         return None
 
 
-def _delegation_prompt(raw_evidence_index: Path) -> str:
+def _delegation_prompt(
+    *,
+    raw_evidence_index_repo_relative: str,
+    raw_evidence_index_virtual_path: str,
+) -> str:
     context = {
         "mode": "evidence_structuring_delegation",
         "parent_agent": "mysql_analyzer",
         "subagent": "evidence_structuring",
-        "raw_evidence_index": str(raw_evidence_index),
+        "raw_evidence_index_repo_relative": raw_evidence_index_repo_relative,
+        "raw_evidence_index_virtual_path": raw_evidence_index_virtual_path,
+        "filesystem_root": "/repo",
         "expected_output": {
             "status": "evidence_bundle_created",
             "subagent": "evidence_structuring",
@@ -119,8 +142,11 @@ def _delegation_prompt(raw_evidence_index: Path) -> str:
         "The task description for evidence_structuring must include:\n"
         "- You are the Evidence Structuring Subagent for mysql_analyzer.\n"
         "- Transform RawEvidence into EvidenceBundle.\n"
-        "- Use content_ref to read full raw artifacts.\n"
-        "- Call the build_evidence_bundle tool with the raw_evidence_index path.\n"
+        "- Use the raw_evidence_index_virtual_path exactly as provided.\n"
+        "- Do not prepend '/' to repo-relative artifact paths.\n"
+        "- Repository artifacts must use /repo/.dbkit/... paths for read_file.\n"
+        "- If payload.content_ref is .dbkit/artifacts/raw/<id>.json, read it as /repo/.dbkit/artifacts/raw/<id>.json.\n"
+        "- Call the build_evidence_bundle tool with the raw_evidence_index_virtual_path path.\n"
         "- Do not call live collectors.\n"
         "- Do not request additional collection.\n"
         "- Do not generate findings, root cause, verdict, final summary, or recommendations.\n\n"
