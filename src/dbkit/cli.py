@@ -12,6 +12,7 @@ from dbkit.runtime.artifact_paths import (
     to_deepagents_repo_virtual_path,
     to_repo_relative_path,
 )
+from dbkit.runtime.analysis import Phase04AnalysisPipeline
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.deepagents_runtime import DeepAgentsRuntimeFactory
 from dbkit.runtime.evidence_delegation import EvidenceStructuringDelegator
@@ -31,8 +32,48 @@ def main(argv: Sequence[str] | None = None) -> int:
     if any(arg in {"--help", "-h"} for arg in args):
         _print_help()
         return 0
-    config_path, interactive_flag, raw_evidence_index_path, prompt_args = _parse_args(args)
+    (
+        config_path,
+        interactive_flag,
+        raw_evidence_index_path,
+        evidence_bundle_path,
+        prompt_args,
+    ) = _parse_args(args)
     config = load_app_config(config_path)
+    if evidence_bundle_path is not None:
+        artifact_store = ArtifactStore(config.runtime.artifact_dir)
+        model = build_agent_model(config.model, config.agent)
+        runtime_factory = DeepAgentsRuntimeFactory(
+            model=model,
+            tools_enabled=False,
+            repo_dir=config.runtime.repo_dir,
+            workspace_dir=config.runtime.workspace_dir,
+            skills_dir=config.runtime.skills_dir,
+            agents_dir=config.runtime.agents_dir,
+        )
+        mysql_analyzer = MySQLAnalyzerAgent.from_skills_dir(
+            config.runtime.skills_dir,
+            agents_dir=config.runtime.agents_dir,
+        )
+        validation_skill = _validation_skill(config.runtime.skills_dir)
+        phase04_result = Phase04AnalysisPipeline(
+            artifact_store=artifact_store,
+            telemetry=TelemetryRecorder(),
+            mysql_analyzer_runtime=runtime_factory.create_mysql_analyzer_runtime(
+                mysql_analyzer.skill_text
+            ),
+            validation_runtime=runtime_factory.create_validation_runtime(validation_skill),
+            repo_dir=config.runtime.repo_dir,
+        ).run(evidence_bundle_path)
+        print(f"DBKit {__version__}")
+        print("mode=replay")
+        _print_phase04_result(phase04_result)
+        return 0 if phase04_result.status in {
+            "analysis_completed",
+            "analysis_completed_with_warnings",
+            "human_review_required",
+        } else 1
+
     if raw_evidence_index_path is not None:
         result = EvidenceStructuringPipeline(
             artifact_store=ArtifactStore(config.runtime.artifact_dir),
@@ -281,7 +322,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"blocking_issues={';'.join(structuring_result.blocking_issues)}")
     if structuring_result.status != "evidence_bundle_created":
         return 1
-    return 0
+
+    if structuring_result.bundle_artifact is None:
+        print("phase=phase-04")
+        print("status=blocked")
+        print("reason=evidence_bundle_artifact_missing")
+        return 1
+
+    phase04_result = Phase04AnalysisPipeline(
+        artifact_store=artifact_store,
+        telemetry=TelemetryRecorder(),
+        mysql_analyzer_runtime=analyzer_runtime,
+        validation_runtime=runtime_factory.create_validation_runtime(
+            _validation_skill(config.runtime.skills_dir)
+        ),
+        repo_dir=config.runtime.repo_dir,
+    ).run(structuring_result.bundle_artifact.path)
+    _print_phase04_result(phase04_result)
+    return 0 if phase04_result.status in {
+        "analysis_completed",
+        "analysis_completed_with_warnings",
+        "human_review_required",
+    } else 1
 
 
 def _collection_summary(raw_evidence) -> dict[str, int]:
@@ -321,10 +383,11 @@ def _print_collection_artifact(evidence_result) -> None:
         print(f"artifact={evidence_result.artifacts[-1].path}")
 
 
-def _parse_args(args: list[str]) -> tuple[Path, bool, Path | None, list[str]]:
+def _parse_args(args: list[str]) -> tuple[Path, bool, Path | None, Path | None, list[str]]:
     config_path = DEFAULT_CONFIG_PATH
     interactive = False
     raw_evidence_index_path: Path | None = None
+    evidence_bundle_path: Path | None = None
     prompt_args: list[str] = []
     index = 0
     while index < len(args):
@@ -342,18 +405,53 @@ def _parse_args(args: list[str]) -> tuple[Path, bool, Path | None, list[str]]:
                 raise ValueError("--from-raw-evidence requires a path")
             raw_evidence_index_path = Path(args[index + 1])
             index += 2
+        elif arg == "--from-evidence-bundle":
+            if index + 1 >= len(args):
+                raise ValueError("--from-evidence-bundle requires a path")
+            evidence_bundle_path = Path(args[index + 1])
+            index += 2
         else:
             prompt_args.extend(args[index:])
             break
-    return config_path, interactive, raw_evidence_index_path, prompt_args
+    return config_path, interactive, raw_evidence_index_path, evidence_bundle_path, prompt_args
 
 
 def _print_help() -> None:
     print(f"DBKit {__version__}")
-    print("usage: python3.11 main.py [--config PATH] [--interactive] [--from-raw-evidence PATH] [PROMPT]")
+    print("usage: python3.11 main.py [--config PATH] [--interactive] [--from-raw-evidence PATH] [--from-evidence-bundle PATH] [PROMPT]")
     print()
-    print("Normal workflow runs Intake -> MySQL evidence planning -> collection -> evidence_structuring.")
+    print("Normal workflow runs Intake -> MySQL evidence planning -> collection -> evidence_structuring -> findings validation verdict.")
     print("--from-raw-evidence replays EvidenceBundle creation from an existing raw evidence index.")
+    print("--from-evidence-bundle replays Phase-04 findings, validation, verdict, and summary from an existing EvidenceBundle.")
+
+
+def _validation_skill(skills_dir: Path) -> str:
+    path = skills_dir / "validation" / "SKILL.md"
+    if not path.exists():
+        raise FileNotFoundError(f"Validation skill not found: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def _print_phase04_result(result) -> None:
+    print(f"phase={result.phase}")
+    print(f"status={result.status}")
+    print("target_agent=mysql_analyzer")
+    if result.verdict is not None:
+        print(f"overall_severity={result.verdict.get('overall_severity')}")
+        print(f"overall_confidence={result.verdict.get('overall_confidence')}")
+    for artifact in result.artifacts:
+        if artifact.kind == "FindingsDraft":
+            print(f"findings_artifact={artifact.path}")
+        elif artifact.kind == "ValidationResult":
+            print(f"validation_artifact={artifact.path}")
+        elif artifact.kind == "Verdict":
+            print(f"verdict_artifact={artifact.path}")
+        elif artifact.kind == "Summary":
+            print(f"summary_artifact={artifact.path}")
+        elif artifact.kind == "AnalysisTelemetry":
+            print(f"analysis_telemetry={artifact.path}")
+    if result.blocking_issues:
+        print(f"blocking_issues={';'.join(result.blocking_issues)}")
 
 
 def _read_supplement(rendered_user_message: str) -> str:

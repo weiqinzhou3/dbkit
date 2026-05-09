@@ -436,6 +436,9 @@ class MainEntrypointTest(unittest.TestCase):
                     )
                     return self.runtime
 
+                def create_validation_runtime(self, _skill_text):
+                    return FakeValidationRuntime()
+
             class FakeAnalyzerRuntime:
                 def __init__(
                     self,
@@ -449,6 +452,29 @@ class MainEntrypointTest(unittest.TestCase):
 
                 def invoke(self, payload):
                     self.calls.append(payload)
+                    if payload.get("mode") == "findings_generation":
+                        return {
+                            "messages": [
+                                {
+                                    "role": "assistant",
+                                    "content": json.dumps(
+                                        {
+                                            "request_id": normalized.request_id,
+                                            "phase": "phase-04",
+                                            "mode": "findings_generation",
+                                            "target_agent": "mysql_analyzer",
+                                            "input_evidence_bundle": ".dbkit/artifacts/req_cli_phase03.evidence-bundle.json",
+                                            "findings": [],
+                                            "insufficient_evidence": [],
+                                            "metadata": {
+                                                "skill": "skills/mysql-analyzer/SKILL.md",
+                                                "runtime_foundation": "DeepAgents SDK",
+                                            },
+                                        }
+                                    ),
+                                }
+                            ]
+                        }
                     if payload.get("mode") != "evidence_structuring_delegation":
                         return {"messages": [{"role": "assistant", "content": "{}"}]}
                     case.assertEqual(
@@ -471,6 +497,33 @@ class MainEntrypointTest(unittest.TestCase):
                                     {
                                         "status": "evidence_bundle_created",
                                         "subagent": "evidence_structuring",
+                                    }
+                                ),
+                            }
+                        ]
+                    }
+
+            class FakeValidationRuntime:
+                def invoke(self, payload):
+                    return {
+                        "messages": [
+                            {
+                                "role": "assistant",
+                                "content": json.dumps(
+                                    {
+                                        "request_id": normalized.request_id,
+                                        "phase": "phase-04",
+                                        "input_findings_artifact": ".dbkit/artifacts/req_cli_phase03.findings-draft.json",
+                                        "input_evidence_bundle": ".dbkit/artifacts/req_cli_phase03.evidence-bundle.json",
+                                        "validated_findings": [],
+                                        "blocked_findings": [],
+                                        "downgraded_findings": [],
+                                        "requires_human_review": False,
+                                        "validation_summary": {
+                                            "passed": 0,
+                                            "blocked": 0,
+                                            "downgraded": 0,
+                                        },
                                     }
                                 ),
                             }

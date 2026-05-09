@@ -100,6 +100,19 @@ class DeepAgentsRuntimeFactory:
                 name="dbkit-evidence-structuring",
             )
 
+    def create_validation_runtime(self, skill_text: str) -> Any:
+        create_deep_agent = self._create_deep_agent or self._load_create_deep_agent()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return create_deep_agent(
+                model=self.model,
+                tools=[],
+                skills=["/skills/validation/"],
+                backend=self._filesystem_backend(),
+                system_prompt=self._system_prompt("validation", skill_text),
+                name="dbkit-validation",
+            )
+
     def _load_create_deep_agent(self) -> Callable[..., Any]:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")

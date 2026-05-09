@@ -221,6 +221,64 @@ class ArtifactStore:
         path.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
         return ArtifactRecord(kind="EvidenceProcessingTelemetry", path=path)
 
+    def persist_findings_draft(
+        self,
+        request_id: str,
+        findings_draft: dict[str, Any],
+    ) -> ArtifactRecord:
+        path = self.root / f"{request_id}.findings-draft.json"
+        path.write_text(
+            json.dumps(findings_draft, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return ArtifactRecord(kind="FindingsDraft", path=path)
+
+    def persist_validation_result(
+        self,
+        request_id: str,
+        validation_result: dict[str, Any],
+    ) -> ArtifactRecord:
+        path = self.root / f"{request_id}.validation-result.json"
+        path.write_text(
+            json.dumps(validation_result, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return ArtifactRecord(kind="ValidationResult", path=path)
+
+    def persist_verdict(
+        self,
+        request_id: str,
+        verdict: dict[str, Any],
+    ) -> ArtifactRecord:
+        path = self.root / f"{request_id}.verdict.json"
+        path.write_text(
+            json.dumps(verdict, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return ArtifactRecord(kind="Verdict", path=path)
+
+    def persist_summary(
+        self,
+        request_id: str,
+        summary: str,
+    ) -> ArtifactRecord:
+        path = self.root / f"{request_id}.summary.md"
+        path.write_text(summary, encoding="utf-8")
+        return ArtifactRecord(kind="Summary", path=path)
+
+    def persist_analysis_telemetry(
+        self,
+        request_id: str,
+        events: list[TelemetryEvent],
+    ) -> ArtifactRecord:
+        path = self.root / f"{request_id}.analysis-telemetry.jsonl"
+        lines = [
+            json.dumps(e.to_dict(), ensure_ascii=False, sort_keys=True)
+            for e in events
+        ]
+        path.write_text("\n".join(lines) + "\n" if lines else "", encoding="utf-8")
+        return ArtifactRecord(kind="AnalysisTelemetry", path=path)
+
 
 def _raw_evidence_index_entry(item: RawEvidence) -> dict[str, Any]:
     payload = {
