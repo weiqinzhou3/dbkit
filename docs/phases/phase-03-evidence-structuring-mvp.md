@@ -1083,8 +1083,9 @@ Telemetry must not include raw secrets or chain-of-thought.
 
 ## 22.1 Normal Phase-03 Workflow
 
-The normal MySQL workflow must automatically delegate to `evidence_structuring`
-after Phase-02.1 RawEvidence collection completes.
+The normal MySQL workflow must ask `mysql_analyzer` to delegate to the
+DeepAgents `evidence_structuring` subagent after Phase-02.1 RawEvidence
+collection completes.
 
 Preferred CLI:
 
@@ -1110,6 +1111,15 @@ artifact=.dbkit/artifacts/<request_id>.evidence-bundle.json
 The command must stop after EvidenceBundle creation in Phase-03. It must not
 generate root cause, findings, verdict, final summary, or recommendations.
 
+The normal workflow must produce a traceable DeepAgents subagent invocation:
+
+```text
+mysql_analyzer delegation prompt
+  -> task(subagent_type=evidence_structuring)
+  -> evidence_structuring system prompt + skills/evidence/SKILL.md
+  -> build_evidence_bundle evidence processing tool
+```
+
 ## 22.2 Replay Phase-03 from Existing RawEvidence
 
 Phase-03 must also support a repeatable replay entrypoint from an existing raw
@@ -1123,6 +1133,8 @@ python3.11 main.py --config config/config.yaml \
 ```
 
 `--from-raw-evidence` is not the normal Phase-03 trigger.
+If replay bypasses DeepAgents subagent invocation for deterministic regression,
+CLI/telemetry must clearly mark replay mode and whether a subagent was invoked.
 
 Expected behavior:
 

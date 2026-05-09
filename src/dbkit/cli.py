@@ -10,6 +10,7 @@ from dbkit.config import DEFAULT_CONFIG_PATH, load_app_config
 from dbkit.model_provider import build_agent_model
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.deepagents_runtime import DeepAgentsRuntimeFactory
+from dbkit.runtime.evidence_delegation import EvidenceStructuringDelegator
 from dbkit.runtime.evidence_pipeline import EvidencePipeline
 from dbkit.runtime.evidence_structuring import EvidenceStructuringPipeline
 from dbkit.runtime.guardrails import Guardrails
@@ -18,6 +19,7 @@ from dbkit.runtime.orchestrator import Orchestrator
 from dbkit.runtime.secret_store import SecretStore
 from dbkit.runtime.time_context import TimeProvider
 from dbkit.tools.collectors import CollectorRegistry
+from dbkit.tools.evidence_deepagent import create_evidence_structuring_tools
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -39,6 +41,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"DBKit {__version__}")
         print(f"phase={result.phase}")
         print(f"status={result.status}")
+        print("mode=replay")
+        print("subagent_invocation=false")
         if result.bundle is not None:
             print(f"subagent={result.bundle.metadata.get('subagent')}")
             print(f"parent_agent={result.bundle.metadata.get('parent_agent')}")
@@ -126,11 +130,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except TypeError:
         mysql_analyzer = MySQLAnalyzerAgent.from_skills_dir(config.runtime.skills_dir)
-    analyzer_runtime = runtime_factory.create_mysql_analyzer_runtime(
-        mysql_analyzer.skill_text
-    )
     collection_telemetry = TelemetryRecorder()
     artifact_store = ArtifactStore(artifact_root)
+    subagents = getattr(mysql_analyzer, "subagents", {}) or {}
+    subagent_registration = subagents.get(
+        "evidence_structuring",
+        EvidenceStructuringSubagentRegistration.from_dirs(
+            skills_dir=config.runtime.skills_dir,
+            agents_dir=config.runtime.agents_dir,
+        ),
+    )
+    evidence_structuring_results = []
+    evidence_structuring_tools = create_evidence_structuring_tools(
+        artifact_store=artifact_store,
+        telemetry=collection_telemetry,
+        subagent_registration=subagent_registration,
+        result_sink=evidence_structuring_results.append,
+    )
+    analyzer_runtime = runtime_factory.create_mysql_analyzer_runtime(
+        mysql_analyzer.skill_text,
+        evidence_structuring_subagent=subagent_registration,
+        evidence_structuring_tools=evidence_structuring_tools,
+    )
     evidence_result = EvidencePipeline(
         artifact_store=artifact_store,
         telemetry=collection_telemetry,
@@ -202,14 +223,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             "status": "started",
         },
     )
-    structuring_result = EvidenceStructuringPipeline(
-        artifact_store=artifact_store,
+    structuring_result = EvidenceStructuringDelegator(
+        mysql_analyzer_runtime=analyzer_runtime,
         telemetry=collection_telemetry,
-        subagent_registration=EvidenceStructuringSubagentRegistration.from_dirs(
-            skills_dir=config.runtime.skills_dir,
-            agents_dir=config.runtime.agents_dir,
-        ),
-    ).run(raw_evidence_index_path)
+    ).run(
+        request_id=evidence_result.request_id,
+        raw_evidence_index=raw_evidence_index_path,
+        result_sink=evidence_structuring_results,
+    )
+    if structuring_result is None:
+        artifact_store.persist_evidence_processing_telemetry(
+            evidence_result.request_id, collection_telemetry.events
+        )
+        print("phase=phase-03")
+        print("status=blocked")
+        print("reason=evidence_subagent_invocation_failed")
+        print("parent_agent=mysql_analyzer")
+        print("subagent=evidence_structuring")
+        print(f"raw_evidence_artifact={raw_evidence_index_path}")
+        return 1
+    artifact_store.persist_evidence_processing_telemetry(
+        structuring_result.request_id, collection_telemetry.events
+    )
 
     print(f"phase={structuring_result.phase}")
     print(f"status={structuring_result.status}")

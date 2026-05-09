@@ -128,6 +128,8 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("phase=phase-03", output)
         self.assertIn("status=evidence_bundle_created", output)
+        self.assertIn("mode=replay", output)
+        self.assertIn("subagent_invocation=false", output)
         self.assertIn("subagent=evidence_structuring", output)
         self.assertIn("parent_agent=mysql_analyzer", output)
         self.assertIn("quality=usable_with_warnings", output)

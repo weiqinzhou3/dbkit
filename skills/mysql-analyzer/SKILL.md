@@ -207,7 +207,8 @@ status or variables are needed, use the baseline evidence types instead.
 
 After evidence planning and raw evidence collection are complete,
 `mysql_analyzer` must delegate RawEvidence structuring to the
-`evidence_structuring` subagent.
+`evidence_structuring` DeepAgents subagent through the runtime-registered
+subagent delegation mechanism.
 
 `mysql_analyzer` owns the workflow, but `evidence_structuring` owns the
 RawEvidence -> EvidenceBundle transformation.
@@ -218,6 +219,7 @@ Rules:
 - `mysql_analyzer` must not directly read raw error logs, raw processlist, raw status, raw variables, or raw SSH command output for final reasoning.
 - `mysql_analyzer` findings_generation mode must consume EvidenceBundle, not RawEvidence.
 - If EvidenceBundle is missing or stale, `mysql_analyzer` must request or delegate evidence structuring before findings_generation.
+- The delegation task must give `evidence_structuring` the RawEvidence index path and require it to call evidence processing tools, especially `build_evidence_bundle`.
 - `mysql_analyzer` must stop at EvidenceBundle creation in Phase-03.
 - `mysql_analyzer` must not generate findings, root cause, verdict, final summary, or recommendations in Phase-03.
 

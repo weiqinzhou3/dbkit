@@ -99,7 +99,7 @@ class MainEntrypointTest(unittest.TestCase):
                 def __init__(self, **_kwargs):
                     pass
 
-                def create_mysql_analyzer_runtime(self, _skill_text):
+                def create_mysql_analyzer_runtime(self, _skill_text, **_kwargs):
                     return object()
 
             class FakeEvidencePipeline:
@@ -206,7 +206,7 @@ class MainEntrypointTest(unittest.TestCase):
                 def __init__(self, **_kwargs):
                     pass
 
-                def create_mysql_analyzer_runtime(self, _skill_text):
+                def create_mysql_analyzer_runtime(self, _skill_text, **_kwargs):
                     return object()
 
             class FakeEvidencePipeline:
@@ -312,7 +312,7 @@ class MainEntrypointTest(unittest.TestCase):
                 def __init__(self, **_kwargs):
                     pass
 
-                def create_mysql_analyzer_runtime(self, _skill_text):
+                def create_mysql_analyzer_runtime(self, _skill_text, **_kwargs):
                     return object()
 
             class FakeEvidencePipeline:
@@ -423,10 +423,52 @@ class MainEntrypointTest(unittest.TestCase):
 
             class FakeRuntimeFactory:
                 def __init__(self, **_kwargs):
-                    pass
+                    self.runtime = None
 
-                def create_mysql_analyzer_runtime(self, _skill_text):
-                    return object()
+                def create_mysql_analyzer_runtime(
+                    self,
+                    _skill_text,
+                    *,
+                    evidence_structuring_subagent=None,
+                    evidence_structuring_tools=(),
+                ):
+                    self.runtime = FakeAnalyzerRuntime(
+                        evidence_structuring_subagent=evidence_structuring_subagent,
+                        evidence_structuring_tools=evidence_structuring_tools,
+                    )
+                    return self.runtime
+
+            class FakeAnalyzerRuntime:
+                def __init__(
+                    self,
+                    *,
+                    evidence_structuring_subagent,
+                    evidence_structuring_tools,
+                ):
+                    self.calls = []
+                    self.evidence_structuring_subagent = evidence_structuring_subagent
+                    self.evidence_structuring_tools = tuple(evidence_structuring_tools)
+
+                def invoke(self, payload):
+                    self.calls.append(payload)
+                    if payload.get("mode") != "evidence_structuring_delegation":
+                        return {"messages": [{"role": "assistant", "content": "{}"}]}
+                    self.evidence_structuring_tools[0].invoke(
+                        {"raw_evidence_index": str(index_path)}
+                    )
+                    return {
+                        "messages": [
+                            {
+                                "role": "assistant",
+                                "content": json.dumps(
+                                    {
+                                        "status": "evidence_bundle_created",
+                                        "subagent": "evidence_structuring",
+                                    }
+                                ),
+                            }
+                        ]
+                    }
 
             class FakeEvidencePipeline:
                 def __init__(self, **kwargs):
@@ -501,6 +543,8 @@ class MainEntrypointTest(unittest.TestCase):
         event_types = {event["event_type"] for event in events}
         self.assertIn("evidence_subagent_delegation_started", event_types)
         self.assertIn("evidence_subagent_invoked", event_types)
+        self.assertIn("evidence_structuring_model_call_started", event_types)
+        self.assertIn("evidence_subagent_invocation_completed", event_types)
         self.assertIn("evidence_bundle_created", event_types)
         for event in events:
             if event["event_type"].startswith("evidence_"):

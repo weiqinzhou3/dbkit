@@ -123,8 +123,10 @@ Run the root entrypoint:
 python3.11 main.py --config config/config.yaml "请帮我分析这个 MySQL，今天17:00触发 mysql cpu usage > 85%，只需要分析本地文件，文件在/tmp/mysql_conn_full_mock/。"
 ```
 
-For normal MySQL live-collection workflows, DBKit automatically delegates to
-`evidence_structuring` after RawEvidence collection and writes:
+For normal MySQL live-collection workflows, DBKit asks `mysql_analyzer` to
+delegate to the DeepAgents `evidence_structuring` subagent after RawEvidence
+collection. The subagent calls the `build_evidence_bundle` evidence processing
+tool and writes:
 
 - `.dbkit/artifacts/<request_id>.raw-evidence-index.json`
 - `.dbkit/artifacts/<request_id>.evidence-bundle.json`
@@ -136,7 +138,8 @@ python3.11 main.py --config config/config.yaml --from-raw-evidence .dbkit/artifa
 ```
 
 `--from-raw-evidence` is a replay/debug entrypoint. It is not required for the
-normal Phase-03 workflow.
+normal Phase-03 workflow and is marked `mode=replay` /
+`subagent_invocation=false` in CLI output.
 
 Run with interactive intake supplement:
 
