@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Protocol
 
@@ -27,17 +28,21 @@ class ParamikoSSHClient:
             import paramiko
         except ImportError as exc:
             raise RuntimeError("paramiko is required for SSH live collection") from exc
+        _suppress_paramiko_transport_tracebacks()
         self._client = paramiko.SSHClient()
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self._client.connect(
-            hostname=str(ssh_target.get("host") or ""),
-            port=int(ssh_target.get("port") or 22),
-            username=str(ssh_target.get("username") or ""),
-            password=password,
-            timeout=5,
-            banner_timeout=5,
-            auth_timeout=5,
-        )
+        try:
+            self._client.connect(
+                hostname=str(ssh_target.get("host") or ""),
+                port=int(ssh_target.get("port") or 22),
+                username=str(ssh_target.get("username") or ""),
+                password=password,
+                timeout=5,
+                banner_timeout=5,
+                auth_timeout=5,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"SSH connection failed: {_public_ssh_error(exc)}") from None
 
     def exec(self, command: str) -> str:
         if not is_ssh_command_allowed(command):
@@ -54,6 +59,19 @@ class ParamikoSSHClient:
     def tail_bytes(self, path: str, max_bytes: int) -> str:
         command = f"tail -c {int(max_bytes)} -- {path}"
         return self.exec(command)
+
+
+def _suppress_paramiko_transport_tracebacks() -> None:
+    for logger_name in ("paramiko", "paramiko.transport"):
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(logging.CRITICAL)
+
+
+def _public_ssh_error(exc: Exception) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    if "\n" in message:
+        message = message.splitlines()[0]
+    return message
 
 
 _OS_COMMANDS = {

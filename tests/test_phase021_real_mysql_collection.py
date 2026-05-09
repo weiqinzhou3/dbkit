@@ -1,4 +1,7 @@
+import contextlib
+import io
 import json
+import logging
 import sys
 import time
 import tempfile
@@ -84,6 +87,61 @@ class Phase021RealMySQLCollectionTest(unittest.TestCase):
                 "mysql_connection_closed",
             ],
         )
+
+    def test_ssh_banner_failure_is_structured_and_does_not_dump_paramiko_traceback(self) -> None:
+        request = _live_request(with_ssh=True)
+        fake_paramiko = FakeNoisyParamikoModule()
+        old_module = sys.modules.get("paramiko")
+        sys.modules["paramiko"] = fake_paramiko
+        logger = logging.getLogger("paramiko.transport")
+        old_handlers = list(logger.handlers)
+        old_level = logger.level
+        old_propagate = logger.propagate
+        old_disabled = logger.disabled
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger.handlers = [handler]
+        logger.setLevel(logging.ERROR)
+        logger.propagate = False
+        logger.disabled = False
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir, contextlib.redirect_stderr(io.StringIO()) as stderr:
+                registry = CollectorRegistry(
+                    workspace_root=Path(tmpdir),
+                    secret_store=SecretStore({"<SECRET_REF:ssh_password_001>": "root"}),
+                )
+                first = registry.collect(
+                    step=_step(1, "collect_os_cpu_snapshot", "metrics.os_cpu"),
+                    request=request,
+                    raw_root=Path(tmpdir) / "raw",
+                    started_at="2026-05-09T11:00:00+08:00",
+                    completed_at="2026-05-09T11:00:00+08:00",
+                )[0]
+                second = registry.collect(
+                    step=_step(2, "collect_os_memory_snapshot", "metrics.os_memory"),
+                    request=request,
+                    raw_root=Path(tmpdir) / "raw",
+                    started_at="2026-05-09T11:00:00+08:00",
+                    completed_at="2026-05-09T11:00:00+08:00",
+                )[0]
+        finally:
+            if old_module is None:
+                sys.modules.pop("paramiko", None)
+            else:
+                sys.modules["paramiko"] = old_module
+            logger.handlers = old_handlers
+            logger.setLevel(old_level)
+            logger.propagate = old_propagate
+            logger.disabled = old_disabled
+
+        self.assertEqual(first.collection["status"], "failed")
+        self.assertEqual(second.collection["status"], "failed")
+        self.assertEqual(fake_paramiko.connect_calls, 1)
+        self.assertIn("SSH connection failed: Error reading SSH protocol banner", first.collection["errors"][0])
+        self.assertIn("SSH connection failed: Error reading SSH protocol banner", second.collection["errors"][0])
+        self.assertNotIn("Traceback", stream.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_pymysql_client_closes_cursor_and_connection_on_query_exception(self) -> None:
         request = _live_request()
@@ -935,6 +993,35 @@ class FakeSSHClient:
 
     def tail_bytes(self, path: str, max_bytes: int) -> str:
         return self.results.get(("tail_bytes", max_bytes, path), "")
+
+
+class FakeNoisyParamikoModule:
+    def __init__(self) -> None:
+        self.connect_calls = 0
+
+    class AutoAddPolicy:
+        pass
+
+    def SSHClient(self):
+        return FakeNoisyParamikoSSHClient(self)
+
+
+class FakeNoisyParamikoSSHClient:
+    def __init__(self, module: FakeNoisyParamikoModule) -> None:
+        self.module = module
+
+    def set_missing_host_key_policy(self, _policy) -> None:
+        return None
+
+    def connect(self, **_kwargs) -> None:
+        self.module.connect_calls += 1
+        try:
+            raise RuntimeError("Error reading SSH protocol banner")
+        except RuntimeError:
+            logging.getLogger("paramiko.transport").exception(
+                "Exception (client): Error reading SSH protocol banner"
+            )
+            raise
 
 
 class RevisionAnalyzerRuntime:

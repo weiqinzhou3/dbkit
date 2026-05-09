@@ -245,6 +245,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"phase={evidence_result.phase}")
         print(f"status={evidence_result.status}")
         _print_collection_summary(evidence_result, result.normalized_request.input_mode)
+        _print_collection_errors(evidence_result)
         _print_collection_artifact(evidence_result)
         return 1
 
@@ -423,6 +424,23 @@ def _print_collection_artifact(evidence_result) -> None:
         print(f"artifact={index_artifacts[0].path}")
     elif evidence_result.artifacts:
         print(f"artifact={evidence_result.artifacts[-1].path}")
+
+
+def _print_collection_errors(evidence_result) -> None:
+    errors: list[str] = []
+    for item in evidence_result.raw_evidence:
+        collection = getattr(item, "collection", {}) or {}
+        if collection.get("status") not in {"failed", "blocked"}:
+            continue
+        source = getattr(item, "source", {}) or {}
+        tool_name = source.get("tool_name") or getattr(item, "evidence_type", "unknown")
+        for error in collection.get("errors") or []:
+            text = str(error).strip().splitlines()[0]
+            if text:
+                errors.append(f"{tool_name}: {text}")
+    unique_errors = list(dict.fromkeys(errors))[:5]
+    if unique_errors:
+        print(f"collection_errors={' | '.join(unique_errors)}")
 
 
 def _parse_args(args: list[str]) -> tuple[Path, bool, Path | None, Path | None, list[str]]:

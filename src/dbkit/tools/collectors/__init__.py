@@ -54,6 +54,7 @@ class CollectorRegistry:
         self.telemetry = telemetry
         self._mysql_client: Any | None = None
         self._ssh_client: Any | None = None
+        self._ssh_client_error: RuntimeError | None = None
 
     def collect(
         self,
@@ -250,8 +251,17 @@ class CollectorRegistry:
         return self._mysql_client
 
     def _ssh(self, request: NormalizedRequest) -> Any:
+        if self._ssh_client_error is not None:
+            raise self._ssh_client_error
         if self._ssh_client is None:
-            self._ssh_client = self.ssh_client_factory(request, self.secret_store)
+            try:
+                self._ssh_client = self.ssh_client_factory(request, self.secret_store)
+            except Exception as exc:
+                message = str(exc).strip() or exc.__class__.__name__
+                if not message.startswith("SSH connection failed:"):
+                    message = f"SSH connection failed: {message}"
+                self._ssh_client_error = RuntimeError(message)
+                raise self._ssh_client_error from None
         return self._ssh_client
 
     def _read_directory_step(

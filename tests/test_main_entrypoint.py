@@ -154,7 +154,7 @@ class MainEntrypointTest(unittest.TestCase):
     def test_phase021_collection_failed_exits_nonzero(self) -> None:
         import main
         from dbkit.config import AgentConfig, AppConfig, ModelConfig, ProviderKind, RuntimeConfig
-        from dbkit.schemas.evidence import EvidencePipelineResult
+        from dbkit.schemas.evidence import EvidencePipelineResult, RawEvidence
         from dbkit.schemas.runtime import NormalizedRequest, RouteDecision, RuntimeResult
 
         output = io.StringIO()
@@ -218,7 +218,19 @@ class MainEntrypointTest(unittest.TestCase):
                         status="collection_failed",
                         evidence_request=None,
                         collection_plan=None,
-                        raw_evidence=(),
+                        raw_evidence=(
+                            RawEvidence(
+                                raw_evidence_id="rawev_failed_ssh",
+                                request_id=normalized.request_id,
+                                evidence_type="metrics.os_cpu",
+                                source={"tool_name": "collect_os_cpu_snapshot"},
+                                collection={
+                                    "status": "failed",
+                                    "errors": ["SSH connection failed: Error reading SSH protocol banner"],
+                                },
+                                payload={"content_ref": None, "bytes": 0, "line_count": 0},
+                            ),
+                        ),
                         artifacts=(),
                         telemetry=(),
                     )
@@ -254,6 +266,11 @@ class MainEntrypointTest(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("phase=phase-02.1", output.getvalue())
         self.assertIn("status=collection_failed", output.getvalue())
+        self.assertIn(
+            "collection_errors=collect_os_cpu_snapshot: SSH connection failed: Error reading SSH protocol banner",
+            output.getvalue(),
+        )
+        self.assertNotIn("Traceback", output.getvalue())
 
     def test_phase021_missing_dependencies_prints_install_hint(self) -> None:
         import main
