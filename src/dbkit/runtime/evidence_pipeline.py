@@ -96,6 +96,17 @@ class EvidencePipeline:
             message="Evidence planning started",
             attributes={"request_id": request.request_id},
         )
+        self.telemetry.emit(
+            event_type="mysql_analyzer_evidence_planning_started",
+            stage="evidence_planning",
+            message="MySQL analyzer evidence planning started",
+            attributes={
+                "request_id": request.request_id,
+                "parent_agent": "mysql_analyzer",
+                "subagent": "evidence_structuring",
+                "status": "started",
+            },
+        )
         if evidence_request_json is None:
             evidence_request_json = self._invoke_mysql_analyzer(request)
         if evidence_request_json is None:
@@ -184,6 +195,17 @@ class EvidencePipeline:
             stage="evidence_planning",
             message="Evidence planning completed",
             attributes={"request_id": request.request_id},
+        )
+        self.telemetry.emit(
+            event_type="mysql_analyzer_evidence_planning_completed",
+            stage="evidence_planning",
+            message="MySQL analyzer evidence planning completed",
+            attributes={
+                "request_id": request.request_id,
+                "parent_agent": "mysql_analyzer",
+                "subagent": "evidence_structuring",
+                "status": "completed",
+            },
         )
         self.telemetry.emit(
             event_type="evidence_request_validated",
@@ -485,6 +507,20 @@ class EvidencePipeline:
             stage="collection",
             message="Collection summary created",
             attributes={"request_id": request.request_id, **summary},
+        )
+        self.telemetry.emit(
+            event_type="raw_evidence_collection_completed",
+            stage="collection",
+            message="Raw evidence collection completed",
+            attributes={
+                "request_id": request.request_id,
+                "parent_agent": "mysql_analyzer",
+                "subagent": "evidence_structuring",
+                "raw_evidence_index": str(index_artifact.path),
+                "raw_evidence_count": len(raw_items),
+                "status": status,
+                **summary,
+            },
         )
         telemetry_artifact = self.artifact_store.persist_collection_telemetry(
             request.request_id, self.telemetry.events

@@ -22,6 +22,9 @@ from dbkit.tools.collectors import CollectorRegistry
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(argv or [])
+    if any(arg in {"--help", "-h"} for arg in args):
+        _print_help()
+        return 0
     config_path, interactive_flag, raw_evidence_index_path, prompt_args = _parse_args(args)
     config = load_app_config(config_path)
     if raw_evidence_index_path is not None:
@@ -126,9 +129,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     analyzer_runtime = runtime_factory.create_mysql_analyzer_runtime(
         mysql_analyzer.skill_text
     )
+    collection_telemetry = TelemetryRecorder()
+    artifact_store = ArtifactStore(artifact_root)
     evidence_result = EvidencePipeline(
-        artifact_store=ArtifactStore(artifact_root),
-        telemetry=TelemetryRecorder(),
+        artifact_store=artifact_store,
+        telemetry=collection_telemetry,
         collectors=CollectorRegistry(
             workspace_root=config.runtime.workspace_dir,
             secret_store=SecretStore(result.secret_values),
@@ -147,12 +152,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         mysql_analyzer_runtime=analyzer_runtime,
     ).run(result.normalized_request)
 
-    print(f"phase={evidence_result.phase}")
     if evidence_result.status in {
         "evidence_request_parse_failed",
         "evidence_request_validation_failed",
         "missing_collection_dependencies",
     }:
+        print(f"phase={evidence_result.phase}")
         print("status=blocked")
         print(f"reason={evidence_result.status}")
         if evidence_result.status == "missing_collection_dependencies":
@@ -160,9 +165,86 @@ def main(argv: Sequence[str] | None = None) -> int:
             install_hint = evidence_result.metadata.get("install_hint")
             print(f"missing_dependencies={','.join(missing_dependencies)}")
             print(f"install_hint={install_hint}")
-    else:
+        _print_collection_summary(evidence_result, result.normalized_request.input_mode)
+        _print_collection_artifact(evidence_result)
+        return 1
+
+    index_artifacts = _raw_evidence_index_artifacts(evidence_result)
+    if evidence_result.status in {
+        "collection_blocked",
+        "collection_failed",
+        "collection_not_implemented",
+    }:
+        print(f"phase={evidence_result.phase}")
         print(f"status={evidence_result.status}")
-    print(f"input_mode={result.normalized_request.input_mode}")
+        _print_collection_summary(evidence_result, result.normalized_request.input_mode)
+        _print_collection_artifact(evidence_result)
+        return 1
+
+    if not index_artifacts:
+        print(f"phase={evidence_result.phase}")
+        print("status=blocked")
+        print("reason=raw_evidence_index_missing")
+        _print_collection_summary(evidence_result, result.normalized_request.input_mode)
+        _print_collection_artifact(evidence_result)
+        return 1
+
+    raw_evidence_index_path = index_artifacts[0].path
+    collection_telemetry.emit(
+        event_type="evidence_subagent_delegation_started",
+        stage="evidence_structuring",
+        message="MySQL analyzer delegated RawEvidence structuring to evidence_structuring",
+        attributes={
+            "request_id": evidence_result.request_id,
+            "parent_agent": "mysql_analyzer",
+            "subagent": "evidence_structuring",
+            "raw_evidence_index": str(raw_evidence_index_path),
+            "status": "started",
+        },
+    )
+    structuring_result = EvidenceStructuringPipeline(
+        artifact_store=artifact_store,
+        telemetry=collection_telemetry,
+        subagent_registration=EvidenceStructuringSubagentRegistration.from_dirs(
+            skills_dir=config.runtime.skills_dir,
+            agents_dir=config.runtime.agents_dir,
+        ),
+    ).run(raw_evidence_index_path)
+
+    print(f"phase={structuring_result.phase}")
+    print(f"status={structuring_result.status}")
+    print("parent_agent=mysql_analyzer")
+    print("subagent=evidence_structuring")
+    print(f"raw_evidence_artifact={raw_evidence_index_path}")
+    if structuring_result.bundle is not None:
+        print(f"evidence_items={len(structuring_result.bundle.evidence_items)}")
+        print(f"quality={structuring_result.bundle.quality.get('overall_status')}")
+    if structuring_result.bundle_artifact is not None:
+        print(f"artifact={structuring_result.bundle_artifact.path}")
+    elif structuring_result.artifacts:
+        print(f"artifact={structuring_result.artifacts[-1].path}")
+    if structuring_result.blocking_issues:
+        print(f"blocking_issues={';'.join(structuring_result.blocking_issues)}")
+    if structuring_result.status != "evidence_bundle_created":
+        return 1
+    return 0
+
+
+def _collection_summary(raw_evidence) -> dict[str, int]:
+    from dbkit.schemas.evidence import collection_summary
+
+    return collection_summary(tuple(raw_evidence))
+
+
+def _raw_evidence_index_artifacts(evidence_result) -> list:
+    return [
+        artifact for artifact in evidence_result.artifacts
+        if artifact.kind == "RawEvidenceIndex"
+    ]
+
+
+def _print_collection_summary(evidence_result, input_mode: str) -> None:
+    print(f"input_mode={input_mode}")
     print(f"raw_evidence_count={len(evidence_result.raw_evidence)}")
     summary = _collection_summary(evidence_result.raw_evidence)
     for key in (
@@ -175,30 +257,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "not_implemented",
     ):
         print(f"{key}={summary.get(key + '_count', 0)}")
-    index_artifacts = [
-        artifact for artifact in evidence_result.artifacts
-        if artifact.kind == "RawEvidenceIndex"
-    ]
+
+
+def _print_collection_artifact(evidence_result) -> None:
+    index_artifacts = _raw_evidence_index_artifacts(evidence_result)
     if index_artifacts:
         print(f"artifact={index_artifacts[0].path}")
     elif evidence_result.artifacts:
         print(f"artifact={evidence_result.artifacts[-1].path}")
-    if evidence_result.status in {
-        "collection_blocked",
-        "collection_failed",
-        "collection_not_implemented",
-        "evidence_request_parse_failed",
-        "evidence_request_validation_failed",
-        "missing_collection_dependencies",
-    }:
-        return 1
-    return 0
-
-
-def _collection_summary(raw_evidence) -> dict[str, int]:
-    from dbkit.schemas.evidence import collection_summary
-
-    return collection_summary(tuple(raw_evidence))
 
 
 def _parse_args(args: list[str]) -> tuple[Path, bool, Path | None, list[str]]:
@@ -226,6 +292,14 @@ def _parse_args(args: list[str]) -> tuple[Path, bool, Path | None, list[str]]:
             prompt_args.extend(args[index:])
             break
     return config_path, interactive, raw_evidence_index_path, prompt_args
+
+
+def _print_help() -> None:
+    print(f"DBKit {__version__}")
+    print("usage: python3.11 main.py [--config PATH] [--interactive] [--from-raw-evidence PATH] [PROMPT]")
+    print()
+    print("Normal workflow runs Intake -> MySQL evidence planning -> collection -> evidence_structuring.")
+    print("--from-raw-evidence replays EvidenceBundle creation from an existing raw evidence index.")
 
 
 def _read_supplement(rendered_user_message: str) -> str:

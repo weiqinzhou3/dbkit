@@ -48,13 +48,8 @@ class EvidenceStructuringPipeline:
         self._emit(
             "evidence_structuring_started",
             "Evidence structuring started",
-            input_raw_evidence_index=str(index_path),
-            status="started",
-        )
-        self._emit(
-            "evidence_subagent_invoked",
-            "MySQL analyzer delegated evidence structuring to subagent",
-            input_raw_evidence_index=str(index_path),
+            request_id=request_id,
+            raw_evidence_index=str(index_path),
             status="started",
         )
 
@@ -87,7 +82,15 @@ class EvidenceStructuringPipeline:
             "raw_evidence_index_loaded",
             "Raw evidence index loaded",
             request_id=request_id,
+            raw_evidence_index=str(index_path),
             raw_evidence_count=len(raw_evidence),
+        )
+        self._emit(
+            "evidence_subagent_invoked",
+            "MySQL analyzer delegated evidence structuring to subagent",
+            request_id=request_id,
+            raw_evidence_index=str(index_path),
+            status="started",
         )
 
         guardrail_issues = self._guardrail_issues(raw_evidence)
@@ -377,10 +380,19 @@ class EvidenceStructuringPipeline:
             raw_bytes=raw_bytes,
             loaded_raw_texts=loaded_raw_texts,
         )
+        for item in evidence_items:
+            artifact = self.artifact_store.persist_evidence_item(item)
+            artifacts.append(artifact)
+            self._artifact_written(request_id, artifact)
+
+        bundle_artifact = self.artifact_store.persist_evidence_bundle(bundle)
+        artifacts.append(bundle_artifact)
         self._emit(
             "evidence_bundle_created",
             "Evidence bundle created",
             request_id=request_id,
+            raw_evidence_index=str(index_path),
+            evidence_bundle_artifact=str(bundle_artifact.path),
             evidence_item_count=len(evidence_items),
             tool_name="build_evidence_bundle",
             status="completed",
@@ -389,17 +401,11 @@ class EvidenceStructuringPipeline:
             "evidence_subagent_completed",
             "Evidence structuring subagent completed",
             request_id=request_id,
+            raw_evidence_index=str(index_path),
+            evidence_bundle_artifact=str(bundle_artifact.path),
             evidence_item_count=len(evidence_items),
             status="completed",
         )
-
-        for item in evidence_items:
-            artifact = self.artifact_store.persist_evidence_item(item)
-            artifacts.append(artifact)
-            self._artifact_written(request_id, artifact)
-
-        bundle_artifact = self.artifact_store.persist_evidence_bundle(bundle)
-        artifacts.append(bundle_artifact)
         self._artifact_written(request_id, bundle_artifact)
         telemetry_artifact = self.artifact_store.persist_evidence_processing_telemetry(
             request_id, self.telemetry.events

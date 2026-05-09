@@ -1081,15 +1081,16 @@ Telemetry must not include raw secrets or chain-of-thought.
 
 # 22. CLI Behavior
 
-## 22.1 Run Phase-03 from Existing RawEvidence
+## 22.1 Normal Phase-03 Workflow
 
-Phase-03 must support a repeatable entrypoint from an existing raw evidence index.
+The normal MySQL workflow must automatically delegate to `evidence_structuring`
+after Phase-02.1 RawEvidence collection completes.
 
 Preferred CLI:
 
 ```bash
 python3.11 main.py --config config/config.yaml \
-  --from-raw-evidence .dbkit/artifacts/<request_id>.raw-evidence-index.json
+  "<MySQL analysis request>"
 ```
 
 Expected output:
@@ -1098,19 +1099,30 @@ Expected output:
 DBKit 0.1.0
 phase=phase-03
 status=evidence_bundle_created
-subagent=evidence_structuring
 parent_agent=mysql_analyzer
+subagent=evidence_structuring
+raw_evidence_artifact=.dbkit/artifacts/<request_id>.raw-evidence-index.json
 evidence_items=...
-unavailable_evidence=...
 quality=usable_with_warnings
 artifact=.dbkit/artifacts/<request_id>.evidence-bundle.json
 ```
 
-If this exact CLI flag is not implemented, an equivalent testable entrypoint must exist.
+The command must stop after EvidenceBundle creation in Phase-03. It must not
+generate root cause, findings, verdict, final summary, or recommendations.
 
-## 22.2 Run Phase-01 -> Phase-02.1 -> Phase-03 in One Command
+## 22.2 Replay Phase-03 from Existing RawEvidence
 
-Phase-03 may also run after Phase-02.1 in the same command if the runtime supports phase chaining.
+Phase-03 must also support a repeatable replay entrypoint from an existing raw
+evidence index for debug and regression testing.
+
+Preferred CLI:
+
+```bash
+python3.11 main.py --config config/config.yaml \
+  --from-raw-evidence .dbkit/artifacts/<request_id>.raw-evidence-index.json
+```
+
+`--from-raw-evidence` is not the normal Phase-03 trigger.
 
 Expected behavior:
 

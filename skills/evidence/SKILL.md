@@ -14,6 +14,10 @@ This stage does not diagnose root cause, produce findings, generate verdicts, or
 
 `mysql_analyzer` delegates RawEvidence transformation to `evidence_structuring` after Phase-02.1 collection. The Evidence Structuring Subagent returns an EvidenceBundle to the MySQL Analyzer workflow.
 
+You are invoked by `mysql_analyzer` only after RawEvidence collection has
+completed. Your output is returned to `mysql_analyzer` as an EvidenceBundle for
+future findings_generation.
+
 Runtime registers, wires, validates, persists artifacts, emits telemetry, and enforces guardrails. Runtime is not the semantic owner of evidence structuring.
 
 You may select evidence processing tools. You must not call live collection tools. You must not request additional collection.

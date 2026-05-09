@@ -168,6 +168,15 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
         self.assertIn("filter_by_time_window", tool_names)
         self.assertNotIn("collect_mysql_error_log", tool_names)
 
+    def test_mysql_analyzer_skill_requires_evidence_structuring_delegation(self) -> None:
+        skill = Path("skills/mysql-analyzer/SKILL.md").read_text(encoding="utf-8")
+
+        self.assertIn("Evidence Structuring Delegation Policy", skill)
+        self.assertIn("must delegate RawEvidence structuring", skill)
+        self.assertIn("findings_generation mode must consume EvidenceBundle", skill)
+        self.assertIn("must not directly analyze RawEvidence", skill)
+        self.assertIn("must not directly read raw error logs", skill)
+
     def test_missing_content_ref_is_blocked_by_evidence_guardrails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

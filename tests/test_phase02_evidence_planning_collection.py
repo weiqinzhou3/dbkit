@@ -90,6 +90,22 @@ class Phase02EvidencePlanningCollectionTest(unittest.TestCase):
 
             self.assertEqual(result.status, "raw_evidence_collected")
             self.assertEqual(len(result.raw_evidence), 1)
+            event_types = [event.event_type for event in result.telemetry]
+            self.assertIn("mysql_analyzer_evidence_planning_started", event_types)
+            self.assertIn("mysql_analyzer_evidence_planning_completed", event_types)
+            self.assertIn("raw_evidence_collection_completed", event_types)
+            raw_collection_event = [
+                event for event in result.telemetry
+                if event.event_type == "raw_evidence_collection_completed"
+            ][0]
+            self.assertEqual(
+                raw_collection_event.attributes["parent_agent"],
+                "mysql_analyzer",
+            )
+            self.assertEqual(
+                raw_collection_event.attributes["subagent"],
+                "evidence_structuring",
+            )
 
     def test_evidence_request_parse_failure_returns_blocked_artifact(self) -> None:
         normalized = _provided_evidence_request(files=["/workspace/mysql-error.log"])

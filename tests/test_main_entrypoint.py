@@ -1,4 +1,5 @@
 import io
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -368,6 +369,208 @@ class MainEntrypointTest(unittest.TestCase):
         self.assertIn("reason=missing_collection_dependencies", output.getvalue())
         self.assertIn("missing_dependencies=pymysql,paramiko", output.getvalue())
         self.assertIn('install_hint=pip install -e ".[collection]"', output.getvalue())
+
+    def test_phase03_normal_workflow_auto_delegates_to_evidence_structuring(self) -> None:
+        import main
+        from dbkit.config import AgentConfig, AppConfig, ModelConfig, ProviderKind, RuntimeConfig
+        from dbkit.schemas.evidence import EvidencePipelineResult
+        from dbkit.schemas.runtime import ArtifactRecord, NormalizedRequest, RouteDecision, RuntimeResult
+
+        output = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            artifact_root = root / ".dbkit" / "artifacts"
+            index_path = _write_minimal_raw_evidence_index(artifact_root)
+            normalized = NormalizedRequest(
+                request_id="req_cli_phase03",
+                original_input="connect mysql",
+                redacted_input="connect mysql",
+                target_domain="mysql",
+                requested_capability="alert_analysis",
+                missing_fields=(),
+                phase="phase-02.1",
+                target_agent="mysql_analyzer",
+                task_type="alert_analysis",
+                input_mode="live_collection",
+            )
+
+            class FakeOrchestrator:
+                def __init__(self, **_kwargs):
+                    pass
+
+                def run(self, *_args, **_kwargs):
+                    return RuntimeResult(
+                        normalized_request=normalized,
+                        route_decision=RouteDecision(
+                            target_agent_name="mysql_analyzer",
+                            target_domain="mysql",
+                            phase="phase-02.1",
+                            reason="test",
+                        ),
+                        artifacts=(),
+                        telemetry=(),
+                        deepagents_runtime_ready=True,
+                        blocked=False,
+                    )
+
+            class FakeAnalyzerAgent:
+                skill_text = "MYSQL_SKILL"
+
+                @classmethod
+                def from_skills_dir(cls, _skills_dir, agents_dir=None):
+                    return cls()
+
+            class FakeRuntimeFactory:
+                def __init__(self, **_kwargs):
+                    pass
+
+                def create_mysql_analyzer_runtime(self, _skill_text):
+                    return object()
+
+            class FakeEvidencePipeline:
+                def __init__(self, **kwargs):
+                    self.telemetry = kwargs["telemetry"]
+
+                def run(self, _request):
+                    self.telemetry.emit(
+                        event_type="raw_evidence_collection_completed",
+                        stage="collection",
+                        message="Raw evidence collection completed",
+                        attributes={
+                            "request_id": normalized.request_id,
+                            "parent_agent": "mysql_analyzer",
+                            "subagent": "evidence_structuring",
+                            "raw_evidence_index": str(index_path),
+                        },
+                    )
+                    return EvidencePipelineResult(
+                        request_id=normalized.request_id,
+                        phase="phase-02.1",
+                        status="raw_evidence_collected",
+                        evidence_request=None,
+                        collection_plan=None,
+                        raw_evidence=(),
+                        artifacts=(
+                            ArtifactRecord(kind="RawEvidenceIndex", path=index_path),
+                        ),
+                        telemetry=tuple(self.telemetry.events),
+                    )
+
+            config = AppConfig(
+                model=ModelConfig(
+                    provider_kind=ProviderKind.OPENAI_COMPATIBLE,
+                    model_name="test-model",
+                    base_url="https://example.invalid/v1",
+                    api_key="sk-test",
+                ),
+                agent=AgentConfig(),
+                runtime=RuntimeConfig(
+                    artifact_dir=artifact_root,
+                    repo_dir=Path("."),
+                    workspace_dir=root / "workspace",
+                    skills_dir=Path("skills"),
+                    agents_dir=Path("agents"),
+                ),
+            )
+
+            with (
+                patch("dbkit.cli.load_app_config", return_value=config),
+                patch("dbkit.cli.build_agent_model", return_value=object()),
+                patch("dbkit.cli.DeepAgentsRuntimeFactory", FakeRuntimeFactory),
+                patch("dbkit.cli.Orchestrator", FakeOrchestrator),
+                patch("dbkit.cli.MySQLAnalyzerAgent", FakeAnalyzerAgent),
+                patch("dbkit.cli.EvidencePipeline", FakeEvidencePipeline),
+                redirect_stdout(output),
+            ):
+                exit_code = main.main(["--config", str(root / "config.yaml"), "connect mysql"])
+
+            telemetry_path = artifact_root / f"{normalized.request_id}.evidence-processing-telemetry.jsonl"
+            events = [
+                json.loads(line)
+                for line in telemetry_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("phase=phase-03", output.getvalue())
+        self.assertIn("status=evidence_bundle_created", output.getvalue())
+        self.assertIn("parent_agent=mysql_analyzer", output.getvalue())
+        self.assertIn("subagent=evidence_structuring", output.getvalue())
+        self.assertIn("raw_evidence_artifact=", output.getvalue())
+        self.assertIn(".evidence-bundle.json", output.getvalue())
+        event_types = {event["event_type"] for event in events}
+        self.assertIn("evidence_subagent_delegation_started", event_types)
+        self.assertIn("evidence_subagent_invoked", event_types)
+        self.assertIn("evidence_bundle_created", event_types)
+        for event in events:
+            if event["event_type"].startswith("evidence_"):
+                attrs = event.get("attributes") or {}
+                self.assertEqual(attrs.get("parent_agent"), "mysql_analyzer")
+                self.assertEqual(attrs.get("subagent"), "evidence_structuring")
+
+
+def _write_minimal_raw_evidence_index(artifact_root: Path) -> Path:
+    raw_dir = artifact_root / "raw"
+    raw_dir.mkdir(parents=True)
+    request_id = "req_cli_phase03"
+    raw_path = raw_dir / "rawev_processlist.json"
+    raw_path.write_text(
+        json.dumps(
+            {
+                "sql": "SHOW FULL PROCESSLIST",
+                "rows": [
+                    {
+                        "Id": 1,
+                        "User": "app",
+                        "Host": "10.0.0.1:52000",
+                        "Command": "Query",
+                        "Time": 12,
+                        "State": "executing",
+                        "Info": "select 1",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    raw_entry = {
+        "raw_evidence_id": "rawev_processlist",
+        "request_id": request_id,
+        "evidence_type": "mysql.processlist",
+        "source": {"kind": "mysql", "tool_name": "collect_mysql_processlist"},
+        "collection": {"status": "collected", "errors": []},
+        "payload": {
+            "content_ref": str(raw_path),
+            "bytes": raw_path.stat().st_size,
+            "line_count": 1,
+        },
+        "metadata": {
+            "time_window": {
+                "start": "2026-05-09T11:00:00+08:00",
+                "end": "2026-05-09T18:00:00+08:00",
+                "source": "skill_default_from_event_time",
+            }
+        },
+    }
+    index_path = artifact_root / f"{request_id}.raw-evidence-index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "request_id": request_id,
+                "phase": "phase-02.1",
+                "raw_evidence_count": 1,
+                "raw_evidence": [raw_entry],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return index_path
 
 
 if __name__ == "__main__":
