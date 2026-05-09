@@ -288,6 +288,60 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
         self.assertEqual(payload["source_timezone"], "unknown")
         self.assertIn("timezone_inference_failed", item["quality_flags"])
 
+    def test_aborted_connection_pattern_has_evidence_summary_and_semantic_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            lines = "".join(
+                "2026-05-09T11:00:00+08:00 [Note] Aborted connection "
+                f"{index} to db: 'unconnected' user: 'root' host: '10.0.0.1' "
+                "(Got an error reading communication packets)\n"
+                for index in range(404)
+            )
+            index_path = _write_error_log_fixture(root, lines)
+            result = EvidenceStructuringPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+            ).run(index_path)
+            bundle = json.loads(result.bundle_artifact.path.read_text(encoding="utf-8"))
+
+        item = bundle["evidence_items"][0]
+        payload = item["structured_payload"]
+        self.assertIn(
+            "Error log contains 404 Aborted connection events inside the requested time window.",
+            item["summary"],
+        )
+        self.assertEqual(len(payload["top_patterns"]), 1)
+        pattern = payload["top_patterns"][0]
+        self.assertEqual(pattern["count"], 404)
+        self.assertEqual(pattern["semantic_hint"], "aborted_connection")
+        self.assertEqual(pattern["operational_relevance"], "high")
+        serialized = json.dumps(bundle, ensure_ascii=False)
+        for forbidden in ("root_cause", "findings", "verdict"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_low_quality_evidence_produces_bundle_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = _write_error_log_fixture(
+                root,
+                "slow query line without timestamp\n",
+                evidence_type="mysql.slow_log",
+            )
+            result = EvidenceStructuringPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+            ).run(index_path)
+            bundle = json.loads(result.bundle_artifact.path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            bundle["coverage"]["low_quality_evidence"][0]["evidence_type"],
+            "mysql.slow_log",
+        )
+        self.assertIn(
+            "mysql.slow_log parsed with low quality: timestamp_parse_failed",
+            bundle["quality"]["warnings"],
+        )
+
 
 def _write_raw_evidence_fixture(root: Path, *, missing_content_ref: bool = False) -> Path:
     artifacts = root / ".dbkit" / "artifacts"
@@ -359,12 +413,13 @@ def _write_error_log_fixture(
     content: str,
     *,
     source_timezone: dict | None = None,
+    evidence_type: str = "mysql.error_log",
 ) -> Path:
     artifacts = root / ".dbkit" / "artifacts"
     raw_dir = artifacts / "raw"
     raw_dir.mkdir(parents=True)
     request_id = "req_error_log"
-    entry = _write_text_raw(raw_dir, request_id, "rawev_error_log_only", "mysql.error_log", content)
+    entry = _write_text_raw(raw_dir, request_id, "rawev_error_log_only", evidence_type, content)
     entry["metadata"]["collection_strategy"] = "bounded_tail_fallback"
     entry["metadata"]["time_window_aware"] = False
     entry["metadata"]["time_window_coverage"] = "unknown"

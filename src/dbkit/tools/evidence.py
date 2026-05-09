@@ -286,12 +286,10 @@ def _parse_log(raw: dict[str, Any], raw_text: str, *, log_name: str) -> Evidence
     )[:10]
     for pattern in top_patterns:
         pattern["raw_refs"] = pattern["raw_refs"][:3]
+        pattern.update(_semantic_hint(str(pattern["pattern"])))
 
     if parsed.retained_lines:
-        summary = (
-            f"{log_name} parsed with {len(parsed.retained_lines)} retained lines "
-            f"inside the requested time window."
-        )
+        summary = _log_summary(log_name, len(parsed.retained_lines), top_patterns)
     elif parsed.discarded_lines:
         summary = f"{log_name} parsed but no lines matched the requested time window."
     else:
@@ -787,6 +785,64 @@ def _log_pattern(line: str) -> str:
     value = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b", "<ip:port>", value)
     value = re.sub(r"\b\d+\b", "<num>", value)
     return _sample(value.strip(), 180)
+
+
+def _log_summary(
+    log_name: str,
+    retained_line_count: int,
+    top_patterns: list[dict[str, Any]],
+) -> str:
+    if top_patterns:
+        top = top_patterns[0]
+        label = _semantic_summary_label(str(top.get("semantic_hint") or ""))
+        count = int(top.get("count") or 0)
+        if label and count > 0:
+            return (
+                f"{log_name} contains {count} {label} events inside "
+                "the requested time window."
+            )
+    return (
+        f"{log_name} parsed with {retained_line_count} retained lines "
+        "inside the requested time window."
+    )
+
+
+def _semantic_hint(pattern: str) -> dict[str, str]:
+    lower = pattern.lower()
+    hints = (
+        ("aborted connection", "aborted_connection", "high"),
+        ("access denied", "access_denied", "high"),
+        ("too many connections", "too_many_connections", "high"),
+        ("ready for connections", "crash_or_restart", "medium"),
+        ("shutdown complete", "crash_or_restart", "medium"),
+        ("starting as process", "crash_or_restart", "medium"),
+        ("out of memory", "oom_or_memory", "high"),
+        ("oom", "oom_or_memory", "high"),
+        ("timeout", "timeout", "medium"),
+        ("timed out", "timeout", "medium"),
+        ("replication", "replication_error", "high"),
+        ("innodb", "innodb_error", "high"),
+    )
+    for needle, hint, relevance in hints:
+        if needle in lower:
+            return {
+                "semantic_hint": hint,
+                "operational_relevance": relevance,
+            }
+    return {}
+
+
+def _semantic_summary_label(semantic_hint: str) -> str:
+    return {
+        "aborted_connection": "Aborted connection",
+        "access_denied": "Access denied",
+        "too_many_connections": "Too many connections",
+        "crash_or_restart": "crash or restart",
+        "oom_or_memory": "OOM or memory",
+        "timeout": "timeout",
+        "replication_error": "replication error",
+        "innodb_error": "InnoDB error",
+    }.get(semantic_hint, "")
 
 
 def _severity(line: str) -> str | None:
