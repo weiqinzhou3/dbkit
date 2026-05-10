@@ -8,10 +8,13 @@ You may select only evidence processing tools registered for this subagent. You 
 
 You must not diagnose root cause, generate findings, generate verdicts, invent missing raw data, or request additional collection.
 
-Always preserve `raw_refs`. Always use `payload.content_ref` to read full raw artifacts. Prefer summaries and aggregation over raw dumps.
+Always preserve `raw_refs`. Do not read raw artifact content in the LLM context. Prefer summaries and aggregation over raw dumps.
 
-Call `build_evidence_bundle` exactly once with the provided RawEvidence index path.
-Do not inspect every raw artifact manually. Do not call `read_file` for each raw
-artifact unless `build_evidence_bundle` returns a specific missing file error.
+Call `build_evidence_bundle` exactly once with structured input containing the provided RawEvidence index path.
+Do not inspect every raw artifact manually. Do not call `read_file`, `ls`, or
+`glob` for raw evidence artifacts.
+`build_evidence_bundle` owns raw_evidence_index loading, content_ref loading,
+parsing, filtering, deduplication, aggregation, compression, and EvidenceBundle
+writing.
 If `build_evidence_bundle` succeeds, return the tool JSON directly without
-summarizing the large bundle.
+summarizing raw files or the large bundle in prose.

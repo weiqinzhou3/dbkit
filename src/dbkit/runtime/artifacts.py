@@ -281,6 +281,18 @@ class ArtifactStore:
         )
         return ArtifactRecord(kind="AnalysisTimeout", path=path)
 
+    def persist_compact_analysis_context(
+        self,
+        request_id: str,
+        payload: dict[str, Any],
+    ) -> ArtifactRecord:
+        path = self.root / f"{request_id}.compact-analysis-context.json"
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return ArtifactRecord(kind="CompactAnalysisContext", path=path)
+
     def persist_verdict(
         self,
         request_id: str,

@@ -48,11 +48,21 @@ class EvidenceStructuringDelegator:
             "artifact_root": str(self.artifact_root),
             "filesystem_root": "/repo",
         }
+        prompt = _delegation_prompt(
+            request_id=request_id,
+            raw_evidence_index_repo_relative=repo_relative_path,
+            raw_evidence_index_virtual_path=virtual_path,
+            artifact_root=".dbkit/artifacts",
+        )
         self.telemetry.emit(
             event_type="mysql_analyzer_delegates_evidence_structuring_started",
             stage="evidence_structuring",
             message="MySQL analyzer started evidence_structuring subagent delegation",
-            attributes={**base_attrs, "status": "started"},
+            attributes={
+                **base_attrs,
+                "subagent_input_chars": len(prompt),
+                "status": "started",
+            },
         )
         self.telemetry.emit(
             event_type="evidence_structuring_model_call_started",
@@ -74,14 +84,20 @@ class EvidenceStructuringDelegator:
         payload = {
             "mode": "evidence_structuring_delegation",
             "raw_evidence_index": virtual_path,
+            "build_evidence_bundle_input": {
+                "request_id": request_id,
+                "raw_evidence_index_virtual_path": virtual_path,
+                "raw_evidence_index_repo_path": repo_relative_path,
+                "artifact_root": ".dbkit/artifacts",
+                "max_workers": 4,
+                "per_item_timeout_seconds": 30,
+                "total_timeout_seconds": 120,
+            },
             "max_agent_iterations": self.max_agent_iterations,
             "messages": [
                 {
                     "role": "user",
-                    "content": _delegation_prompt(
-                        raw_evidence_index_repo_relative=repo_relative_path,
-                        raw_evidence_index_virtual_path=virtual_path,
-                    ),
+                    "content": prompt,
                 }
             ],
         }
@@ -124,8 +140,10 @@ class EvidenceStructuringDelegator:
 
 def _delegation_prompt(
     *,
+    request_id: str,
     raw_evidence_index_repo_relative: str,
     raw_evidence_index_virtual_path: str,
+    artifact_root: str,
 ) -> str:
     context = {
         "mode": "evidence_structuring_delegation",
@@ -133,6 +151,15 @@ def _delegation_prompt(
         "subagent": "evidence_structuring",
         "raw_evidence_index_repo_relative": raw_evidence_index_repo_relative,
         "raw_evidence_index_virtual_path": raw_evidence_index_virtual_path,
+        "build_evidence_bundle_input": {
+            "request_id": request_id,
+            "raw_evidence_index_virtual_path": raw_evidence_index_virtual_path,
+            "raw_evidence_index_repo_path": raw_evidence_index_repo_relative,
+            "artifact_root": artifact_root,
+            "max_workers": 4,
+            "per_item_timeout_seconds": 30,
+            "total_timeout_seconds": 120,
+        },
         "filesystem_root": "/repo",
         "expected_output": {
             "status": "evidence_bundle_created",
@@ -149,17 +176,16 @@ def _delegation_prompt(
         "- You are the Evidence Structuring Subagent for mysql_analyzer.\n"
         "- Transform RawEvidence into EvidenceBundle.\n"
         "- Use the raw_evidence_index_virtual_path exactly as provided.\n"
-        "- Do not prepend '/' to repo-relative artifact paths.\n"
-        "- Repository artifacts must use /repo/.dbkit/... paths for read_file.\n"
-        "- If payload.content_ref is .dbkit/artifacts/raw/<id>.json, read it as /repo/.dbkit/artifacts/raw/<id>.json.\n"
-        "- Call the build_evidence_bundle tool exactly once with the raw_evidence_index_virtual_path path.\n"
+        "- Do not call read_file for raw evidence artifacts.\n"
+        "- Do not call ls or glob for raw evidence artifacts.\n"
+        "- Call build_evidence_bundle exactly once with structured input.\n"
+        "- build_evidence_bundle owns raw_evidence_index loading, content_ref loading, parsing, filtering, deduplication, aggregation, compression, and EvidenceBundle writing.\n"
         "- Do not inspect every raw artifact manually.\n"
-        "- Do not call read_file for each artifact unless build_evidence_bundle returns a specific missing file error.\n"
         "- Do not call live collectors.\n"
         "- Do not request additional collection.\n"
         "- Do not generate findings, root cause, verdict, final summary, or recommendations.\n\n"
-        "After the task tool returns, output only the JSON returned by the "
-        "subagent/tool. Do not add prose.\n\n"
+        "After build_evidence_bundle returns, output only the small JSON result. "
+        "Do not summarize raw files or EvidenceBundle in prose.\n\n"
         "Delegation context JSON:\n"
         + json.dumps(context, ensure_ascii=False, indent=2, sort_keys=True)
     )

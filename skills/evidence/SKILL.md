@@ -19,15 +19,15 @@ completed. Your output is returned to `mysql_analyzer` as an EvidenceBundle for
 future findings_generation.
 
 When invoked through DeepAgents delegation, call the `build_evidence_bundle`
-evidence processing tool with the RawEvidence index path. That tool performs
-the allowed deterministic loading, parsing, filtering, aggregation,
-deduplication, raw reference validation, and bundle persistence work.
+evidence processing tool with structured input containing the RawEvidence index
+path. That tool performs the allowed deterministic loading, parsing, filtering,
+aggregation, deduplication, raw reference validation, compression, and bundle
+persistence work.
 
 Call `build_evidence_bundle` exactly once in normal operation. Do not inspect
-every raw artifact manually. Do not call `read_file` for each artifact unless
-`build_evidence_bundle` returns a specific missing file error. If
-`build_evidence_bundle` succeeds, return the tool JSON directly without
-summarizing the large EvidenceBundle.
+every raw artifact manually. Do not call `read_file`, `ls`, or `glob` for raw
+evidence artifacts. If `build_evidence_bundle` succeeds, return the tool JSON
+directly without summarizing raw files or the large EvidenceBundle in prose.
 
 Use the `raw_evidence_index` path provided by runtime exactly as given. Do not
 prepend `/` to relative artifact paths. If runtime provides a repository
@@ -91,32 +91,14 @@ Use `mysql.runtime_status` and `mysql.variables` instead.
 
 ## Allowed Processing Tools
 
-Allowed tools:
+Allowed subagent-visible tool:
 
-- `load_raw_evidence_index`
-- `load_raw_artifact`
-- `classify_raw_evidence`
-- `parse_mysql_processlist`
-- `parse_mysql_runtime_status`
-- `parse_mysql_innodb_status`
-- `parse_mysql_variables`
-- `parse_mysql_service_metadata`
-- `parse_mysql_log_paths`
-- `parse_mysql_error_log`
-- `parse_mysql_slow_log`
-- `parse_os_cpu_snapshot`
-- `parse_os_memory_snapshot`
-- `parse_os_disk_snapshot`
-- `parse_os_mysql_service_status`
-- `filter_by_time_window`
-- `deduplicate_events`
-- `aggregate_log_patterns`
-- `aggregate_processlist`
-- `aggregate_mysql_status`
-- `aggregate_os_metrics`
-- `estimate_token_size`
-- `validate_raw_refs`
 - `build_evidence_bundle`
+
+`build_evidence_bundle` internally owns raw evidence loading, classification,
+parsing, filtering, deduplication, aggregation, token estimation, raw reference
+validation, and EvidenceBundle persistence. These internal operations must not
+be exposed as separate LLM file-reading or raw-inspection steps.
 
 ## Forbidden Tools
 

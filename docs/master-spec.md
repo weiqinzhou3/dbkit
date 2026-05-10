@@ -82,6 +82,7 @@ Implementation phases are maintained independently.
   phase-02.1-real-mysql-evidence-collection-mvp.md
   phase-03-evidence-structuring-mvp.md
   phase-04-mysql-analyzer-findings-mvp.md
+  phase-04.1-evidence-structuring-token-performance-remediation.md
 ```
 
 Each phase spec must reference and comply with:

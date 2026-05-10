@@ -144,6 +144,12 @@ class Phase04AnalysisPipeline:
             evidence_bundle=evidence_bundle,
             input_bundle_ref=input_bundle_ref,
         )
+        artifacts.append(
+            self.artifact_store.persist_compact_analysis_context(
+                request_id,
+                compact_context,
+            )
+        )
 
         findings_payload = self._invoke_findings_generation(
             evidence_bundle=evidence_bundle,
@@ -349,6 +355,15 @@ class Phase04AnalysisPipeline:
             input_chars_after=after,
             compression_ratio=round(after / before, 6) if before else 1,
             max_prompt_chars=self.max_prompt_chars,
+            context_truncated=bool(context.get("context_truncated")),
+            omitted_sections=list(context.get("omitted_sections") or []),
+            included_evidence_count=len(context.get("evidence_items") or []),
+            included_evidence_ids=[
+                item.get("evidence_id")
+                for item in context.get("evidence_items") or []
+                if isinstance(item, dict)
+            ],
+            included_signal_sections=_compact_signal_sections(context),
             status="completed",
             duration_ms=_duration_ms(started_ns),
         )
@@ -1477,6 +1492,31 @@ def _compact_raw_ref(ref: Any) -> dict[str, Any]:
         for key in ("content_ref", "line_start", "line_end", "raw_evidence_id")
         if key in ref
     }
+
+
+def _compact_signal_sections(context: dict[str, Any]) -> list[str]:
+    sections: set[str] = set()
+    if context.get("coverage"):
+        sections.add("coverage")
+    if (context.get("quality") or {}).get("warnings"):
+        sections.add("quality_warnings")
+    for item in context.get("evidence_items") or []:
+        if not isinstance(item, dict):
+            continue
+        evidence_type = str(item.get("evidence_type") or "")
+        if item.get("error_log"):
+            sections.add("top_patterns")
+        if item.get("processlist"):
+            sections.add("processlist_aggregates")
+        if item.get("runtime_status"):
+            sections.add("runtime_status_key_counters")
+        if item.get("variables"):
+            sections.add("mysql_variables_key_values")
+        if evidence_type.startswith("metrics.os_"):
+            sections.add("os_metrics")
+        if item.get("raw_refs"):
+            sections.add("raw_refs_summary")
+    return sorted(sections)
 
 
 def _bound_compact_context(context: dict[str, Any], max_chars: int) -> dict[str, Any]:

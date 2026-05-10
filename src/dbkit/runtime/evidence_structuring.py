@@ -50,6 +50,7 @@ class EvidenceStructuringPipeline:
         self.total_timeout_seconds = max(1, int(total_timeout_seconds))
 
     def run(self, raw_evidence_index_path: str | Path) -> EvidenceStructuringResult:
+        started_ns = perf_counter_ns()
         index_path = Path(raw_evidence_index_path)
         request_id = "unknown"
         artifacts: list[Any] = []
@@ -98,6 +99,14 @@ class EvidenceStructuringPipeline:
             "MySQL analyzer delegated evidence structuring to subagent",
             request_id=request_id,
             raw_evidence_index=str(index_path),
+            status="started",
+        )
+        self._emit(
+            "build_evidence_bundle_tool_started",
+            "build_evidence_bundle deterministic tool started",
+            request_id=request_id,
+            raw_evidence_index=str(index_path),
+            parallel_workers=self.max_workers,
             status="started",
         )
 
@@ -284,6 +293,31 @@ class EvidenceStructuringPipeline:
             self._artifact_written(request_id, artifact)
 
         bundle_artifact = self.artifact_store.persist_evidence_bundle(bundle)
+        tool_result_preview = {
+            "status": "evidence_bundle_created",
+            "request_id": request_id,
+            "artifact": str(bundle_artifact.path),
+            "evidence_items": len(bundle.evidence_items),
+            "quality": bundle.quality.get("overall_status"),
+            "warnings": list(bundle.quality.get("warnings") or []),
+            "raw_bytes_processed_inside_tool": bundle.processing_summary.get("raw_bytes", 0),
+            "parallel_workers": self.max_workers,
+        }
+        self._emit(
+            "build_evidence_bundle_tool_completed",
+            "build_evidence_bundle deterministic tool completed",
+            request_id=request_id,
+            raw_evidence_index=str(index_path),
+            evidence_bundle_artifact=str(bundle_artifact.path),
+            tool_result_chars=len(
+                json.dumps(tool_result_preview, ensure_ascii=False, sort_keys=True)
+            ),
+            raw_bytes_processed_inside_tool=bundle.processing_summary.get("raw_bytes", 0),
+            evidence_items_processed=len(bundle.evidence_items),
+            parallel_workers=self.max_workers,
+            duration_ms=max(0, (perf_counter_ns() - started_ns) // 1_000_000),
+            status="completed",
+        )
         artifacts.append(bundle_artifact)
         self._emit(
             "evidence_bundle_created",
@@ -456,6 +490,17 @@ class EvidenceStructuringPipeline:
                 raw_evidence_id=raw_id,
                 evidence_type=evidence_type,
                 tool_name="load_raw_artifact",
+                status="completed",
+                worker_id=worker_id,
+                bytes=len(raw_text.encode("utf-8")),
+            )
+            self._emit(
+                "raw_artifact_loaded_inside_tool",
+                "Raw artifact loaded inside build_evidence_bundle tool",
+                request_id=request_id,
+                raw_evidence_id=raw_id,
+                evidence_type=evidence_type,
+                tool_name="build_evidence_bundle",
                 status="completed",
                 worker_id=worker_id,
                 bytes=len(raw_text.encode("utf-8")),

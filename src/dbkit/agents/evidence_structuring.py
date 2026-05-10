@@ -5,29 +5,6 @@ from pathlib import Path
 
 
 EVIDENCE_STRUCTURING_ALLOWED_TOOLS: tuple[str, ...] = (
-    "load_raw_evidence_index",
-    "load_raw_artifact",
-    "classify_raw_evidence",
-    "parse_mysql_processlist",
-    "parse_mysql_runtime_status",
-    "parse_mysql_innodb_status",
-    "parse_mysql_variables",
-    "parse_mysql_service_metadata",
-    "parse_mysql_log_paths",
-    "parse_mysql_error_log",
-    "parse_mysql_slow_log",
-    "parse_os_cpu_snapshot",
-    "parse_os_memory_snapshot",
-    "parse_os_disk_snapshot",
-    "parse_os_mysql_service_status",
-    "filter_by_time_window",
-    "deduplicate_events",
-    "aggregate_log_patterns",
-    "aggregate_processlist",
-    "aggregate_mysql_status",
-    "aggregate_os_metrics",
-    "estimate_token_size",
-    "validate_raw_refs",
     "build_evidence_bundle",
 )
 

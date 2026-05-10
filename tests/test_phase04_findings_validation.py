@@ -342,6 +342,7 @@ class Phase04FindingsValidationTest(unittest.TestCase):
                 validation_runtime=validation,
                 max_prompt_chars=30000,
             ).run(bundle_path)
+            compact_artifact = _artifact_payload(result.artifacts, "CompactAnalysisContext")
 
         self.assertEqual(result.status, "analysis_completed_with_warnings")
         analyzer_message = analyzer.invocations[0]["messages"][0]["content"]
@@ -351,12 +352,25 @@ class Phase04FindingsValidationTest(unittest.TestCase):
         self.assertNotIn("raw-log-line-should-not-enter-llm", analyzer_message)
         self.assertNotIn("raw-log-line-should-not-enter-llm", validation_message)
         self.assertLessEqual(len(analyzer_message), 30000)
+        compact = analyzer.invocations[0]["compact_analysis_context"]
+        compact_serialized = json.dumps(compact_artifact, ensure_ascii=False)
+        self.assertEqual(compact_artifact["request_id"], compact["request_id"])
+        self.assertIn("ev_error_log", compact_serialized)
+        self.assertIn("ev_status", compact_serialized)
+        self.assertIn("top_patterns", compact_serialized)
+        self.assertIn("selected_counters", compact_serialized)
+        self.assertIn("coverage", compact_serialized)
+        self.assertNotIn("raw-log-line-should-not-enter-llm", compact_serialized)
+        self.assertNotIn("SHOW GLOBAL STATUS", compact_serialized)
+        self.assertNotIn("full_processlist_rows", compact_serialized)
         compact_events = [
             event for event in result.telemetry
             if event.event_type == "compact_analysis_context_created"
         ]
         self.assertTrue(compact_events)
         self.assertLess(compact_events[0].attributes["compression_ratio"], 1)
+        self.assertIn("included_evidence_ids", compact_events[0].attributes)
+        self.assertIn("included_signal_sections", compact_events[0].attributes)
 
     def test_phase04_timing_telemetry_has_duration_ms(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

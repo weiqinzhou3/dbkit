@@ -503,8 +503,16 @@ class MainEntrypointTest(unittest.TestCase):
                         "/repo/.dbkit/artifacts/req_cli_phase03.raw-evidence-index.json",
                         payload["messages"][0]["content"],
                     )
+                    case.assertEqual(
+                        payload["build_evidence_bundle_input"]["request_id"],
+                        normalized.request_id,
+                    )
+                    case.assertEqual(
+                        payload["build_evidence_bundle_input"]["raw_evidence_index_virtual_path"],
+                        "/repo/.dbkit/artifacts/req_cli_phase03.raw-evidence-index.json",
+                    )
                     self.evidence_structuring_tools[0].invoke(
-                        {"raw_evidence_index": payload["raw_evidence_index"]}
+                        payload["build_evidence_bundle_input"]
                     )
                     return {
                         "messages": [

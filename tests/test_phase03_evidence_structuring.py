@@ -9,9 +9,11 @@ from unittest.mock import patch
 
 from dbkit.cli import main as cli_main
 from dbkit.agents.mysql_analyzer import MySQLAnalyzerAgent
+from dbkit.runtime.deepagents_runtime import DeepAgentsRuntimeFactory
 from dbkit.runtime.artifacts import ArtifactStore
 from dbkit.runtime.evidence_structuring import EvidenceStructuringPipeline
 from dbkit.runtime.observability import TelemetryRecorder
+from dbkit.tools.evidence_deepagent import create_evidence_structuring_tools
 
 
 class Phase03EvidenceStructuringTest(unittest.TestCase):
@@ -23,8 +25,11 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
         self.assertEqual(registration.parent_agent, "mysql_analyzer")
         self.assertEqual(registration.name, "evidence_structuring")
         self.assertEqual(registration.skill_path, Path("skills/evidence/SKILL.md"))
-        self.assertTrue(registration.is_tool_allowed("parse_mysql_error_log"))
         self.assertTrue(registration.is_tool_allowed("build_evidence_bundle"))
+        self.assertFalse(registration.is_tool_allowed("parse_mysql_error_log"))
+        self.assertFalse(registration.is_tool_allowed("read_file"))
+        self.assertFalse(registration.is_tool_allowed("ls"))
+        self.assertFalse(registration.is_tool_allowed("glob"))
         self.assertFalse(registration.is_tool_allowed("collect_mysql_error_log"))
         self.assertFalse(registration.is_tool_allowed("read_remote_file"))
         self.assertFalse(registration.is_tool_allowed("kill_mysql_query"))
@@ -157,6 +162,9 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
         event_types = [event["event_type"] for event in events]
         self.assertIn("evidence_subagent_invoked", event_types)
         self.assertIn("evidence_subagent_completed", event_types)
+        self.assertIn("build_evidence_bundle_tool_started", event_types)
+        self.assertIn("build_evidence_bundle_tool_completed", event_types)
+        self.assertIn("raw_artifact_loaded_inside_tool", event_types)
         self.assertIn("deduplication_started", event_types)
         self.assertIn("deduplication_completed", event_types)
         self.assertIn("evidence_artifact_written", event_types)
@@ -171,6 +179,86 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
         self.assertIn("parse_mysql_error_log", tool_names)
         self.assertIn("filter_by_time_window", tool_names)
         self.assertNotIn("collect_mysql_error_log", tool_names)
+
+    def test_evidence_structuring_filesystem_blocks_raw_artifact_file_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            artifact_root = root / ".dbkit" / "artifacts"
+            raw_dir = artifact_root / "raw"
+            raw_dir.mkdir(parents=True)
+            (artifact_root / "req_x.raw-evidence-index.json").write_text("{}", encoding="utf-8")
+            (raw_dir / "rawev_x.json").write_text("{}", encoding="utf-8")
+
+            backend = DeepAgentsRuntimeFactory(
+                create_deep_agent=lambda **_kwargs: object(),
+                model=object(),
+                repo_dir=root,
+                workspace_dir=root,
+                skills_dir=Path("skills"),
+                agents_dir=Path("agents"),
+            )._filesystem_backend()
+
+            read_index = backend.read("/repo/.dbkit/artifacts/req_x.raw-evidence-index.json")
+            read_raw = backend.read("/repo/.dbkit/artifacts/raw/rawev_x.json")
+            read_relative = backend.read(".dbkit/artifacts/raw/rawev_x.json")
+            list_raw = backend.ls("/repo/.dbkit/artifacts/raw/")
+            glob_raw = backend.glob("*.json", "/repo/.dbkit/artifacts/raw/")
+
+        self.assertIn("blocked", read_index.error)
+        self.assertIn("blocked", read_raw.error)
+        self.assertIn("blocked", read_relative.error)
+        self.assertIn("blocked", list_raw.error)
+        self.assertIn("blocked", glob_raw.error)
+
+    def test_build_evidence_bundle_tool_accepts_structured_input_and_returns_small_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = _write_raw_evidence_fixture(root)
+            telemetry = TelemetryRecorder()
+            results = []
+            registration = MySQLAnalyzerAgent.from_skills_dir(Path("skills")).subagents[
+                "evidence_structuring"
+            ]
+            tool = create_evidence_structuring_tools(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=telemetry,
+                subagent_registration=registration,
+                result_sink=results.append,
+                repo_dir=root,
+            )[0]
+
+            payload = json.loads(
+                tool.invoke(
+                    {
+                        "request_id": "req_phase03",
+                        "raw_evidence_index_virtual_path": str(index_path),
+                        "raw_evidence_index_repo_path": ".dbkit/artifacts/req_phase03.raw-evidence-index.json",
+                        "artifact_root": ".dbkit/artifacts",
+                        "max_workers": 2,
+                        "per_item_timeout_seconds": 5,
+                        "total_timeout_seconds": 30,
+                    }
+                )
+            )
+
+        self.assertEqual(payload["status"], "evidence_bundle_created")
+        self.assertEqual(payload["request_id"], "req_phase03")
+        self.assertIn(".evidence-bundle.json", payload["artifact"])
+        self.assertIsInstance(payload["evidence_items"], int)
+        self.assertGreater(payload["raw_bytes_processed_inside_tool"], 0)
+        self.assertEqual(payload["parallel_workers"], 2)
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("evidence_items_payload", serialized)
+        self.assertNotIn("structured_payload", serialized)
+        self.assertNotIn("Aborted connection", serialized)
+        self.assertNotIn("SHOW GLOBAL STATUS", serialized)
+        event_types = [event.event_type for event in telemetry.events]
+        self.assertIn("build_evidence_bundle_tool_started", event_types)
+        self.assertIn("build_evidence_bundle_tool_completed", event_types)
+        self.assertEqual(event_types.count("build_evidence_bundle_tool_started"), 1)
+        self.assertEqual(event_types.count("build_evidence_bundle_tool_completed"), 1)
+        self.assertIn("raw_artifact_loaded_inside_tool", event_types)
+        self.assertEqual(len(results), 1)
 
     def test_evidence_structuring_processes_raw_items_in_parallel(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -244,12 +332,15 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
         system_prompt = Path("agents/evidence-structuring/system.md").read_text(encoding="utf-8")
         skill = Path("skills/evidence/SKILL.md").read_text(encoding="utf-8")
         mysql_skill = Path("skills/mysql-analyzer/SKILL.md").read_text(encoding="utf-8")
+        delegator_source = Path("src/dbkit/runtime/evidence_delegation.py").read_text(encoding="utf-8")
 
         self.assertIn("Call `build_evidence_bundle` exactly once", system_prompt)
         self.assertIn("Call `build_evidence_bundle` exactly once", skill)
         self.assertIn("Do not inspect", skill)
         self.assertIn("every raw artifact manually", skill)
         self.assertIn("Call the build_evidence_bundle tool exactly once", mysql_skill)
+        self.assertIn("Do not call read_file for raw evidence artifacts", delegator_source)
+        self.assertNotIn("paths for read_file", delegator_source)
 
     def test_mysql_analyzer_skill_requires_evidence_structuring_delegation(self) -> None:
         skill = Path("skills/mysql-analyzer/SKILL.md").read_text(encoding="utf-8")

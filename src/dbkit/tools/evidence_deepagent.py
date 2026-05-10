@@ -4,6 +4,7 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from time import perf_counter_ns
 
 from langchain_core.tools import StructuredTool
 
@@ -26,9 +27,24 @@ def create_evidence_structuring_tools(
     per_item_timeout_seconds: int = 30,
     total_timeout_seconds: int = 120,
 ) -> tuple[Any, ...]:
-    def build_evidence_bundle(raw_evidence_index: str) -> str:
+    def build_evidence_bundle(
+        request_id: str = "",
+        raw_evidence_index_virtual_path: str = "",
+        raw_evidence_index_repo_path: str = "",
+        artifact_root: str = "",
+        max_workers: int = max_workers,
+        per_item_timeout_seconds: int = per_item_timeout_seconds,
+        total_timeout_seconds: int = total_timeout_seconds,
+        raw_evidence_index: str = "",
+    ) -> str:
         """Build an EvidenceBundle from a DBKit RawEvidence index artifact."""
-        host_index_path = to_host_path(raw_evidence_index, repo_dir=repo_dir)
+        started_ns = perf_counter_ns()
+        index_ref = (
+            raw_evidence_index_virtual_path
+            or raw_evidence_index
+            or raw_evidence_index_repo_path
+        )
+        host_index_path = to_host_path(index_ref, repo_dir=repo_dir)
         result = EvidenceStructuringPipeline(
             artifact_store=artifact_store,
             telemetry=telemetry,
@@ -38,16 +54,23 @@ def create_evidence_structuring_tools(
             total_timeout_seconds=total_timeout_seconds,
         ).run(host_index_path)
         result_sink(result)
+        artifact_ref = (
+            _repo_relative(result.bundle_artifact.path, repo_dir=repo_dir)
+            if result.bundle_artifact is not None
+            else None
+        )
+        raw_bytes_processed = (
+            int(result.bundle.processing_summary.get("raw_bytes") or 0)
+            if result.bundle is not None
+            else 0
+        )
         payload = {
             "status": result.status,
             "request_id": result.request_id,
             "parent_agent": subagent_registration.parent_agent,
             "subagent": subagent_registration.name,
-            "evidence_bundle_artifact": (
-                str(result.bundle_artifact.path)
-                if result.bundle_artifact is not None
-                else None
-            ),
+            "artifact": artifact_ref,
+            "evidence_bundle_artifact": artifact_ref,
             "evidence_items": (
                 len(result.bundle.evidence_items)
                 if result.bundle is not None
@@ -58,9 +81,18 @@ def create_evidence_structuring_tools(
                 if result.bundle is not None
                 else None
             ),
+            "warnings": (
+                list(result.bundle.quality.get("warnings") or [])
+                if result.bundle is not None
+                else []
+            ),
+            "duration_ms": max(0, (perf_counter_ns() - started_ns) // 1_000_000),
+            "raw_bytes_processed_inside_tool": raw_bytes_processed,
+            "parallel_workers": max_workers,
             "blocking_issues": list(result.blocking_issues),
         }
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return serialized
 
     return (
         StructuredTool.from_function(
@@ -77,3 +109,10 @@ def create_evidence_structuring_tools(
             ),
         ),
     )
+
+
+def _repo_relative(path: Path, *, repo_dir: Path) -> str:
+    try:
+        return path.relative_to(repo_dir).as_posix()
+    except ValueError:
+        return path.as_posix()

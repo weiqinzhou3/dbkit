@@ -152,14 +152,26 @@ class DeepAgentsRuntimeFactory:
 
     def _filesystem_backend(self) -> Any:
         configure_langchain_deserialization_allowlist("messages")
+        from deepagents.backends.protocol import GlobResult, LsResult, ReadResult
         from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
 
+        default_backend = _RawArtifactBlockingBackend(
+            StateBackend(),
+            read_result_cls=ReadResult,
+            ls_result_cls=LsResult,
+            glob_result_cls=GlobResult,
+        )
         return CompositeBackend(
-            default=StateBackend(),
+            default=default_backend,
             routes={
-                "/repo/": FilesystemBackend(
-                    root_dir=self.repo_dir,
-                    virtual_mode=True,
+                "/repo/": _RawArtifactBlockingBackend(
+                    FilesystemBackend(
+                        root_dir=self.repo_dir,
+                        virtual_mode=True,
+                    ),
+                    read_result_cls=ReadResult,
+                    ls_result_cls=LsResult,
+                    glob_result_cls=GlobResult,
                 ),
                 "/workspace/": FilesystemBackend(
                     root_dir=self.workspace_dir,
@@ -192,3 +204,73 @@ class DeepAgentsRuntimeFactory:
         if str(host_path).endswith("/") and not virtual_path.endswith("/"):
             virtual_path += "/"
         return virtual_path
+
+
+class _RawArtifactBlockingBackend:
+    def __init__(
+        self,
+        backend: Any,
+        *,
+        read_result_cls: Any,
+        ls_result_cls: Any,
+        glob_result_cls: Any,
+    ) -> None:
+        self._backend = backend
+        self._read_result_cls = read_result_cls
+        self._ls_result_cls = ls_result_cls
+        self._glob_result_cls = glob_result_cls
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> Any:
+        if _is_blocked_raw_artifact_path(file_path):
+            return self._read_result_cls(error=_blocked_raw_artifact_message(file_path))
+        return self._backend.read(file_path, offset=offset, limit=limit)
+
+    async def aread(self, file_path: str, offset: int = 0, limit: int = 2000) -> Any:
+        if _is_blocked_raw_artifact_path(file_path):
+            return self._read_result_cls(error=_blocked_raw_artifact_message(file_path))
+        return await self._backend.aread(file_path, offset=offset, limit=limit)
+
+    def ls(self, path: str) -> Any:
+        if _is_blocked_raw_artifact_path(path):
+            return self._ls_result_cls(error=_blocked_raw_artifact_message(path))
+        return self._backend.ls(path)
+
+    async def als(self, path: str) -> Any:
+        if _is_blocked_raw_artifact_path(path):
+            return self._ls_result_cls(error=_blocked_raw_artifact_message(path))
+        return await self._backend.als(path)
+
+    def glob(self, pattern: str, path: str = "/") -> Any:
+        candidate = f"{path.rstrip('/')}/{pattern.lstrip('/')}"
+        if _is_blocked_raw_artifact_path(path) or _is_blocked_raw_artifact_path(candidate):
+            return self._glob_result_cls(error=_blocked_raw_artifact_message(candidate))
+        return self._backend.glob(pattern, path)
+
+    async def aglob(self, pattern: str, path: str = "/") -> Any:
+        candidate = f"{path.rstrip('/')}/{pattern.lstrip('/')}"
+        if _is_blocked_raw_artifact_path(path) or _is_blocked_raw_artifact_path(candidate):
+            return self._glob_result_cls(error=_blocked_raw_artifact_message(candidate))
+        return await self._backend.aglob(pattern, path)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._backend, name)
+
+
+def _is_blocked_raw_artifact_path(path: str) -> bool:
+    normalized = path.replace("\\", "/").lstrip("/")
+    if normalized.startswith("repo/"):
+        normalized = normalized.removeprefix("repo/").lstrip("/")
+    if normalized.startswith(".dbkit/artifacts/raw/"):
+        return True
+    if normalized.startswith(".dbkit/artifacts/") and normalized.endswith(
+        ".raw-evidence-index.json"
+    ):
+        return True
+    return False
+
+
+def _blocked_raw_artifact_message(path: str) -> str:
+    return (
+        "blocked: evidence_structuring must not use filesystem read/list/glob "
+        f"for raw evidence artifacts ({path}); call build_evidence_bundle instead"
+    )
