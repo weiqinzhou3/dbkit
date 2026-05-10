@@ -46,6 +46,7 @@ class RuntimeConfig:
     phase04_max_findings_generation_retries: int = 1
     phase04_max_validation_retries: int = 1
     phase04_max_agent_iterations: int = 6
+    phase04_max_findings: int = 5
 
 
 @dataclass(frozen=True)
@@ -89,11 +90,32 @@ class CollectionConfig:
 
 
 @dataclass(frozen=True)
+class EvidenceStructuringConfig:
+    max_workers: int = 4
+    per_item_timeout_seconds: int = 30
+    total_timeout_seconds: int = 120
+    max_agent_iterations: int = 4
+
+
+@dataclass(frozen=True)
+class Phase04Config:
+    findings_generation_timeout_seconds: int = 120
+    validation_timeout_seconds: int = 60
+    max_findings_generation_retries: int = 1
+    max_validation_retries: int = 1
+    max_findings: int = 5
+    max_prompt_chars: int = 30_000
+    max_agent_iterations: int = 6
+
+
+@dataclass(frozen=True)
 class AppConfig:
     model: ModelConfig
     agent: AgentConfig
     runtime: RuntimeConfig
     collection: CollectionConfig = field(default_factory=CollectionConfig)
+    evidence_structuring: EvidenceStructuringConfig = field(default_factory=EvidenceStructuringConfig)
+    phase04: Phase04Config = field(default_factory=Phase04Config)
 
 
 def load_app_config(config_path: str | Path | None = None) -> AppConfig:
@@ -102,11 +124,16 @@ def load_app_config(config_path: str | Path | None = None) -> AppConfig:
         raise FileNotFoundError(f"Config file not found: {path}")
 
     document = _load_yaml_document(path)
+    runtime = _load_runtime_config(_require_mapping(document, "runtime"))
     return AppConfig(
         model=_load_model_config(_require_mapping(document, "model")),
         agent=_load_agent_config(_optional_mapping(document, "agent")),
-        runtime=_load_runtime_config(_require_mapping(document, "runtime")),
+        runtime=runtime,
         collection=_load_collection_config(_optional_mapping(document, "collection")),
+        evidence_structuring=_load_evidence_structuring_config(
+            _optional_mapping(document, "evidence_structuring")
+        ),
+        phase04=_load_phase04_config(_optional_mapping(document, "phase04"), runtime),
     )
 
 
@@ -165,6 +192,7 @@ def _load_runtime_config(data: dict[str, Any]) -> RuntimeConfig:
         phase04_max_agent_iterations=_optional_int(
             data, "phase04_max_agent_iterations", 6
         ),
+        phase04_max_findings=_optional_int(data, "phase04_max_findings", 5),
     )
 
 
@@ -207,6 +235,49 @@ def _load_collection_config(data: dict[str, Any] | None) -> CollectionConfig:
         ),
         metrics=MetricsCollectionConfig(
             mysqld_exporter_url=_optional_string(metrics, "mysqld_exporter_url"),
+        ),
+    )
+
+
+def _load_evidence_structuring_config(data: dict[str, Any] | None) -> EvidenceStructuringConfig:
+    data = data or {}
+    return EvidenceStructuringConfig(
+        max_workers=_optional_int(data, "max_workers", 4),
+        per_item_timeout_seconds=_optional_int(data, "per_item_timeout_seconds", 30),
+        total_timeout_seconds=_optional_int(data, "total_timeout_seconds", 120),
+        max_agent_iterations=_optional_int(data, "max_agent_iterations", 4),
+    )
+
+
+def _load_phase04_config(data: dict[str, Any] | None, runtime: RuntimeConfig) -> Phase04Config:
+    data = data or {}
+    return Phase04Config(
+        findings_generation_timeout_seconds=_optional_int(
+            data,
+            "findings_generation_timeout_seconds",
+            runtime.phase04_findings_generation_timeout_seconds,
+        ),
+        validation_timeout_seconds=_optional_int(
+            data,
+            "validation_timeout_seconds",
+            runtime.phase04_validation_timeout_seconds,
+        ),
+        max_findings_generation_retries=_optional_int(
+            data,
+            "max_findings_generation_retries",
+            runtime.phase04_max_findings_generation_retries,
+        ),
+        max_validation_retries=_optional_int(
+            data,
+            "max_validation_retries",
+            runtime.phase04_max_validation_retries,
+        ),
+        max_findings=_optional_int(data, "max_findings", runtime.phase04_max_findings),
+        max_prompt_chars=_optional_int(
+            data, "max_prompt_chars", runtime.phase04_max_prompt_chars
+        ),
+        max_agent_iterations=_optional_int(
+            data, "max_agent_iterations", runtime.phase04_max_agent_iterations
         ),
     )
 

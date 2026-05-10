@@ -20,11 +20,13 @@ class EvidenceStructuringDelegator:
         telemetry: TelemetryRecorder,
         repo_dir: Path,
         artifact_root: Path,
+        max_agent_iterations: int = 4,
     ) -> None:
         self.mysql_analyzer_runtime = mysql_analyzer_runtime
         self.telemetry = telemetry
         self.repo_dir = repo_dir
         self.artifact_root = artifact_root
+        self.max_agent_iterations = max_agent_iterations
 
     def run(
         self,
@@ -69,21 +71,25 @@ class EvidenceStructuringDelegator:
             )
             return None
 
-        invoke(
-            {
-                "mode": "evidence_structuring_delegation",
-                "raw_evidence_index": virtual_path,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": _delegation_prompt(
-                            raw_evidence_index_repo_relative=repo_relative_path,
-                            raw_evidence_index_virtual_path=virtual_path,
-                        ),
-                    }
-                ],
-            }
-        )
+        payload = {
+            "mode": "evidence_structuring_delegation",
+            "raw_evidence_index": virtual_path,
+            "max_agent_iterations": self.max_agent_iterations,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": _delegation_prompt(
+                        raw_evidence_index_repo_relative=repo_relative_path,
+                        raw_evidence_index_virtual_path=virtual_path,
+                    ),
+                }
+            ],
+        }
+        config = {"recursion_limit": self.max_agent_iterations}
+        try:
+            invoke(payload, config)
+        except TypeError:
+            invoke(payload)
         if result_sink:
             result = result_sink[-1]
             bundle_artifact = (
@@ -146,7 +152,9 @@ def _delegation_prompt(
         "- Do not prepend '/' to repo-relative artifact paths.\n"
         "- Repository artifacts must use /repo/.dbkit/... paths for read_file.\n"
         "- If payload.content_ref is .dbkit/artifacts/raw/<id>.json, read it as /repo/.dbkit/artifacts/raw/<id>.json.\n"
-        "- Call the build_evidence_bundle tool with the raw_evidence_index_virtual_path path.\n"
+        "- Call the build_evidence_bundle tool exactly once with the raw_evidence_index_virtual_path path.\n"
+        "- Do not inspect every raw artifact manually.\n"
+        "- Do not call read_file for each artifact unless build_evidence_bundle returns a specific missing file error.\n"
         "- Do not call live collectors.\n"
         "- Do not request additional collection.\n"
         "- Do not generate findings, root cause, verdict, final summary, or recommendations.\n\n"

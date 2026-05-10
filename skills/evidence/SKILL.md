@@ -23,6 +23,12 @@ evidence processing tool with the RawEvidence index path. That tool performs
 the allowed deterministic loading, parsing, filtering, aggregation,
 deduplication, raw reference validation, and bundle persistence work.
 
+Call `build_evidence_bundle` exactly once in normal operation. Do not inspect
+every raw artifact manually. Do not call `read_file` for each artifact unless
+`build_evidence_bundle` returns a specific missing file error. If
+`build_evidence_bundle` succeeds, return the tool JSON directly without
+summarizing the large EvidenceBundle.
+
 Use the `raw_evidence_index` path provided by runtime exactly as given. Do not
 prepend `/` to relative artifact paths. If runtime provides a repository
 artifact path, it must be a DeepAgents virtual path under `/repo/`, for example

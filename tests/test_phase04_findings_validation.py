@@ -374,7 +374,7 @@ class Phase04FindingsValidationTest(unittest.TestCase):
             self.assertIn("duration_ms", event.attributes)
             self.assertGreaterEqual(event.attributes["duration_ms"], 0)
 
-    def test_validation_timeout_returns_human_review_required(self) -> None:
+    def test_validation_timeout_returns_analysis_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             bundle_path = _write_evidence_bundle(root)
@@ -385,11 +385,14 @@ class Phase04FindingsValidationTest(unittest.TestCase):
                 mysql_analyzer_runtime=FakeAnalyzerRuntime(_findings_payload("req_phase04")),
                 validation_runtime=FakeTimeoutRuntime(),
             ).run(bundle_path)
+            timeout_payload = _artifact_payload(result.artifacts, "AnalysisTimeout")
 
-        self.assertEqual(result.status, "human_review_required")
+        self.assertEqual(result.status, "analysis_timeout")
+        self.assertIn("validation_timeout", result.blocking_issues)
+        self.assertEqual(timeout_payload["reason"], "validation_timeout")
         self.assertTrue(any(event.attributes.get("status") == "timeout" for event in result.telemetry))
 
-    def test_findings_generation_timeout_returns_human_review_required(self) -> None:
+    def test_findings_generation_timeout_returns_analysis_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             bundle_path = _write_evidence_bundle(root)
@@ -400,9 +403,11 @@ class Phase04FindingsValidationTest(unittest.TestCase):
                 mysql_analyzer_runtime=FakeTimeoutRuntime(),
                 validation_runtime=FakeValidationRuntime(_validation_payload("req_phase04")),
             ).run(bundle_path)
+            timeout_payload = _artifact_payload(result.artifacts, "AnalysisTimeout")
 
-        self.assertEqual(result.status, "human_review_required")
+        self.assertEqual(result.status, "analysis_timeout")
         self.assertIn("findings_generation_timeout", result.blocking_issues)
+        self.assertEqual(timeout_payload["reason"], "findings_generation_timeout")
 
     def test_cli_from_evidence_bundle_replay_runs_phase04(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -568,6 +573,34 @@ class Phase04FindingsValidationTest(unittest.TestCase):
         self.assertIn("validation_status", validation_skill)
         self.assertIn("passed", validation_skill)
         self.assertIn("requires_human_review", validation_skill)
+
+    def test_compact_context_preserves_all_ids_and_records_priority_truncation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_path = _write_large_evidence_bundle(root)
+            analyzer = FakeAnalyzerRuntime(_findings_payload("req_phase04"))
+
+            result = Phase04AnalysisPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                mysql_analyzer_runtime=analyzer,
+                validation_runtime=FakeValidationRuntime(_validation_payload("req_phase04")),
+                max_prompt_chars=1800,
+            ).run(bundle_path)
+
+        self.assertEqual(result.status, "analysis_completed_with_warnings")
+        compact = analyzer.invocations[0]["compact_analysis_context"]
+        ids = {item["evidence_id"] for item in compact["evidence_items"]}
+        self.assertIn("ev_error_log", ids)
+        self.assertIn("ev_status", ids)
+        self.assertIn("ev_large_status", ids)
+        self.assertTrue(compact["context_truncated"])
+        self.assertEqual(compact["truncation_policy"], "priority_based")
+        self.assertTrue(compact["omitted_sections"])
+        self.assertLessEqual(
+            len(json.dumps(compact, ensure_ascii=False, sort_keys=True)),
+            1800,
+        )
 
     def test_normalize_request_preserves_execution_boundary_from_intake_json(self) -> None:
         normalized = normalize_request(

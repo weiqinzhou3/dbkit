@@ -22,6 +22,9 @@ def create_evidence_structuring_tools(
     subagent_registration: EvidenceStructuringSubagentRegistration,
     result_sink: Callable[[EvidenceStructuringResult], None],
     repo_dir: Path,
+    max_workers: int = 4,
+    per_item_timeout_seconds: int = 30,
+    total_timeout_seconds: int = 120,
 ) -> tuple[Any, ...]:
     def build_evidence_bundle(raw_evidence_index: str) -> str:
         """Build an EvidenceBundle from a DBKit RawEvidence index artifact."""
@@ -30,6 +33,9 @@ def create_evidence_structuring_tools(
             artifact_store=artifact_store,
             telemetry=telemetry,
             subagent_registration=subagent_registration,
+            max_workers=max_workers,
+            per_item_timeout_seconds=per_item_timeout_seconds,
+            total_timeout_seconds=total_timeout_seconds,
         ).run(host_index_path)
         result_sink(result)
         payload = {

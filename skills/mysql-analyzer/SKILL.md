@@ -224,6 +224,8 @@ Rules:
 - `mysql_analyzer` findings_generation mode must consume EvidenceBundle, not RawEvidence.
 - If EvidenceBundle is missing or stale, `mysql_analyzer` must request or delegate evidence structuring before findings_generation.
 - The delegation task must give `evidence_structuring` the RawEvidence index path and require it to call evidence processing tools, especially `build_evidence_bundle`.
+- Call the build_evidence_bundle tool exactly once through `evidence_structuring`.
+- Do not ask `evidence_structuring` to inspect every raw artifact manually unless `build_evidence_bundle` returns a specific missing file error.
 - `mysql_analyzer` must stop at EvidenceBundle creation in Phase-03.
 - `mysql_analyzer` must not generate findings, root cause, verdict, final summary, or recommendations in Phase-03.
 

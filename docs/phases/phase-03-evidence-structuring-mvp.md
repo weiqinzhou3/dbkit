@@ -189,6 +189,8 @@ Evidence Structuring Subagent:
 
 Evidence Processing Tools:
   perform deterministic parsing, filtering, aggregation, token estimation, raw_ref mapping, and bundle construction
+  may process independent RawEvidence items concurrently inside build_evidence_bundle
+  must isolate per-item parser failures so one bad artifact does not block the bundle
 
 Runtime:
   registers MySQL Analyzer and Evidence Structuring Subagent

@@ -157,6 +157,7 @@ Optional artifacts:
 ```text
 .dbkit/artifacts/<request_id>.finding-evidence-map.json
 .dbkit/artifacts/<request_id>.human-review.json
+.dbkit/artifacts/<request_id>.analysis-timeout.json
 ```
 
 CLI output should include:
@@ -164,7 +165,7 @@ CLI output should include:
 ```text
 DBKit 0.1.0
 phase=phase-04
-status=analysis_completed | analysis_completed_with_warnings | human_review_required | validation_failed
+status=analysis_completed | analysis_completed_with_warnings | human_review_required | validation_failed | analysis_timeout
 target_agent=mysql_analyzer
 evidence_bundle_artifact=.dbkit/artifacts/<request_id>.evidence-bundle.json
 findings_artifact=.dbkit/artifacts/<request_id>.findings-draft.json
@@ -637,6 +638,16 @@ If still invalid:
 ```text
 status=validation_failed or human_review_required
 ```
+
+If Phase-04 model execution times out, the status must be:
+
+```text
+status=analysis_timeout
+reason=findings_generation_timeout | validation_timeout
+```
+
+Timeout is not `human_review_required`. Human review is reserved for evidence
+ambiguity, contradiction, unsupported conclusions, or high-risk judgment.
 
 ---
 

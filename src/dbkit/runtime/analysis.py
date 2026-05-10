@@ -39,6 +39,8 @@ class Phase04AnalysisPipeline:
         max_findings_generation_retries: int = 1,
         max_validation_retries: int = 1,
         max_agent_iterations: int = 6,
+        max_findings: int = 5,
+        model_name: str | None = None,
     ) -> None:
         self.artifact_store = artifact_store
         self.telemetry = telemetry
@@ -51,6 +53,8 @@ class Phase04AnalysisPipeline:
         self.max_findings_generation_retries = max_findings_generation_retries
         self.max_validation_retries = max_validation_retries
         self.max_agent_iterations = max_agent_iterations
+        self.max_findings = max_findings
+        self.model_name = model_name
         self._last_timeout_stage: str | None = None
 
     def run(
@@ -59,6 +63,7 @@ class Phase04AnalysisPipeline:
         *,
         expected_request_id: str | None = None,
     ) -> Phase04AnalysisResult:
+        self._last_timeout_stage = None
         started_ns = perf_counter_ns()
         bundle_path = Path(evidence_bundle_path)
         request_id = "unknown"
@@ -147,10 +152,12 @@ class Phase04AnalysisPipeline:
         )
         if findings_payload is None:
             if self._last_timeout_stage == "findings_generation":
-                return self._human_review_timeout(
+                return self._analysis_timeout(
                     request_id=request_id,
                     artifacts=artifacts,
                     issues=("findings_generation_timeout",),
+                    reason="findings_generation_timeout",
+                    input_bundle_ref=input_bundle_ref,
                     started_ns=started_ns,
                 )
             return self._failed(
@@ -195,6 +202,15 @@ class Phase04AnalysisPipeline:
             input_bundle_ref=input_bundle_ref,
             findings_artifact=findings_artifact.path,
         )
+        if self._last_timeout_stage == "validation":
+            return self._analysis_timeout(
+                request_id=request_id,
+                artifacts=artifacts,
+                issues=("validation_timeout",),
+                reason="validation_timeout",
+                input_bundle_ref=input_bundle_ref,
+                started_ns=started_ns,
+            )
         if validation_payload is None:
             return self._failed(
                 request_id=request_id,
@@ -354,6 +370,9 @@ class Phase04AnalysisPipeline:
             request_id=request_id,
             input_evidence_bundle=input_bundle_ref,
             mode="findings_generation",
+            compact_context_chars=len(json.dumps(compact_context, ensure_ascii=False, sort_keys=True)),
+            model_name=self.model_name,
+            timeout_seconds=self.findings_generation_timeout_seconds,
             status="started",
         )
         payload = {
@@ -362,13 +381,15 @@ class Phase04AnalysisPipeline:
             "compact_analysis_context": compact_context,
             "retry_context": retry_context or {},
             "max_agent_iterations": self.max_agent_iterations,
+            "max_findings": self.max_findings,
             "messages": [
                 {
                     "role": "user",
                     "content": (
                         "Output only DBKit FindingsDraft JSON. Consume only the "
                         "compact_analysis_context; do not read RawEvidence and do not "
-                        "request collection.\n\n"
+                        f"request collection. Return at most {self.max_findings} findings. "
+                        "Use concise evidence-bound statements only.\n\n"
                         + (
                             "Previous FindingsDraft was invalid. Fix these issues:\n"
                             + json.dumps(retry_context, ensure_ascii=False, sort_keys=True)
@@ -397,6 +418,7 @@ class Phase04AnalysisPipeline:
                 input_evidence_bundle=input_bundle_ref,
                 mode="findings_generation",
                 timeout_seconds=self.findings_generation_timeout_seconds,
+                model_name=self.model_name,
                 status="timeout",
                 duration_ms=_duration_ms(started_ns),
             )
@@ -408,6 +430,8 @@ class Phase04AnalysisPipeline:
             request_id=request_id,
             input_evidence_bundle=input_bundle_ref,
             mode="findings_generation",
+            model_name=self.model_name,
+            output_chars=len(json.dumps(parsed, ensure_ascii=False, sort_keys=True)) if parsed is not None else 0,
             status="completed" if parsed is not None else "failed",
             duration_ms=_duration_ms(started_ns),
         )
@@ -706,6 +730,8 @@ class Phase04AnalysisPipeline:
             input_evidence_bundle=input_bundle_ref,
             input_findings_artifact=_artifact_ref(findings_artifact, self.repo_dir),
             finding_count=len(findings_draft.get("findings") or []),
+            model_name=self.model_name,
+            timeout_seconds=self.validation_timeout_seconds,
             status="started",
         )
         payload = {
@@ -744,6 +770,7 @@ class Phase04AnalysisPipeline:
                 timeout_seconds=self.validation_timeout_seconds,
             )
         except TimeoutError:
+            self._last_timeout_stage = "validation"
             self._emit(
                 "validation_completed",
                 "Validation agent timed out",
@@ -754,29 +781,7 @@ class Phase04AnalysisPipeline:
                 status="timeout",
                 duration_ms=_duration_ms(started_ns),
             )
-            return {
-                "request_id": request_id,
-                "phase": "phase-04",
-                "input_findings_artifact": _artifact_ref(findings_artifact, self.repo_dir),
-                "input_evidence_bundle": input_bundle_ref,
-                "validated_findings": [],
-                "blocked_findings": [
-                    {
-                        "finding_id": item.get("finding_id"),
-                        "reason": "validation_timeout",
-                        "validation_status": "blocked",
-                    }
-                    for item in findings_draft.get("findings") or []
-                    if isinstance(item, dict)
-                ],
-                "downgraded_findings": [],
-                "requires_human_review": True,
-                "validation_summary": {
-                    "passed": 0,
-                    "blocked": len(findings_draft.get("findings") or []),
-                    "downgraded": 0,
-                },
-            }
+            return None
         parsed = extract_json_from_invoke_result(result)
         self._emit(
             "validation_completed",
@@ -785,6 +790,7 @@ class Phase04AnalysisPipeline:
             input_evidence_bundle=input_bundle_ref,
             input_findings_artifact=_artifact_ref(findings_artifact, self.repo_dir),
             status="completed" if parsed is not None else "failed",
+            output_chars=len(json.dumps(parsed, ensure_ascii=False, sort_keys=True)) if parsed is not None else 0,
             duration_ms=_duration_ms(started_ns),
         )
         return parsed
@@ -1211,21 +1217,37 @@ class Phase04AnalysisPipeline:
             lines.append(f"- {key}: `{value}`")
         return "\n".join(lines) + "\n"
 
-    def _human_review_timeout(
+    def _analysis_timeout(
         self,
         *,
         request_id: str,
         artifacts: list[Any],
         issues: tuple[str, ...],
+        reason: str,
+        input_bundle_ref: str,
         started_ns: int,
     ) -> Phase04AnalysisResult:
+        timeout_artifact = self.artifact_store.persist_analysis_timeout(
+            request_id,
+            {
+                "request_id": request_id,
+                "phase": "phase-04",
+                "status": "analysis_timeout",
+                "reason": reason,
+                "input_evidence_bundle": input_bundle_ref,
+                "blocking_issues": list(issues),
+            },
+        )
+        artifacts.append(timeout_artifact)
         self._emit(
             "phase04_completed",
-            "Phase-04 stopped with human review required after timeout",
+            "Phase-04 stopped after analysis timeout",
             request_id=request_id,
             blocking_issues=list(issues),
+            reason=reason,
+            input_evidence_bundle=input_bundle_ref,
             duration_ms=_duration_ms(started_ns),
-            status="human_review_required",
+            status="analysis_timeout",
         )
         telemetry_artifact = self.artifact_store.persist_analysis_telemetry(
             request_id, self.telemetry.events
@@ -1234,7 +1256,7 @@ class Phase04AnalysisPipeline:
         return Phase04AnalysisResult(
             request_id=request_id,
             phase="phase-04",
-            status="human_review_required",
+            status="analysis_timeout",
             findings_draft=None,
             validation_result=None,
             verdict=None,
@@ -1242,6 +1264,7 @@ class Phase04AnalysisPipeline:
             artifacts=tuple(artifacts),
             telemetry=tuple(self.telemetry.events),
             blocking_issues=issues,
+            metadata={"reason": reason, "input_evidence_bundle": input_bundle_ref},
         )
 
     def _failed(
@@ -1326,6 +1349,9 @@ def _compact_analysis_context(
         "request_id": evidence_bundle.get("request_id"),
         "phase": "phase-04",
         "input_evidence_bundle": input_bundle_ref,
+        "context_truncated": False,
+        "omitted_sections": [],
+        "truncation_policy": "none",
         "incident": {
             "event": evidence_bundle.get("event") or {},
             "time_window": evidence_bundle.get("time_window") or {},
@@ -1455,36 +1481,110 @@ def _compact_raw_ref(ref: Any) -> dict[str, Any]:
 
 def _bound_compact_context(context: dict[str, Any], max_chars: int) -> dict[str, Any]:
     bounded = dict(context)
-    while len(json.dumps(bounded, ensure_ascii=False, sort_keys=True)) > max_chars:
-        items = list(bounded.get("evidence_items") or [])
-        if len(items) > 1:
-            bounded["evidence_items"] = items[:-1]
-            bounded["truncated"] = True
+    if len(json.dumps(bounded, ensure_ascii=False, sort_keys=True)) <= max_chars:
+        return bounded
+
+    omitted: list[str] = []
+    bounded["context_truncated"] = True
+    bounded["truncation_policy"] = "priority_based"
+
+    items = []
+    for item in bounded.get("evidence_items") or []:
+        if not isinstance(item, dict):
             continue
+        copied = dict(item)
+        if isinstance(copied.get("error_log"), dict):
+            error_log = dict(copied["error_log"])
+            if len(error_log.get("sample_events") or []) > 0:
+                error_log["sample_events"] = []
+                omitted.append(f"{copied.get('evidence_id')}.sample_events")
+            if len(error_log.get("top_patterns") or []) > 5:
+                error_log["top_patterns"] = error_log["top_patterns"][:5]
+                omitted.append(f"{copied.get('evidence_id')}.top_patterns_tail")
+            copied["error_log"] = error_log
+        if isinstance(copied.get("raw_refs"), list) and len(copied["raw_refs"]) > 3:
+            copied["raw_refs"] = copied["raw_refs"][:3]
+            omitted.append(f"{copied.get('evidence_id')}.raw_refs_tail")
+        items.append(copied)
+    bounded["evidence_items"] = items
+
+    if len(json.dumps(bounded, ensure_ascii=False, sort_keys=True)) > max_chars:
+        omitted.append("structured_details")
+        bounded["evidence_items"] = [
+            {
+                "evidence_id": item.get("evidence_id"),
+                "evidence_type": item.get("evidence_type"),
+                "summary": _trim_text(str(item.get("summary") or ""), 220),
+                "quality_flags": _limit_list(item.get("quality_flags"), 5),
+                "raw_refs": _limit_list(item.get("raw_refs"), 2),
+            }
+            for item in bounded.get("evidence_items") or []
+            if isinstance(item, dict)
+        ]
+    if len(json.dumps(bounded, ensure_ascii=False, sort_keys=True)) > max_chars:
+        omitted.append("long_summaries")
+        for item in bounded.get("evidence_items") or []:
+            if isinstance(item, dict):
+                item["summary"] = _trim_text(str(item.get("summary") or ""), 100)
+    if len(json.dumps(bounded, ensure_ascii=False, sort_keys=True)) > max_chars:
+        omitted.append("raw_refs")
+        for item in bounded.get("evidence_items") or []:
+            if isinstance(item, dict):
+                item["raw_refs"] = []
+                item["summary"] = _trim_text(str(item.get("summary") or ""), 60)
+    if len(json.dumps(bounded, ensure_ascii=False, sort_keys=True)) > max_chars:
+        omitted.append("coverage_details")
+        bounded["coverage"] = {
+            "source_raw_evidence_count": (bounded.get("coverage") or {}).get("source_raw_evidence_count"),
+            "processed_raw_evidence_count": (bounded.get("coverage") or {}).get("processed_raw_evidence_count"),
+        }
         bounded["quality"] = {
             "overall_status": (bounded.get("quality") or {}).get("overall_status"),
-            "warnings": _limit_list((bounded.get("quality") or {}).get("warnings"), 5),
+            "warnings": _limit_list((bounded.get("quality") or {}).get("warnings"), 3),
         }
-        serialized = json.dumps(bounded, ensure_ascii=False, sort_keys=True)
-        if len(serialized) <= max_chars:
-            break
-        bounded = {
-            "request_id": context.get("request_id"),
-            "phase": "phase-04",
-            "input_evidence_bundle": context.get("input_evidence_bundle"),
-            "quality": bounded.get("quality"),
-            "evidence_items": [
-                {
-                    "evidence_id": item.get("evidence_id"),
-                    "evidence_type": item.get("evidence_type"),
-                    "summary": _trim_text(str(item.get("summary") or ""), 400),
-                }
-                for item in _limit_list(context.get("evidence_items"), 10)
-                if isinstance(item, dict)
-            ],
-            "truncated": True,
+    if len(json.dumps(bounded, ensure_ascii=False, sort_keys=True)) > max_chars:
+        omitted.append("secondary_metadata")
+        bounded.pop("processing_summary", None)
+        bounded.pop("artifact_refs", None)
+        bounded["incident"] = {
+            "time_window": (bounded.get("incident") or {}).get("time_window") or {}
         }
-        break
+    bounded["omitted_sections"] = list(dict.fromkeys(omitted))
+    bounded["actual_prompt_chars"] = len(
+        json.dumps(bounded, ensure_ascii=False, sort_keys=True)
+    )
+    bounded["max_prompt_chars"] = max_chars
+    bounded["actual_prompt_chars"] = len(
+        json.dumps(bounded, ensure_ascii=False, sort_keys=True)
+    )
+    if bounded["actual_prompt_chars"] > max_chars:
+        omitted.append("quality_warning_tail")
+        bounded["quality"] = {
+            "overall_status": (bounded.get("quality") or {}).get("overall_status"),
+            "warnings": [],
+        }
+        bounded["omitted_sections"] = list(dict.fromkeys(omitted))
+        bounded["actual_prompt_chars"] = len(
+            json.dumps(bounded, ensure_ascii=False, sort_keys=True)
+        )
+    if bounded["actual_prompt_chars"] > max_chars:
+        omitted.append("nonessential_context")
+        bounded["coverage"] = {}
+        bounded["incident"] = {}
+        bounded["quality"] = {}
+        bounded["omitted_sections"] = list(dict.fromkeys(omitted))
+        bounded["actual_prompt_chars"] = len(
+            json.dumps(bounded, ensure_ascii=False, sort_keys=True)
+        )
+    if bounded["actual_prompt_chars"] > max_chars:
+        omitted.append("summary_tail")
+        for item in bounded.get("evidence_items") or []:
+            if isinstance(item, dict):
+                item["summary"] = _trim_text(str(item.get("summary") or ""), 40)
+        bounded["omitted_sections"] = list(dict.fromkeys(omitted))
+        bounded["actual_prompt_chars"] = len(
+            json.dumps(bounded, ensure_ascii=False, sort_keys=True)
+        )
     return bounded
 
 

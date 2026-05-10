@@ -64,16 +64,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             validation_runtime=runtime_factory.create_validation_runtime(validation_skill),
             repo_dir=config.runtime.repo_dir,
-            max_prompt_chars=config.runtime.phase04_max_prompt_chars,
+            max_prompt_chars=config.phase04.max_prompt_chars,
             findings_generation_timeout_seconds=(
-                config.runtime.phase04_findings_generation_timeout_seconds
+                config.phase04.findings_generation_timeout_seconds
             ),
-            validation_timeout_seconds=config.runtime.phase04_validation_timeout_seconds,
+            validation_timeout_seconds=config.phase04.validation_timeout_seconds,
             max_findings_generation_retries=(
-                config.runtime.phase04_max_findings_generation_retries
+                config.phase04.max_findings_generation_retries
             ),
-            max_validation_retries=config.runtime.phase04_max_validation_retries,
-            max_agent_iterations=config.runtime.phase04_max_agent_iterations,
+            max_validation_retries=config.phase04.max_validation_retries,
+            max_agent_iterations=config.phase04.max_agent_iterations,
+            max_findings=config.phase04.max_findings,
+            model_name=config.model.model_name,
         ).run(evidence_bundle_path)
         print(f"DBKit {__version__}")
         print("mode=replay")
@@ -92,6 +94,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 skills_dir=config.runtime.skills_dir,
                 agents_dir=config.runtime.agents_dir,
             ),
+            max_workers=config.evidence_structuring.max_workers,
+            per_item_timeout_seconds=config.evidence_structuring.per_item_timeout_seconds,
+            total_timeout_seconds=config.evidence_structuring.total_timeout_seconds,
         ).run(raw_evidence_index_path)
         print(f"DBKit {__version__}")
         print(f"phase={result.phase}")
@@ -202,6 +207,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         subagent_registration=subagent_registration,
         result_sink=evidence_structuring_results.append,
         repo_dir=config.runtime.repo_dir,
+        max_workers=config.evidence_structuring.max_workers,
+        per_item_timeout_seconds=config.evidence_structuring.per_item_timeout_seconds,
+        total_timeout_seconds=config.evidence_structuring.total_timeout_seconds,
     )
     analyzer_runtime = runtime_factory.create_mysql_analyzer_runtime(
         mysql_analyzer.skill_text,
@@ -307,6 +315,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         telemetry=collection_telemetry,
         repo_dir=config.runtime.repo_dir,
         artifact_root=artifact_root,
+        max_agent_iterations=config.evidence_structuring.max_agent_iterations,
     ).run(
         request_id=evidence_result.request_id,
         raw_evidence_index=raw_evidence_index_path,
@@ -387,16 +396,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             _validation_skill(config.runtime.skills_dir)
         ),
         repo_dir=config.runtime.repo_dir,
-        max_prompt_chars=config.runtime.phase04_max_prompt_chars,
+        max_prompt_chars=config.phase04.max_prompt_chars,
         findings_generation_timeout_seconds=(
-            config.runtime.phase04_findings_generation_timeout_seconds
+            config.phase04.findings_generation_timeout_seconds
         ),
-        validation_timeout_seconds=config.runtime.phase04_validation_timeout_seconds,
+        validation_timeout_seconds=config.phase04.validation_timeout_seconds,
         max_findings_generation_retries=(
-            config.runtime.phase04_max_findings_generation_retries
+            config.phase04.max_findings_generation_retries
         ),
-        max_validation_retries=config.runtime.phase04_max_validation_retries,
-        max_agent_iterations=config.runtime.phase04_max_agent_iterations,
+        max_validation_retries=config.phase04.max_validation_retries,
+        max_agent_iterations=config.phase04.max_agent_iterations,
+        max_findings=config.phase04.max_findings,
+        model_name=config.model.model_name,
     ).run(
         structuring_result.bundle_artifact.path,
         expected_request_id=evidence_result.request_id,
@@ -519,6 +530,10 @@ def _print_phase04_result(result) -> None:
     if result.verdict is not None:
         print(f"overall_severity={result.verdict.get('overall_severity')}")
         print(f"overall_confidence={result.verdict.get('overall_confidence')}")
+    if result.metadata.get("reason"):
+        print(f"reason={result.metadata.get('reason')}")
+    if result.metadata.get("input_evidence_bundle"):
+        print(f"evidence_bundle_artifact={result.metadata.get('input_evidence_bundle')}")
     for artifact in result.artifacts:
         if artifact.kind == "FindingsDraft":
             print(f"findings_artifact={artifact.path}")
@@ -528,6 +543,8 @@ def _print_phase04_result(result) -> None:
             print(f"verdict_artifact={artifact.path}")
         elif artifact.kind == "Summary":
             print(f"summary_artifact={artifact.path}")
+        elif artifact.kind == "AnalysisTimeout":
+            print(f"timeout_artifact={artifact.path}")
         elif artifact.kind == "AnalysisTelemetry":
             print(f"analysis_telemetry={artifact.path}")
     if result.blocking_issues:

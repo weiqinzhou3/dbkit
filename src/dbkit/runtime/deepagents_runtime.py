@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from dbkit.agents.evidence_structuring import EvidenceStructuringSubagentRegistration
+from dbkit.runtime.langchain_compat import configure_langchain_deserialization_allowlist
 
 
 class DeepAgentsRuntimeFactory:
@@ -105,6 +106,7 @@ class DeepAgentsRuntimeFactory:
         )
 
     def _load_create_deep_agent(self) -> Callable[..., Any]:
+        configure_langchain_deserialization_allowlist("messages")
         from deepagents import create_deep_agent
         return create_deep_agent
 
@@ -149,6 +151,7 @@ class DeepAgentsRuntimeFactory:
         )
 
     def _filesystem_backend(self) -> Any:
+        configure_langchain_deserialization_allowlist("messages")
         from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
 
         return CompositeBackend(

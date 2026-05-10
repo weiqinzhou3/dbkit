@@ -2,8 +2,10 @@ import contextlib
 import io
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from dbkit.cli import main as cli_main
 from dbkit.agents.mysql_analyzer import MySQLAnalyzerAgent
@@ -169,6 +171,85 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
         self.assertIn("parse_mysql_error_log", tool_names)
         self.assertIn("filter_by_time_window", tool_names)
         self.assertNotIn("collect_mysql_error_log", tool_names)
+
+    def test_evidence_structuring_processes_raw_items_in_parallel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = _write_raw_evidence_fixture(root)
+            starts: list[float] = []
+            original_parse = __import__(
+                "dbkit.runtime.evidence_structuring",
+                fromlist=["parse_raw_evidence"],
+            ).parse_raw_evidence
+
+            def slow_parse(raw, raw_text, raw_payload):
+                starts.append(time.perf_counter())
+                time.sleep(0.05)
+                return original_parse(raw, raw_text, raw_payload)
+
+            with patch("dbkit.runtime.evidence_structuring.parse_raw_evidence", side_effect=slow_parse):
+                started = time.perf_counter()
+                result = EvidenceStructuringPipeline(
+                    artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                    telemetry=TelemetryRecorder(),
+                    max_workers=4,
+                    total_timeout_seconds=10,
+                ).run(index_path)
+                elapsed = time.perf_counter() - started
+
+        self.assertEqual(result.status, "evidence_bundle_created")
+        self.assertLess(elapsed, 0.45)
+        event_types = [event.event_type for event in result.telemetry]
+        self.assertIn("evidence_processing_parallel_started", event_types)
+        self.assertIn("evidence_item_processing_started", event_types)
+        self.assertIn("evidence_item_processing_completed", event_types)
+        self.assertIn("evidence_processing_parallel_completed", event_types)
+        self.assertTrue(
+            any(
+                event.attributes.get("worker_id")
+                for event in result.telemetry
+                if event.event_type == "evidence_item_processing_completed"
+            )
+        )
+
+    def test_evidence_item_parse_failure_does_not_block_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            index_path = _write_raw_evidence_fixture(root)
+            original_parse = __import__(
+                "dbkit.runtime.evidence_structuring",
+                fromlist=["parse_raw_evidence"],
+            ).parse_raw_evidence
+
+            def sometimes_fails(raw, raw_text, raw_payload):
+                if raw["evidence_type"] == "mysql.innodb_status":
+                    raise ValueError("bad innodb payload")
+                return original_parse(raw, raw_text, raw_payload)
+
+            with patch("dbkit.runtime.evidence_structuring.parse_raw_evidence", side_effect=sometimes_fails):
+                result = EvidenceStructuringPipeline(
+                    artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                    telemetry=TelemetryRecorder(),
+                    max_workers=4,
+                ).run(index_path)
+                bundle = json.loads(result.bundle_artifact.path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.status, "evidence_bundle_created")
+        evidence_types = {item["evidence_type"] for item in bundle["evidence_items"]}
+        self.assertNotIn("mysql.innodb_status", evidence_types)
+        self.assertIn("mysql.innodb_status parser failed", bundle["quality"]["warnings"])
+        self.assertIn("evidence_item_processing_failed", [event.event_type for event in result.telemetry])
+
+    def test_evidence_structuring_skill_requires_single_build_bundle_tool_call(self) -> None:
+        system_prompt = Path("agents/evidence-structuring/system.md").read_text(encoding="utf-8")
+        skill = Path("skills/evidence/SKILL.md").read_text(encoding="utf-8")
+        mysql_skill = Path("skills/mysql-analyzer/SKILL.md").read_text(encoding="utf-8")
+
+        self.assertIn("Call `build_evidence_bundle` exactly once", system_prompt)
+        self.assertIn("Call `build_evidence_bundle` exactly once", skill)
+        self.assertIn("Do not inspect", skill)
+        self.assertIn("every raw artifact manually", skill)
+        self.assertIn("Call the build_evidence_bundle tool exactly once", mysql_skill)
 
     def test_mysql_analyzer_skill_requires_evidence_structuring_delegation(self) -> None:
         skill = Path("skills/mysql-analyzer/SKILL.md").read_text(encoding="utf-8")

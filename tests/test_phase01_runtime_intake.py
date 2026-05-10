@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+import warnings
 from dataclasses import replace
 from types import SimpleNamespace
 from pathlib import Path
@@ -80,6 +81,44 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
             self.assertEqual(config.runtime.max_discovered_files, 10)
             self.assertEqual(config.runtime.max_evidence_file_size_bytes, 2048)
             self.assertEqual(config.runtime.blocked_paths, ("/workspace/**/.env",))
+
+    def test_load_app_config_reads_phase04_and_evidence_structuring_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                """
+model:
+  provider_kind: openai_compatible
+  model_name: test-model
+  base_url: https://example.invalid
+  api_key: test-key
+runtime:
+  artifact_dir: .dbkit/artifacts
+evidence_structuring:
+  max_workers: 3
+  per_item_timeout_seconds: 7
+  total_timeout_seconds: 25
+phase04:
+  findings_generation_timeout_seconds: 9
+  validation_timeout_seconds: 5
+  max_findings_generation_retries: 1
+  max_validation_retries: 1
+  max_findings: 4
+  max_prompt_chars: 12345
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = load_app_config(config_path)
+
+        self.assertEqual(config.evidence_structuring.max_workers, 3)
+        self.assertEqual(config.evidence_structuring.per_item_timeout_seconds, 7)
+        self.assertEqual(config.evidence_structuring.total_timeout_seconds, 25)
+        self.assertEqual(config.phase04.findings_generation_timeout_seconds, 9)
+        self.assertEqual(config.phase04.validation_timeout_seconds, 5)
+        self.assertEqual(config.phase04.max_findings, 4)
+        self.assertEqual(config.phase04.max_prompt_chars, 12345)
 
     def test_build_model_uses_openai_compatible_config(self) -> None:
         config = load_app_config(_write_config_file())
@@ -947,6 +986,39 @@ class Phase01RuntimeIntakeTest(unittest.TestCase):
             "normalize_request_tool",
             ",".join(getattr(tool, "__name__", "") for tool in calls[0]["tools"]),
         )
+
+    def test_langchain_serializer_allowed_objects_is_configured_before_deepagents_import(self) -> None:
+        from dbkit.runtime.langchain_compat import (
+            configure_langchain_deserialization_allowlist,
+        )
+
+        configure_langchain_deserialization_allowlist("messages")
+
+        import importlib
+
+        load_module = importlib.import_module("langchain_core.load.load")
+        reviver = load_module.Reviver()
+
+        self.assertEqual(getattr(load_module.Reviver, "_dbkit_allowed_objects"), "messages")
+        self.assertIsNotNone(reviver)
+
+    def test_deepagents_runtime_factory_does_not_emit_allowed_objects_warning(self) -> None:
+        calls = []
+
+        def fake_create_deep_agent(**kwargs):
+            calls.append(kwargs)
+            return object()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            DeepAgentsRuntimeFactory(
+                create_deep_agent=fake_create_deep_agent,
+                model=object(),
+            ).create_intake_runtime("DBKit Intake Skill")
+
+        warning_text = "\n".join(str(item.message) for item in caught)
+        self.assertNotIn("allowed_objects", warning_text)
+        self.assertEqual(len(calls), 1)
 
     def test_deepagents_runtime_factory_loads_system_prompt_from_agents_dir(self) -> None:
         calls = []
