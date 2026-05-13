@@ -108,6 +108,8 @@ phase04:
   max_validation_retries: 1
   max_findings: 4
   max_prompt_chars: 12345
+  per_finding_validation_timeout_seconds: 6
+  semantic_validation_enabled: false
 """.strip()
                 + "\n",
                 encoding="utf-8",
@@ -125,6 +127,8 @@ phase04:
         self.assertEqual(config.phase04.validation_timeout_seconds, 5)
         self.assertEqual(config.phase04.max_findings, 4)
         self.assertEqual(config.phase04.max_prompt_chars, 12345)
+        self.assertEqual(config.phase04.per_finding_validation_timeout_seconds, 6)
+        self.assertFalse(config.phase04.semantic_validation_enabled)
 
     def test_evidence_structuring_recursion_limit_defaults_to_bounded_non_four_value(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

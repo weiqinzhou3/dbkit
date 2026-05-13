@@ -47,6 +47,8 @@ class RuntimeConfig:
     phase04_max_validation_retries: int = 1
     phase04_max_agent_iterations: int = 6
     phase04_max_findings: int = 5
+    phase04_per_finding_validation_timeout_seconds: int = 15
+    phase04_semantic_validation_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,8 @@ class Phase04Config:
     max_findings: int = 5
     max_prompt_chars: int = 30_000
     max_agent_iterations: int = 6
+    per_finding_validation_timeout_seconds: int = 15
+    semantic_validation_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -195,6 +199,12 @@ def _load_runtime_config(data: dict[str, Any]) -> RuntimeConfig:
             data, "phase04_max_agent_iterations", 6
         ),
         phase04_max_findings=_optional_int(data, "phase04_max_findings", 5),
+        phase04_per_finding_validation_timeout_seconds=_optional_int(
+            data, "phase04_per_finding_validation_timeout_seconds", 15
+        ),
+        phase04_semantic_validation_enabled=_optional_bool(
+            data, "phase04_semantic_validation_enabled", True
+        ),
     )
 
 
@@ -286,6 +296,16 @@ def _load_phase04_config(data: dict[str, Any] | None, runtime: RuntimeConfig) ->
         ),
         max_agent_iterations=_optional_int(
             data, "max_agent_iterations", runtime.phase04_max_agent_iterations
+        ),
+        per_finding_validation_timeout_seconds=_optional_int(
+            data,
+            "per_finding_validation_timeout_seconds",
+            runtime.phase04_per_finding_validation_timeout_seconds,
+        ),
+        semantic_validation_enabled=_optional_bool(
+            data,
+            "semantic_validation_enabled",
+            runtime.phase04_semantic_validation_enabled,
         ),
     )
 

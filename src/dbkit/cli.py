@@ -75,6 +75,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_validation_retries=config.phase04.max_validation_retries,
             max_agent_iterations=config.phase04.max_agent_iterations,
             max_findings=config.phase04.max_findings,
+            per_finding_validation_timeout_seconds=(
+                config.phase04.per_finding_validation_timeout_seconds
+            ),
+            semantic_validation_enabled=config.phase04.semantic_validation_enabled,
             model_name=config.model.model_name,
         ).run(evidence_bundle_path)
         print(f"DBKit {__version__}")
@@ -409,6 +413,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_validation_retries=config.phase04.max_validation_retries,
         max_agent_iterations=config.phase04.max_agent_iterations,
         max_findings=config.phase04.max_findings,
+        per_finding_validation_timeout_seconds=(
+            config.phase04.per_finding_validation_timeout_seconds
+        ),
+        semantic_validation_enabled=config.phase04.semantic_validation_enabled,
         model_name=config.model.model_name,
     ).run(
         structuring_result.bundle_artifact.path,

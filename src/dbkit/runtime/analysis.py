@@ -40,6 +40,8 @@ class Phase04AnalysisPipeline:
         max_validation_retries: int = 1,
         max_agent_iterations: int = 6,
         max_findings: int = 5,
+        per_finding_validation_timeout_seconds: int = 15,
+        semantic_validation_enabled: bool = True,
         model_name: str | None = None,
     ) -> None:
         self.artifact_store = artifact_store
@@ -54,6 +56,8 @@ class Phase04AnalysisPipeline:
         self.max_validation_retries = max_validation_retries
         self.max_agent_iterations = max_agent_iterations
         self.max_findings = max_findings
+        self.per_finding_validation_timeout_seconds = per_finding_validation_timeout_seconds
+        self.semantic_validation_enabled = semantic_validation_enabled
         self.model_name = model_name
         self._last_timeout_stage: str | None = None
 
@@ -201,31 +205,7 @@ class Phase04AnalysisPipeline:
             status="completed",
         )
 
-        validation_payload = self._invoke_validation(
-            evidence_bundle=evidence_bundle,
-            compact_context=compact_context,
-            findings_draft=findings_draft,
-            input_bundle_ref=input_bundle_ref,
-            findings_artifact=findings_artifact.path,
-        )
-        if self._last_timeout_stage == "validation":
-            return self._analysis_timeout(
-                request_id=request_id,
-                artifacts=artifacts,
-                issues=("validation_timeout",),
-                reason="validation_timeout",
-                input_bundle_ref=input_bundle_ref,
-                started_ns=started_ns,
-            )
-        if validation_payload is None:
-            return self._failed(
-                request_id=request_id,
-                artifacts=artifacts,
-                issues=("validation_parse_failed",),
-                started_ns=started_ns,
-            )
-        validation_result, validation_error = self._prepare_validation_result(
-            validation_payload=validation_payload,
+        validation_result, validation_error, validation_timeout_reason = self._run_validation(
             evidence_bundle=evidence_bundle,
             compact_context=compact_context,
             findings_draft=findings_draft,
@@ -233,19 +213,22 @@ class Phase04AnalysisPipeline:
             findings_artifact=findings_artifact.path,
             artifacts=artifacts,
         )
+        if validation_timeout_reason is not None:
+            return self._analysis_timeout(
+                request_id=request_id,
+                artifacts=artifacts,
+                issues=(validation_timeout_reason,),
+                reason=validation_timeout_reason,
+                input_bundle_ref=input_bundle_ref,
+                started_ns=started_ns,
+            )
         if validation_result is None:
             return self._failed(
                 request_id=request_id,
                 artifacts=artifacts,
-                issues=(f"validation_result_invalid: {validation_error}",),
+                issues=(validation_error or "validation_parse_failed",),
                 started_ns=started_ns,
             )
-
-        validation_result = self._enforce_evidence_ref_validation(
-            validation_result=validation_result,
-            findings_draft=findings_draft,
-            evidence_bundle=evidence_bundle,
-        )
         validation_artifact = self.artifact_store.persist_validation_result(
             request_id, validation_result
         )
@@ -726,7 +709,7 @@ class Phase04AnalysisPipeline:
         )
         return artifact
 
-    def _invoke_validation(
+    def _run_validation(
         self,
         *,
         evidence_bundle: dict[str, Any],
@@ -734,35 +717,353 @@ class Phase04AnalysisPipeline:
         findings_draft: dict[str, Any],
         input_bundle_ref: str,
         findings_artifact: Path,
+        artifacts: list[Any],
+    ) -> tuple[dict[str, Any] | None, str | None, str | None]:
+        request_id = str(evidence_bundle["request_id"])
+        started_ns = perf_counter_ns()
+        findings_artifact_ref = _artifact_ref(findings_artifact, self.repo_dir)
+        self._emit(
+            "validation_started",
+            "Phase-04 validation started",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            input_findings_artifact=findings_artifact_ref,
+            finding_count=len(findings_draft.get("findings") or []),
+            semantic_validation_enabled=self.semantic_validation_enabled,
+            timeout_seconds=self.validation_timeout_seconds,
+            status="started",
+        )
+        deterministic_started_ns = perf_counter_ns()
+        self._emit(
+            "deterministic_validation_started",
+            "Deterministic validation started",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            input_findings_artifact=findings_artifact_ref,
+            status="started",
+        )
+        validated: list[dict[str, Any]] = []
+        blocked: list[dict[str, Any]] = []
+        downgraded: list[dict[str, Any]] = []
+        semantic_candidates: list[dict[str, Any]] = []
+        evidence_by_id = _evidence_by_id(evidence_bundle)
+        unavailable_types = _unavailable_evidence_types(evidence_bundle)
+
+        for finding in findings_draft.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
+            item_result = self._deterministic_validate_finding(
+                finding=finding,
+                evidence_by_id=evidence_by_id,
+                unavailable_types=unavailable_types,
+                request_id=request_id,
+                input_bundle_ref=input_bundle_ref,
+            )
+            if item_result["status"] == "blocked":
+                blocked.append(item_result["validation_item"])
+            elif item_result["status"] == "downgraded":
+                validated.append(item_result["validation_item"])
+                downgraded.append(item_result["downgraded_item"])
+            elif item_result["semantic_validation_needed"]:
+                semantic_candidates.append(finding)
+            else:
+                validated.append(item_result["validation_item"])
+
+        self._emit(
+            "deterministic_validation_completed",
+            "Deterministic validation completed",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            input_findings_artifact=findings_artifact_ref,
+            validated_count=len(validated),
+            blocked_count=len(blocked),
+            downgraded_count=len(downgraded),
+            semantic_candidate_count=len(semantic_candidates),
+            status="completed",
+            duration_ms=_duration_ms(deterministic_started_ns),
+        )
+
+        semantic_used = False
+        semantic_timeout_count = 0
+        semantic_completed_count = 0
+        if self.semantic_validation_enabled:
+            for finding in semantic_candidates:
+                semantic_used = True
+                semantic_result, semantic_error, timed_out = self._semantic_validate_finding(
+                    finding=finding,
+                    evidence_bundle=evidence_bundle,
+                    compact_context=compact_context,
+                    findings_draft=findings_draft,
+                    input_bundle_ref=input_bundle_ref,
+                    findings_artifact=findings_artifact,
+                    artifacts=artifacts,
+                )
+                if timed_out:
+                    semantic_timeout_count += 1
+                    review_item = _human_review_validation_item(
+                        finding,
+                        reason="semantic_validation_timeout",
+                    )
+                    validated.append(review_item)
+                    continue
+                if semantic_result is None:
+                    return None, f"validation_result_invalid: {semantic_error}", None
+                semantic_completed_count += 1
+                _merge_validation_result(
+                    target_validated=validated,
+                    target_blocked=blocked,
+                    target_downgraded=downgraded,
+                    source=semantic_result,
+                    allowed_finding_ids={str(finding.get("finding_id") or "")},
+                )
+        else:
+            for finding in semantic_candidates:
+                validated.append(
+                    _human_review_validation_item(
+                        finding,
+                        reason="semantic_validation_disabled",
+                    )
+                )
+
+        finding_count = len(
+            [
+                finding for finding in findings_draft.get("findings") or []
+                if isinstance(finding, dict)
+            ]
+        )
+        if (
+            semantic_candidates
+            and semantic_timeout_count == len(semantic_candidates)
+            and len(semantic_candidates) == finding_count
+            and not blocked
+            and not downgraded
+        ):
+            self._emit(
+                "validation_completed",
+                "Validation stopped because all semantic validation attempts timed out",
+                request_id=request_id,
+                input_evidence_bundle=input_bundle_ref,
+                input_findings_artifact=findings_artifact_ref,
+                semantic_timeout_count=semantic_timeout_count,
+                status="timeout",
+                duration_ms=_duration_ms(started_ns),
+            )
+            return None, None, "semantic_validation_timeout"
+
+        validation_result = _build_validation_result(
+            request_id=request_id,
+            input_bundle_ref=input_bundle_ref,
+            findings_artifact_ref=findings_artifact_ref,
+            validated=validated,
+            blocked=blocked,
+            downgraded=downgraded,
+            validation_method="hybrid" if semantic_used else "deterministic",
+            semantic_validation_used=semantic_used,
+            semantic_timeout_count=semantic_timeout_count,
+            semantic_completed_count=semantic_completed_count,
+        )
+        try:
+            validation_result = validate_validation_result(validation_result, findings_draft)
+        except ValueError as exc:
+            return None, f"validation_result_invalid: {exc}", None
+        self._emit(
+            "validation_result_created",
+            "ValidationResult created",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            input_findings_artifact=findings_artifact_ref,
+            validation_method=validation_result["metadata"]["validation_method"],
+            semantic_validation_used=validation_result["metadata"]["semantic_validation_used"],
+            validated_count=len(validation_result.get("validated_findings") or []),
+            blocked_count=len(validation_result.get("blocked_findings") or []),
+            downgraded_count=len(validation_result.get("downgraded_findings") or []),
+            status="completed",
+        )
+        return validation_result, None, None
+
+    def _deterministic_validate_finding(
+        self,
+        *,
+        finding: dict[str, Any],
+        evidence_by_id: dict[str, dict[str, Any]],
+        unavailable_types: set[str],
+        request_id: str,
+        input_bundle_ref: str,
+    ) -> dict[str, Any]:
+        finding_id = str(finding.get("finding_id") or "")
+        started_ns = perf_counter_ns()
+        refs = finding.get("evidence_refs") or []
+        self._emit(
+            "finding_deterministic_validation_started",
+            "Finding deterministic validation started",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            finding_id=finding_id,
+            evidence_refs_count=len(refs),
+            validation_path="deterministic",
+            status="started",
+        )
+        status = "passed"
+        reason = "deterministic_checks_passed"
+        semantic_needed = _semantic_validation_needed(finding)
+        validation_item = _passed_validation_item(finding)
+        downgraded_item: dict[str, Any] | None = None
+
+        if not refs:
+            status = "blocked"
+            reason = "missing_evidence_refs"
+            validation_item = _blocked_validation_item(finding, reason=reason)
+            semantic_needed = False
+        elif _finding_contains_forbidden_fields(finding):
+            status = "blocked"
+            reason = "forbidden_analysis_field"
+            validation_item = _blocked_validation_item(finding, reason=reason)
+            semantic_needed = False
+        elif _contains_secret_like(finding):
+            status = "blocked"
+            reason = "raw_secret_detected"
+            validation_item = _blocked_validation_item(finding, reason=reason)
+            semantic_needed = False
+        else:
+            for ref in refs:
+                ref_id = str(ref.get("evidence_id") or "")
+                evidence = evidence_by_id.get(ref_id)
+                if evidence is None:
+                    status = "blocked"
+                    reason = "evidence_ref_not_found"
+                    validation_item = _blocked_validation_item(finding, reason=reason)
+                    semantic_needed = False
+                    break
+                expected_type = str(ref.get("evidence_type") or "")
+                actual_type = str(evidence.get("evidence_type") or "")
+                if expected_type and actual_type and expected_type != actual_type:
+                    status = "blocked"
+                    reason = "evidence_type_mismatch"
+                    validation_item = _blocked_validation_item(finding, reason=reason)
+                    semantic_needed = False
+                    break
+                if expected_type in unavailable_types or _evidence_is_low_quality(evidence):
+                    status = "downgraded"
+                    reason = "referenced_low_quality_or_unavailable_evidence"
+                    validation_item = _downgraded_validation_item(finding, reason=reason)
+                    downgraded_item = {
+                        "finding_id": finding_id,
+                        "reason": reason,
+                        "validation_status": "downgraded",
+                    }
+                    semantic_needed = False
+
+        self._emit(
+            "finding_deterministic_validation_completed",
+            "Finding deterministic validation completed",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            finding_id=finding_id,
+            validation_path="deterministic",
+            semantic_validation_needed=semantic_needed,
+            evidence_refs_count=len(refs),
+            reason=reason,
+            status=status,
+            duration_ms=_duration_ms(started_ns),
+        )
+        return {
+            "status": status,
+            "reason": reason,
+            "semantic_validation_needed": semantic_needed,
+            "validation_item": validation_item,
+            "downgraded_item": downgraded_item or {},
+        }
+
+    def _semantic_validate_finding(
+        self,
+        *,
+        finding: dict[str, Any],
+        evidence_bundle: dict[str, Any],
+        compact_context: dict[str, Any],
+        findings_draft: dict[str, Any],
+        input_bundle_ref: str,
+        findings_artifact: Path,
+        artifacts: list[Any],
+    ) -> tuple[dict[str, Any] | None, str | None, bool]:
+        request_id = str(evidence_bundle["request_id"])
+        finding_id = str(finding.get("finding_id") or "")
+        validation_payload = self._invoke_semantic_validation(
+            evidence_bundle=evidence_bundle,
+            finding=finding,
+            input_bundle_ref=input_bundle_ref,
+            findings_artifact=findings_artifact,
+        )
+        if self._last_timeout_stage == f"semantic_validation:{finding_id}":
+            return None, None, True
+        if validation_payload is None:
+            return None, "semantic_validation_parse_failed", False
+        validation_result, validation_error = self._prepare_semantic_validation_result(
+            validation_payload=validation_payload,
+            evidence_bundle=evidence_bundle,
+            compact_context=compact_context,
+            findings_draft=findings_draft,
+            input_bundle_ref=input_bundle_ref,
+            findings_artifact=findings_artifact,
+            artifacts=artifacts,
+            finding=finding,
+        )
+        if validation_result is None:
+            return None, validation_error, False
+        self._emit(
+            "semantic_validation_completed",
+            "Semantic validation completed for finding",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            finding_id=finding_id,
+            validation_path="semantic",
+            status="completed",
+        )
+        return validation_result, None, False
+
+    def _invoke_semantic_validation(
+        self,
+        *,
+        evidence_bundle: dict[str, Any],
+        finding: dict[str, Any],
+        input_bundle_ref: str,
+        findings_artifact: Path,
         retry_context: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         request_id = str(evidence_bundle["request_id"])
+        finding_id = str(finding.get("finding_id") or "")
         started_ns = perf_counter_ns()
+        minimal_context = _minimal_validation_context(
+            finding=finding,
+            evidence_bundle=evidence_bundle,
+        )
         self._emit(
-            "validation_started",
-            "Validation agent started",
+            "semantic_validation_started",
+            "Semantic validation started for finding",
             request_id=request_id,
             input_evidence_bundle=input_bundle_ref,
             input_findings_artifact=_artifact_ref(findings_artifact, self.repo_dir),
-            finding_count=len(findings_draft.get("findings") or []),
+            finding_id=finding_id,
+            validation_path="semantic",
+            evidence_refs_count=len(finding.get("evidence_refs") or []),
+            timeout_seconds=self.per_finding_validation_timeout_seconds,
             model_name=self.model_name,
-            timeout_seconds=self.validation_timeout_seconds,
             status="started",
         )
         payload = {
             "mode": "validation",
+            "validation_scope": "single_finding",
             "input_evidence_bundle": input_bundle_ref,
-            "findings_draft": findings_draft,
-            "compact_analysis_context": compact_context,
+            "finding": finding,
+            "minimal_validation_context": minimal_context,
             "retry_context": retry_context or {},
             "max_agent_iterations": self.max_agent_iterations,
             "messages": [
                 {
                     "role": "user",
                     "content": (
-                        "Output only DBKit ValidationResult JSON. Validate "
-                        "FindingsDraft against compact_analysis_context evidence_refs. "
-                        "Do not read RawEvidence and do not generate new findings.\n\n"
+                        "Output only DBKit ValidationResult JSON for this single finding. "
+                        "Use only minimal_validation_context. Do not read RawEvidence, "
+                        "do not use full EvidenceBundle, and do not generate new findings.\n\n"
                         + (
                             "Previous ValidationResult was invalid. Fix these issues:\n"
                             + json.dumps(retry_context, ensure_ascii=False, sort_keys=True)
@@ -770,10 +1071,8 @@ class Phase04AnalysisPipeline:
                             if retry_context
                             else ""
                         )
-                        + "FindingsDraft JSON:\n"
-                        + json.dumps(findings_draft, ensure_ascii=False, sort_keys=True)
-                        + "\n\ncompact_analysis_context JSON:\n"
-                        + json.dumps(compact_context, ensure_ascii=False, sort_keys=True)
+                        + "minimal_validation_context JSON:\n"
+                        + json.dumps(minimal_context, ensure_ascii=False, sort_keys=True)
                     ),
                 }
             ],
@@ -782,35 +1081,37 @@ class Phase04AnalysisPipeline:
             result = self._invoke_runtime_with_timeout(
                 self.validation_runtime,
                 payload,
-                timeout_seconds=self.validation_timeout_seconds,
+                timeout_seconds=self.per_finding_validation_timeout_seconds,
             )
         except TimeoutError:
-            self._last_timeout_stage = "validation"
+            self._last_timeout_stage = f"semantic_validation:{finding_id}"
             self._emit(
-                "validation_completed",
-                "Validation agent timed out",
+                "semantic_validation_timeout",
+                "Semantic validation timed out for finding",
                 request_id=request_id,
                 input_evidence_bundle=input_bundle_ref,
-                input_findings_artifact=_artifact_ref(findings_artifact, self.repo_dir),
-                timeout_seconds=self.validation_timeout_seconds,
+                finding_id=finding_id,
+                validation_path="semantic",
+                timeout_seconds=self.per_finding_validation_timeout_seconds,
                 status="timeout",
                 duration_ms=_duration_ms(started_ns),
             )
             return None
         parsed = extract_json_from_invoke_result(result)
         self._emit(
-            "validation_completed",
-            "Validation agent completed",
+            "semantic_validation_completed",
+            "Semantic validation agent returned for finding",
             request_id=request_id,
             input_evidence_bundle=input_bundle_ref,
-            input_findings_artifact=_artifact_ref(findings_artifact, self.repo_dir),
-            status="completed" if parsed is not None else "failed",
+            finding_id=finding_id,
+            validation_path="semantic",
             output_chars=len(json.dumps(parsed, ensure_ascii=False, sort_keys=True)) if parsed is not None else 0,
+            status="completed" if parsed is not None else "failed",
             duration_ms=_duration_ms(started_ns),
         )
         return parsed
 
-    def _prepare_validation_result(
+    def _prepare_semantic_validation_result(
         self,
         *,
         validation_payload: dict[str, Any],
@@ -820,6 +1121,7 @@ class Phase04AnalysisPipeline:
         input_bundle_ref: str,
         findings_artifact: Path,
         artifacts: list[Any],
+        finding: dict[str, Any],
     ) -> tuple[dict[str, Any] | None, str | None]:
         request_id = str(evidence_bundle["request_id"])
         result, errors = self._validate_validation_result_attempt(
@@ -830,7 +1132,6 @@ class Phase04AnalysisPipeline:
         )
         if not errors:
             return result, None
-
         invalid_artifact = self._persist_invalid_validation_result(
             request_id=request_id,
             invalid_payload=validation_payload,
@@ -840,43 +1141,42 @@ class Phase04AnalysisPipeline:
         artifacts.append(invalid_artifact)
         if self.max_validation_retries < 1:
             return None, errors[0]
-
         retry_context = {
             "validation_errors": list(errors),
             "allowed_schema": {
                 "validation_status": "one of passed/downgraded/blocked/requires_human_review",
             },
             "instructions": [
-                "Regenerate ValidationResult JSON only.",
+                "Regenerate ValidationResult JSON only for the same finding.",
                 "Do not re-analyze RawEvidence.",
                 "Do not generate new findings.",
                 "Only fix ValidationResult JSON schema.",
-                "Do not use valid, invalid, pass, fail, approved, warning, needs_review, or review_required for validation_status.",
             ],
         }
         self._emit(
             "validation_retry_requested",
-            "Validation retry requested by schema validation",
+            "Semantic validation retry requested by schema validation",
             request_id=request_id,
             input_evidence_bundle=input_bundle_ref,
             validation_errors=list(errors),
             retry_attempt=1,
+            finding_id=finding.get("finding_id"),
             status="retry_requested",
         )
-        retry_payload = self._invoke_validation(
+        retry_payload = self._invoke_semantic_validation(
             evidence_bundle=evidence_bundle,
-            compact_context=compact_context,
-            findings_draft=findings_draft,
+            finding=finding,
             input_bundle_ref=input_bundle_ref,
             findings_artifact=findings_artifact,
             retry_context=retry_context,
         )
         self._emit(
             "validation_retry_completed",
-            "Validation retry completed",
+            "Semantic validation retry completed",
             request_id=request_id,
             input_evidence_bundle=input_bundle_ref,
             retry_attempt=1,
+            finding_id=finding.get("finding_id"),
             status="completed" if retry_payload is not None else "failed",
         )
         if retry_payload is None:
@@ -1775,6 +2075,251 @@ def _sanitize_text(value: str) -> str:
     )
     text = secret_like.sub(lambda match: match.group(1) + "=<redacted>", text)
     return text
+
+
+def _evidence_by_id(evidence_bundle: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(item.get("evidence_id")): item
+        for item in evidence_bundle.get("evidence_items") or []
+        if isinstance(item, dict) and item.get("evidence_id")
+    }
+
+
+def _unavailable_evidence_types(evidence_bundle: dict[str, Any]) -> set[str]:
+    return {
+        str(item.get("evidence_type"))
+        for item in (evidence_bundle.get("coverage") or {}).get("unavailable_evidence") or []
+        if isinstance(item, dict) and item.get("evidence_type")
+    }
+
+
+def _semantic_validation_needed(finding: dict[str, Any]) -> bool:
+    return bool(
+        finding.get("semantic_validation_required")
+        or finding.get("requires_semantic_validation")
+    )
+
+
+def _finding_contains_forbidden_fields(finding: dict[str, Any]) -> bool:
+    forbidden = {
+        "root_cause",
+        "verdict",
+        "final_summary",
+        "raw_evidence",
+        "raw_logs",
+        "remediation_executed",
+    }
+    return any(key in finding for key in forbidden)
+
+
+def _contains_secret_like(value: Any) -> bool:
+    serialized = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if "<SECRET_REF:" in serialized:
+        return False
+    secret_patterns = (
+        r"(?i)\b(password|passwd|pwd|token|secret|api_key|authorization)\s*[:=]\s*[^,\s}]+",
+        r"(?i)authorization:\s*bearer\s+\S+",
+        r"(?i)(mysql|redis|mongodb|postgres|postgresql)://[^/\s]+:[^@\s]+@",
+    )
+    return any(re.search(pattern, serialized) for pattern in secret_patterns)
+
+
+def _evidence_is_low_quality(evidence: dict[str, Any]) -> bool:
+    flags = {str(flag) for flag in evidence.get("quality_flags") or []}
+    return bool(
+        flags
+        & {
+            "unavailable",
+            "not_available",
+            "parser_failed",
+            "timestamp_parse_failed",
+            "time_window_filter_unavailable",
+        }
+    )
+
+
+def _passed_validation_item(finding: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "finding_id": finding.get("finding_id"),
+        "validation_status": "passed",
+        "confidence_after_validation": finding.get("confidence"),
+        "evidence_ref_check": "passed",
+        "support_check": "deterministic_reference_check_passed",
+        "contradiction_check": "not_evaluated",
+        "validation_notes": [
+            "Deterministic validation passed schema, evidence reference, and safety checks."
+        ],
+        "validation_method": "deterministic",
+    }
+
+
+def _blocked_validation_item(finding: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    return {
+        "finding_id": finding.get("finding_id"),
+        "reason": reason,
+        "validation_status": "blocked",
+    }
+
+
+def _downgraded_validation_item(finding: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    confidence = finding.get("confidence")
+    try:
+        confidence_after = min(float(confidence), 0.5)
+    except (TypeError, ValueError):
+        confidence_after = 0.0
+    return {
+        "finding_id": finding.get("finding_id"),
+        "validation_status": "downgraded",
+        "confidence_after_validation": confidence_after,
+        "evidence_ref_check": "passed_with_warnings",
+        "support_check": "low_quality_or_unavailable_evidence",
+        "contradiction_check": "not_evaluated",
+        "validation_notes": [reason],
+        "reason": reason,
+        "validation_method": "deterministic",
+    }
+
+
+def _human_review_validation_item(finding: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    return {
+        "finding_id": finding.get("finding_id"),
+        "validation_status": "requires_human_review",
+        "confidence_after_validation": finding.get("confidence"),
+        "evidence_ref_check": "passed",
+        "support_check": "semantic_validation_incomplete",
+        "contradiction_check": "unknown",
+        "validation_notes": [reason],
+        "reason": reason,
+        "validation_method": "semantic",
+    }
+
+
+def _merge_validation_result(
+    *,
+    target_validated: list[dict[str, Any]],
+    target_blocked: list[dict[str, Any]],
+    target_downgraded: list[dict[str, Any]],
+    source: dict[str, Any],
+    allowed_finding_ids: set[str],
+) -> None:
+    for item in source.get("validated_findings") or []:
+        if isinstance(item, dict) and str(item.get("finding_id") or "") in allowed_finding_ids:
+            copied = dict(item)
+            copied.setdefault("validation_method", "semantic")
+            target_validated.append(copied)
+    for item in source.get("blocked_findings") or []:
+        if isinstance(item, dict) and str(item.get("finding_id") or "") in allowed_finding_ids:
+            target_blocked.append(dict(item))
+    for item in source.get("downgraded_findings") or []:
+        if isinstance(item, dict) and str(item.get("finding_id") or "") in allowed_finding_ids:
+            target_downgraded.append(dict(item))
+
+
+def _build_validation_result(
+    *,
+    request_id: str,
+    input_bundle_ref: str,
+    findings_artifact_ref: str,
+    validated: list[dict[str, Any]],
+    blocked: list[dict[str, Any]],
+    downgraded: list[dict[str, Any]],
+    validation_method: str,
+    semantic_validation_used: bool,
+    semantic_timeout_count: int,
+    semantic_completed_count: int,
+) -> dict[str, Any]:
+    requires_human_review = any(
+        item.get("validation_status") == "requires_human_review"
+        for item in validated
+    )
+    return {
+        "request_id": request_id,
+        "phase": "phase-04",
+        "input_findings_artifact": findings_artifact_ref,
+        "input_evidence_bundle": input_bundle_ref,
+        "validated_findings": validated,
+        "blocked_findings": blocked,
+        "downgraded_findings": downgraded,
+        "requires_human_review": requires_human_review,
+        "validation_summary": {
+            "passed": len(
+                [
+                    item for item in validated
+                    if item.get("validation_status") == "passed"
+                ]
+            ),
+            "blocked": len(blocked),
+            "downgraded": len(downgraded),
+            "requires_human_review": len(
+                [
+                    item for item in validated
+                    if item.get("validation_status") == "requires_human_review"
+                ]
+            ),
+        },
+        "metadata": {
+            "validation_method": validation_method,
+            "semantic_validation_used": semantic_validation_used,
+            "semantic_timeout_count": semantic_timeout_count,
+            "semantic_completed_count": semantic_completed_count,
+        },
+    }
+
+
+def _minimal_validation_context(
+    *,
+    finding: dict[str, Any],
+    evidence_bundle: dict[str, Any],
+) -> dict[str, Any]:
+    evidence_by_id = _evidence_by_id(evidence_bundle)
+    referenced = []
+    for ref in finding.get("evidence_refs") or []:
+        evidence = evidence_by_id.get(str(ref.get("evidence_id") or ""))
+        if not evidence:
+            continue
+        referenced.append(_minimal_evidence_item(evidence))
+    return {
+        "request_id": evidence_bundle.get("request_id"),
+        "finding": finding,
+        "referenced_evidence_items": referenced,
+        "coverage_warnings": (evidence_bundle.get("quality") or {}).get("warnings") or [],
+        "unavailable_evidence": (
+            evidence_bundle.get("coverage") or {}
+        ).get("unavailable_evidence") or [],
+    }
+
+
+def _minimal_evidence_item(evidence: dict[str, Any]) -> dict[str, Any]:
+    structured = evidence.get("structured_payload") or {}
+    subset: dict[str, Any] = {}
+    evidence_type = str(evidence.get("evidence_type") or "")
+    if evidence_type == "mysql.error_log":
+        subset = {
+            "retained_lines": structured.get("retained_lines"),
+            "top_patterns": _compact_top_patterns(structured.get("top_patterns")),
+            "severity_counts": structured.get("severity_counts") or {},
+        }
+    elif evidence_type == "mysql.runtime_status":
+        subset = _selected_dict(structured, ("selected_counters", "top_counters", "summary"))
+    elif evidence_type == "mysql.variables":
+        subset = _selected_dict(structured, ("selected_variables", "summary"))
+    elif evidence_type == "mysql.processlist":
+        subset = _selected_dict(
+            structured,
+            ("total_processes", "user_counts", "command_counts", "state_counts"),
+        )
+    else:
+        subset = _selected_dict(structured, ("summary", "status", "reason"))
+    return {
+        "evidence_id": evidence.get("evidence_id"),
+        "evidence_type": evidence.get("evidence_type"),
+        "summary": evidence.get("summary"),
+        "structured_payload_subset": subset,
+        "quality_flags": evidence.get("quality_flags") or [],
+        "raw_refs_summary": [
+            _compact_raw_ref(ref) for ref in _limit_list(evidence.get("raw_refs"), 5)
+        ],
+    }
 
 
 def _duration_ms(started_ns: int) -> int:
