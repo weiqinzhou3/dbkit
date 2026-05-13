@@ -68,6 +68,7 @@ class Phase04AnalysisResult:
     telemetry: tuple[Any, ...]
     blocking_issues: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
+    terminal_response: str | None = None
 
 
 def validate_evidence_bundle_payload(payload: dict[str, Any]) -> dict[str, Any]:

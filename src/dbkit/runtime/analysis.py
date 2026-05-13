@@ -42,6 +42,7 @@ class Phase04AnalysisPipeline:
         max_findings: int = 5,
         per_finding_validation_timeout_seconds: int = 15,
         semantic_validation_enabled: bool = True,
+        request_context: dict[str, Any] | None = None,
         model_name: str | None = None,
     ) -> None:
         self.artifact_store = artifact_store
@@ -58,6 +59,7 @@ class Phase04AnalysisPipeline:
         self.max_findings = max_findings
         self.per_finding_validation_timeout_seconds = per_finding_validation_timeout_seconds
         self.semantic_validation_enabled = semantic_validation_enabled
+        self.request_context = request_context or {}
         self.model_name = model_name
         self._last_timeout_stage: str | None = None
 
@@ -269,12 +271,45 @@ class Phase04AnalysisPipeline:
             verdict_artifact=str(verdict_artifact.path),
         )
 
-        summary = self._render_summary(
+        summary_artifact_ref = _artifact_ref(
+            self.artifact_store.root / f"{request_id}.summary.md",
+            self.repo_dir,
+        )
+        final_response_context = _final_response_context(
             evidence_bundle=evidence_bundle,
             findings_draft=findings_draft,
             validation_result=validation_result,
             verdict=verdict,
+            request_context=self.request_context,
+            artifact_refs={
+                "evidence_bundle": input_bundle_ref,
+                "findings": _artifact_ref(findings_artifact.path, self.repo_dir),
+                "validation": _artifact_ref(validation_artifact.path, self.repo_dir),
+                "verdict": _artifact_ref(verdict_artifact.path, self.repo_dir),
+                "summary": summary_artifact_ref,
+            },
         )
+        final_context_artifact = self.artifact_store.persist_final_response_context(
+            request_id,
+            final_response_context,
+        )
+        artifacts.append(final_context_artifact)
+        self._emit(
+            "final_response_context_created",
+            "Final response context created from validated findings and verdict",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            final_response_context_artifact=str(final_context_artifact.path),
+            validated_finding_count=len(final_response_context.get("validated_findings") or []),
+            status="completed",
+        )
+        final_response = self._invoke_final_response_generation(
+            request_id=request_id,
+            input_bundle_ref=input_bundle_ref,
+            final_response_context=final_response_context,
+        )
+        summary = final_response["summary_markdown"]
+        terminal_response = final_response["terminal_response"]
         summary_artifact = self.artifact_store.persist_summary(request_id, summary)
         artifacts.append(summary_artifact)
         self._emit(
@@ -312,6 +347,7 @@ class Phase04AnalysisPipeline:
             summary=summary,
             artifacts=tuple(artifacts),
             telemetry=tuple(self.telemetry.events),
+            terminal_response=terminal_response,
         )
 
     def _create_compact_analysis_context(
@@ -434,6 +470,80 @@ class Phase04AnalysisPipeline:
             duration_ms=_duration_ms(started_ns),
         )
         return parsed
+
+    def _invoke_final_response_generation(
+        self,
+        *,
+        request_id: str,
+        input_bundle_ref: str,
+        final_response_context: dict[str, Any],
+    ) -> dict[str, str]:
+        started_ns = perf_counter_ns()
+        self._emit(
+            "mysql_analyzer_final_response_generation_started",
+            "MySQL analyzer final_response_generation started",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            mode="final_response_generation",
+            final_response_context_chars=len(
+                json.dumps(final_response_context, ensure_ascii=False, sort_keys=True)
+            ),
+            model_name=self.model_name,
+            timeout_seconds=min(self.findings_generation_timeout_seconds, 60),
+            status="started",
+        )
+        payload = {
+            "mode": "final_response_generation",
+            "input_evidence_bundle": input_bundle_ref,
+            "final_response_context": final_response_context,
+            "max_agent_iterations": min(self.max_agent_iterations, 3),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Output only DBKit final response JSON with keys "
+                        "terminal_response and summary_markdown. Use only "
+                        "final_response_context. Do not read RawEvidence, do not "
+                        "read the full EvidenceBundle, do not invent new findings, "
+                        "and do not change validated severity or confidence.\n\n"
+                        "final_response_context JSON:\n"
+                        + json.dumps(final_response_context, ensure_ascii=False, sort_keys=True)
+                    ),
+                }
+            ],
+        }
+        try:
+            result = self._invoke_runtime_with_timeout(
+                self.mysql_analyzer_runtime,
+                payload,
+                timeout_seconds=min(self.findings_generation_timeout_seconds, 60),
+            )
+        except TimeoutError:
+            fallback = _deterministic_final_response(final_response_context)
+            self._emit(
+                "mysql_analyzer_final_response_generation_completed",
+                "MySQL analyzer final_response_generation timed out; deterministic renderer used",
+                request_id=request_id,
+                input_evidence_bundle=input_bundle_ref,
+                mode="final_response_generation",
+                status="timeout_fallback",
+                duration_ms=_duration_ms(started_ns),
+            )
+            return fallback
+        parsed = extract_json_from_invoke_result(result)
+        final_response = _validated_final_response(parsed, final_response_context)
+        self._emit(
+            "mysql_analyzer_final_response_generation_completed",
+            "MySQL analyzer final_response_generation completed",
+            request_id=request_id,
+            input_evidence_bundle=input_bundle_ref,
+            mode="final_response_generation",
+            output_chars=len(json.dumps(parsed, ensure_ascii=False, sort_keys=True)) if parsed else 0,
+            renderer="mysql_analyzer" if parsed is not None else "deterministic_fallback",
+            status="completed" if parsed is not None else "fallback",
+            duration_ms=_duration_ms(started_ns),
+        )
+        return final_response
 
     def _prepare_findings_draft(
         self,
@@ -2320,6 +2430,228 @@ def _minimal_evidence_item(evidence: dict[str, Any]) -> dict[str, Any]:
             _compact_raw_ref(ref) for ref in _limit_list(evidence.get("raw_refs"), 5)
         ],
     }
+
+
+def _final_response_context(
+    *,
+    evidence_bundle: dict[str, Any],
+    findings_draft: dict[str, Any],
+    validation_result: dict[str, Any],
+    verdict: dict[str, Any],
+    request_context: dict[str, Any],
+    artifact_refs: dict[str, str],
+) -> dict[str, Any]:
+    findings = finding_by_id(findings_draft)
+    evidence_by_id = _evidence_by_id(evidence_bundle)
+    validated_findings = []
+    allowed_statuses = {"passed", "downgraded", "requires_human_review"}
+    for validation_item in validation_result.get("validated_findings") or []:
+        if not isinstance(validation_item, dict):
+            continue
+        if validation_item.get("validation_status") not in allowed_statuses:
+            continue
+        finding = findings.get(str(validation_item.get("finding_id") or ""))
+        if finding is None:
+            continue
+        evidence_summaries = []
+        for ref in finding.get("evidence_refs") or []:
+            evidence = evidence_by_id.get(str(ref.get("evidence_id") or ""))
+            if evidence is not None:
+                evidence_summaries.append(_final_evidence_summary(evidence))
+        validated_findings.append(
+            {
+                "finding_id": finding.get("finding_id"),
+                "title": finding.get("title"),
+                "category": finding.get("category"),
+                "severity": finding.get("severity"),
+                "confidence": validation_item.get(
+                    "confidence_after_validation",
+                    finding.get("confidence"),
+                ),
+                "validation_status": validation_item.get("validation_status"),
+                "statement": finding.get("statement"),
+                "supporting_signals": _limit_list(finding.get("supporting_signals"), 10),
+                "contradicting_signals": _limit_list(finding.get("contradicting_signals"), 10),
+                "recommended_next_checks": _limit_list(finding.get("recommended_next_checks"), 10),
+                "evidence_summaries": evidence_summaries,
+                "limitations": _limit_list(finding.get("missing_evidence"), 10)
+                + _limit_list(finding.get("assumptions"), 10),
+            }
+        )
+    request = {
+        "original_input": request_context.get("original_input"),
+        "target_domain": request_context.get("target_domain") or "mysql",
+        "task_type": request_context.get("task_type"),
+        "event_time": ((evidence_bundle.get("event") or {}).get("event_time")),
+        "time_window": evidence_bundle.get("time_window") or {},
+    }
+    return {
+        "request_id": evidence_bundle.get("request_id"),
+        "phase": "phase-04",
+        "mode": "final_response_generation",
+        "request": request,
+        "verdict": {
+            "status": verdict.get("status"),
+            "overall_severity": verdict.get("overall_severity"),
+            "overall_confidence": verdict.get("overall_confidence"),
+            "requires_human_review": verdict.get("requires_human_review"),
+            "human_review_reasons": verdict.get("human_review_reasons") or [],
+        },
+        "validated_findings": validated_findings,
+        "evidence_gaps": findings_draft.get("insufficient_evidence") or [],
+        "quality_warnings": (evidence_bundle.get("quality") or {}).get("warnings") or [],
+        "artifact_refs": artifact_refs,
+        "llm_context_contract": {
+            "contains_full_evidence_bundle": False,
+            "contains_raw_logs": False,
+            "contains_full_status_rows": False,
+            "contains_full_variables_rows": False,
+        },
+    }
+
+
+def _final_evidence_summary(evidence: dict[str, Any]) -> dict[str, Any]:
+    structured = evidence.get("structured_payload") or {}
+    evidence_type = str(evidence.get("evidence_type") or "")
+    result: dict[str, Any] = {
+        "evidence_id": evidence.get("evidence_id"),
+        "evidence_type": evidence_type,
+        "summary": evidence.get("summary"),
+        "quality_flags": evidence.get("quality_flags") or [],
+        "raw_refs_summary": [
+            _compact_raw_ref(ref) for ref in _limit_list(evidence.get("raw_refs"), 5)
+        ],
+    }
+    if evidence_type == "mysql.error_log":
+        result["top_patterns"] = _compact_top_patterns(structured.get("top_patterns"))
+    if evidence_type == "mysql.runtime_status":
+        result["key_counters"] = structured.get("selected_counters") or {}
+    if evidence_type == "mysql.variables":
+        result["key_variables"] = structured.get("selected_variables") or {}
+    if evidence_type == "mysql.processlist":
+        result["processlist_aggregates"] = _selected_dict(
+            structured,
+            ("total_processes", "user_counts", "command_counts", "state_counts"),
+        )
+    return result
+
+
+def _validated_final_response(
+    payload: dict[str, Any] | None,
+    final_response_context: dict[str, Any],
+) -> dict[str, str]:
+    fallback = _deterministic_final_response(final_response_context)
+    if not isinstance(payload, dict):
+        return fallback
+    terminal = payload.get("terminal_response")
+    summary = payload.get("summary_markdown")
+    if not isinstance(terminal, str) or not terminal.strip():
+        terminal = fallback["terminal_response"]
+    if not isinstance(summary, str) or not summary.strip():
+        summary = fallback["summary_markdown"]
+    terminal = _sanitize_text(terminal)
+    summary = _sanitize_text(summary)
+    return {
+        "terminal_response": terminal,
+        "summary_markdown": summary,
+    }
+
+
+def _deterministic_final_response(final_response_context: dict[str, Any]) -> dict[str, str]:
+    verdict = final_response_context.get("verdict") or {}
+    findings = final_response_context.get("validated_findings") or []
+    gaps = final_response_context.get("evidence_gaps") or []
+    warnings = final_response_context.get("quality_warnings") or []
+    artifacts = final_response_context.get("artifact_refs") or {}
+    status = verdict.get("status") or "unknown"
+    severity = verdict.get("overall_severity") or "unknown"
+    confidence = verdict.get("overall_confidence")
+    primary = findings[0] if findings else {}
+    lines = [
+        f"分析完成：{status}",
+        f"严重级别：{severity}",
+        f"置信度：{confidence}",
+        "",
+        "一、结论",
+        _conclusion_text(primary, status),
+        "",
+        "二、主要发现",
+    ]
+    if findings:
+        for index, finding in enumerate(findings, start=1):
+            lines.append(f"{index}. {finding.get('title')}")
+            lines.append(f"   - 严重级别：{finding.get('severity')}")
+            lines.append(f"   - 置信度：{finding.get('confidence')}")
+            lines.append(f"   - 说明：{finding.get('statement')}")
+            evidence_ids = [
+                str(item.get("evidence_id"))
+                for item in finding.get("evidence_summaries") or []
+                if isinstance(item, dict) and item.get("evidence_id")
+            ]
+            if evidence_ids:
+                lines.append(f"   - 证据：{', '.join(evidence_ids)}")
+    else:
+        lines.append("1. 没有通过 Validation 的 finding。")
+    lines.extend(["", "三、可能原因 / 合理猜测"])
+    lines.append("以下内容只基于已验证 finding 和证据摘要，不扩展新的根因判断。")
+    for finding in findings[:3]:
+        signals = finding.get("supporting_signals") or []
+        if signals:
+            lines.append(f"- {finding.get('title')}: {'; '.join(str(item) for item in signals[:3])}")
+    if not findings:
+        lines.append("- 当前证据不足以形成合理猜测。")
+    lines.extend(["", "四、建议排查步骤"])
+    checks = []
+    for finding in findings:
+        checks.extend(str(item) for item in finding.get("recommended_next_checks") or [])
+    if checks:
+        for index, check in enumerate(checks[:8], start=1):
+            lines.append(f"{index}. {check}")
+    else:
+        lines.append("1. 查看上方证据对应 artifact，确认证据窗口和采集范围。")
+    lines.extend(["", "五、建议执行的只读命令", "```bash"])
+    lines.extend(_read_only_command_suggestions(findings))
+    lines.extend(["```", "", "六、证据缺口 / warnings"])
+    if gaps or warnings:
+        for gap in gaps:
+            if isinstance(gap, dict):
+                lines.append(f"- {gap.get('evidence_type', 'unknown')}: {gap.get('reason', 'insufficient')}")
+        for warning in warnings:
+            lines.append(f"- {warning}")
+    else:
+        lines.append("- 未记录显式证据缺口。")
+    lines.extend(["", "七、Artifacts"])
+    for key, value in artifacts.items():
+        lines.append(f"- {key}: {value}")
+    terminal = "\n".join(lines).strip() + "\n"
+    summary = "# DBKit MySQL Analysis Summary\n\n" + terminal
+    return {"terminal_response": terminal, "summary_markdown": summary}
+
+
+def _conclusion_text(primary: dict[str, Any], status: str) -> str:
+    if primary:
+        return str(primary.get("statement") or primary.get("title") or status)
+    return f"Phase-04 已完成，但当前状态为 {status}，没有可直接确认的主要发现。"
+
+
+def _read_only_command_suggestions(findings: list[Any]) -> list[str]:
+    commands: list[str] = []
+    evidence_types = {
+        str(summary.get("evidence_type"))
+        for finding in findings
+        if isinstance(finding, dict)
+        for summary in finding.get("evidence_summaries") or []
+        if isinstance(summary, dict)
+    }
+    if "mysql.runtime_status" in evidence_types:
+        commands.append("SHOW GLOBAL STATUS LIKE 'Aborted%';")
+    if "mysql.processlist" in evidence_types:
+        commands.append("SHOW FULL PROCESSLIST;")
+    if "mysql.variables" in evidence_types:
+        commands.append("SHOW VARIABLES LIKE 'max_connections';")
+    if not commands:
+        commands.append("# 当前 final_response_context 未包含可直接映射的只读命令。")
+    return commands[:5]
 
 
 def _duration_ms(started_ns: int) -> int:

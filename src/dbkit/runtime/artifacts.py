@@ -293,6 +293,18 @@ class ArtifactStore:
         )
         return ArtifactRecord(kind="CompactAnalysisContext", path=path)
 
+    def persist_final_response_context(
+        self,
+        request_id: str,
+        payload: dict[str, Any],
+    ) -> ArtifactRecord:
+        path = self.root / f"{request_id}.final-response-context.json"
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return ArtifactRecord(kind="FinalResponseContext", path=path)
+
     def persist_verdict(
         self,
         request_id: str,

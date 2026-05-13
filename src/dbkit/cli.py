@@ -79,6 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config.phase04.per_finding_validation_timeout_seconds
             ),
             semantic_validation_enabled=config.phase04.semantic_validation_enabled,
+            request_context={},
             model_name=config.model.model_name,
         ).run(evidence_bundle_path)
         print(f"DBKit {__version__}")
@@ -417,6 +418,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config.phase04.per_finding_validation_timeout_seconds
         ),
         semantic_validation_enabled=config.phase04.semantic_validation_enabled,
+        request_context=_phase04_request_context(result.normalized_request),
         model_name=config.model.model_name,
     ).run(
         structuring_result.bundle_artifact.path,
@@ -540,6 +542,12 @@ def _print_phase04_result(result) -> None:
     if result.verdict is not None:
         print(f"overall_severity={result.verdict.get('overall_severity')}")
         print(f"overall_confidence={result.verdict.get('overall_confidence')}")
+    if result.terminal_response:
+        print()
+        print("最终答复")
+        print()
+        print(result.terminal_response.rstrip())
+        print()
     if result.metadata.get("reason"):
         print(f"reason={result.metadata.get('reason')}")
     if result.metadata.get("input_evidence_bundle"):
@@ -551,6 +559,8 @@ def _print_phase04_result(result) -> None:
             print(f"validation_artifact={artifact.path}")
         elif artifact.kind == "Verdict":
             print(f"verdict_artifact={artifact.path}")
+        elif artifact.kind == "FinalResponseContext":
+            print(f"final_response_context_artifact={artifact.path}")
         elif artifact.kind == "Summary":
             print(f"summary_artifact={artifact.path}")
         elif artifact.kind == "AnalysisTimeout":
@@ -566,6 +576,17 @@ def _stop_after_phase(normalized_request) -> str | None:
     if value in {"phase-02.1", "phase-03"}:
         return str(value)
     return None
+
+
+def _phase04_request_context(normalized_request) -> dict:
+    event = normalized_request.event or {}
+    return {
+        "original_input": normalized_request.redacted_input,
+        "target_domain": normalized_request.target_domain,
+        "task_type": normalized_request.task_type,
+        "event_time": event.get("event_time") if isinstance(event, dict) else None,
+        "time_window": event.get("time_window") if isinstance(event, dict) else None,
+    }
 
 
 def _read_supplement(rendered_user_message: str) -> str:

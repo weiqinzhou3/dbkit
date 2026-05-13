@@ -33,6 +33,7 @@ class Phase04FindingsValidationTest(unittest.TestCase):
             findings = _artifact_payload(result.artifacts, "FindingsDraft")
             validation = _artifact_payload(result.artifacts, "ValidationResult")
             verdict = _artifact_payload(result.artifacts, "Verdict")
+            final_context = _artifact_payload(result.artifacts, "FinalResponseContext")
             summary = _artifact_text(result.artifacts, "Summary")
 
         self.assertEqual(result.status, "analysis_completed_with_warnings")
@@ -44,9 +45,12 @@ class Phase04FindingsValidationTest(unittest.TestCase):
         self.assertEqual(validation["metadata"]["validation_method"], "deterministic")
         self.assertFalse(validation["metadata"]["semantic_validation_used"])
         self.assertEqual(validation_runtime.invocations, [])
+        self.assertEqual(final_context["request"]["target_domain"], "mysql")
+        self.assertEqual(final_context["validated_findings"][0]["evidence_summaries"][0]["evidence_id"], "ev_error_log")
         self.assertEqual(verdict["status"], "analysis_completed_with_warnings")
         self.assertEqual(verdict["primary_findings"], ["finding_aborted_connections"])
         self.assertIn("# DBKit MySQL Analysis Summary", summary)
+        self.assertIn("一、结论", result.terminal_response)
         self.assertIn("Large number of aborted MySQL connections observed", summary)
         serialized = json.dumps(
             {
@@ -194,7 +198,7 @@ class Phase04FindingsValidationTest(unittest.TestCase):
             ).run(bundle_path)
 
         self.assertEqual(result.status, "blocked")
-        self.assertEqual(len(analyzer.invocations), 2)
+        self.assertEqual(_mode_invocation_count(analyzer, "findings_generation"), 2)
         self.assertTrue(any("findings_draft_invalid" in issue for issue in result.blocking_issues))
         self.assertIn("findings_generation_retry_requested", [event.event_type for event in result.telemetry])
 
@@ -243,7 +247,7 @@ class Phase04FindingsValidationTest(unittest.TestCase):
             invalid_payload = _artifact_payload(result.artifacts, "InvalidFindingsDraft")
 
         self.assertEqual(result.status, "analysis_completed_with_warnings")
-        self.assertEqual(len(analyzer.invocations), 2)
+        self.assertEqual(_mode_invocation_count(analyzer, "findings_generation"), 2)
         self.assertEqual(findings_payload["findings"][0]["confidence"], 0.78)
         self.assertIn(
             "Finding.confidence must be a number between 0.0 and 1.0, got string 'high'",
@@ -276,7 +280,7 @@ class Phase04FindingsValidationTest(unittest.TestCase):
             invalid_payload = _artifact_payload(result.artifacts, "InvalidFindingsDraft")
 
         self.assertEqual(result.status, "blocked")
-        self.assertEqual(len(analyzer.invocations), 2)
+        self.assertEqual(_mode_invocation_count(analyzer, "findings_generation"), 2)
         self.assertIn(
             "findings_draft_invalid: Finding.confidence must be a number between 0.0 and 1.0, got string 'medium'",
             result.blocking_issues,
@@ -518,6 +522,55 @@ class Phase04FindingsValidationTest(unittest.TestCase):
         self.assertEqual(validation["validated_findings"][0]["validation_status"], "downgraded")
         self.assertEqual(validation["downgraded_findings"][0]["reason"], "referenced_low_quality_or_unavailable_evidence")
 
+    def test_final_response_generation_uses_bounded_context_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bundle_path = _write_large_evidence_bundle(root)
+            analyzer = FakeSequenceAnalyzerRuntime(
+                [
+                    _findings_payload("req_phase04"),
+                    _final_response_payload("req_phase04"),
+                ]
+            )
+
+            result = Phase04AnalysisPipeline(
+                artifact_store=ArtifactStore(root / ".dbkit" / "artifacts"),
+                telemetry=TelemetryRecorder(),
+                mysql_analyzer_runtime=analyzer,
+                validation_runtime=FailIfInvokedRuntime(),
+                request_context={
+                    "original_input": "请帮我分析这个 MySQL",
+                    "target_domain": "mysql",
+                    "task_type": "incident_analysis",
+                },
+            ).run(bundle_path)
+
+            final_context = _artifact_payload(result.artifacts, "FinalResponseContext")
+
+        self.assertEqual(result.status, "analysis_completed_with_warnings")
+        self.assertEqual(_mode_invocation_count(analyzer, "findings_generation"), 1)
+        self.assertEqual(_mode_invocation_count(analyzer, "final_response_generation"), 1)
+        final_invocation = [
+            item for item in analyzer.invocations
+            if item["mode"] == "final_response_generation"
+        ][0]
+        self.assertIn("final_response_context", final_invocation)
+        self.assertNotIn("compact_analysis_context", final_invocation)
+        serialized_context = json.dumps(final_context, ensure_ascii=False)
+        self.assertIn("ev_error_log", serialized_context)
+        self.assertIn("ev_status", serialized_context)
+        self.assertIn("top_patterns", serialized_context)
+        self.assertIn("key_counters", serialized_context)
+        self.assertNotIn("raw-log-line-should-not-enter-llm", serialized_context)
+        self.assertNotIn("SHOW GLOBAL STATUS", serialized_context)
+        self.assertNotIn("full_processlist_rows", serialized_context)
+        self.assertIn("一、结论", result.terminal_response)
+        self.assertIn("DBKit MySQL Analysis Summary", result.summary)
+        event_types = [event.event_type for event in result.telemetry]
+        self.assertIn("final_response_context_created", event_types)
+        self.assertIn("mysql_analyzer_final_response_generation_started", event_types)
+        self.assertIn("mysql_analyzer_final_response_generation_completed", event_types)
+
     def test_per_finding_semantic_timeout_does_not_timeout_whole_phase(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -580,7 +633,12 @@ class Phase04FindingsValidationTest(unittest.TestCase):
 
             with patch("dbkit.cli.build_agent_model", return_value=object()), patch(
                 "dbkit.cli.DeepAgentsRuntimeFactory.create_mysql_analyzer_runtime",
-                return_value=FakeAnalyzerRuntime(_findings_payload("req_phase04")),
+                return_value=FakeSequenceAnalyzerRuntime(
+                    [
+                        _findings_payload("req_phase04"),
+                        _final_response_payload("req_phase04"),
+                    ]
+                ),
             ), patch(
                 "dbkit.cli.DeepAgentsRuntimeFactory.create_validation_runtime",
                 return_value=FakeValidationRuntime(_validation_payload("req_phase04")),
@@ -604,6 +662,8 @@ class Phase04FindingsValidationTest(unittest.TestCase):
         self.assertIn("validation_artifact=", output)
         self.assertIn("verdict_artifact=", output)
         self.assertIn("summary_artifact=", output)
+        self.assertIn("一、结论", output)
+        self.assertIn("最终答复", output)
 
     def test_cli_stops_after_raw_collection_when_requested(self) -> None:
         exit_code, output = _run_normal_cli_with_stop_after_phase("phase-02.1")
@@ -727,6 +787,9 @@ class Phase04FindingsValidationTest(unittest.TestCase):
         self.assertIn("Finding.category", mysql_skill)
         self.assertIn("Finding.confidence", mysql_skill)
         self.assertIn("Confidence must never be", mysql_skill)
+        self.assertIn("Final Response Generation Mode", mysql_skill)
+        self.assertIn("final_response_context", mysql_skill)
+        self.assertIn("Do not read the full EvidenceBundle", mysql_skill)
         self.assertIn("Execution Boundary", intake_skill)
         self.assertIn("stop_after_phase", intake_skill)
         self.assertIn("Validation Agent", validation_skill)
@@ -806,7 +869,7 @@ class FakeSequenceAnalyzerRuntime:
 
     def invoke(self, payload: dict) -> dict:
         self.invocations.append(payload)
-        response = self.payloads.pop(0)
+        response = self.payloads.pop(0) if self.payloads else _final_response_payload("req_phase04")
         return {"messages": [{"role": "assistant", "content": json.dumps(response, ensure_ascii=False)}]}
 
 
@@ -1047,6 +1110,39 @@ def _validation_payload(request_id: str) -> dict:
     }
 
 
+def _final_response_payload(request_id: str) -> dict:
+    return {
+        "request_id": request_id,
+        "phase": "phase-04",
+        "mode": "final_response_generation",
+        "terminal_response": (
+            "分析完成：analysis_completed_with_warnings\n"
+            "严重级别：medium\n"
+            "置信度：0.76\n\n"
+            "一、结论\n"
+            "MySQL 在窗口内存在大量 aborted connection 事件。\n\n"
+            "二、主要发现\n"
+            "1. Large number of aborted MySQL connections observed\n"
+            "   - 证据：ev_error_log, ev_status\n\n"
+            "三、可能原因 / 合理猜测\n"
+            "基于已验证证据，只能说明连接异常信号明显，不能直接断言根因。\n\n"
+            "四、建议排查步骤\n"
+            "1. Review client connection lifecycle and connection timeout settings.\n\n"
+            "五、建议执行的只读命令\n"
+            "```bash\n"
+            "SHOW GLOBAL STATUS LIKE 'Aborted%';\n"
+            "```\n\n"
+            "六、证据缺口 / warnings\n"
+            "- mysql.slow_log: slow_query_log_disabled\n"
+        ),
+        "summary_markdown": (
+            "# DBKit MySQL Analysis Summary\n\n"
+            "## 一、结论\n\n"
+            "MySQL 在窗口内存在大量 aborted connection 事件。\n"
+        ),
+    }
+
+
 def _artifact_payload(artifacts, kind: str) -> dict:
     artifact = [item for item in artifacts if item.kind == kind][0]
     return json.loads(artifact.path.read_text(encoding="utf-8"))
@@ -1055,6 +1151,13 @@ def _artifact_payload(artifacts, kind: str) -> dict:
 def _artifact_text(artifacts, kind: str) -> str:
     artifact = [item for item in artifacts if item.kind == kind][0]
     return artifact.path.read_text(encoding="utf-8")
+
+
+def _mode_invocation_count(runtime, mode: str) -> int:
+    return len([
+        invocation for invocation in runtime.invocations
+        if invocation.get("mode") == mode
+    ])
 
 
 def _write_config(root: Path) -> Path:
