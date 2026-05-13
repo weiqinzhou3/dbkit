@@ -323,6 +323,9 @@ evidence_structuring:
   max_workers: 4
   per_item_timeout_seconds: 30
   total_timeout_seconds: 120
+  recursion_limit: 8
+  max_tool_calls: 1
+  required_tool: build_evidence_bundle
 ```
 
 Rules:

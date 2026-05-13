@@ -94,7 +94,9 @@ class EvidenceStructuringConfig:
     max_workers: int = 4
     per_item_timeout_seconds: int = 30
     total_timeout_seconds: int = 120
-    max_agent_iterations: int = 4
+    recursion_limit: int = 8
+    max_tool_calls: int = 1
+    required_tool: str = "build_evidence_bundle"
 
 
 @dataclass(frozen=True)
@@ -245,7 +247,13 @@ def _load_evidence_structuring_config(data: dict[str, Any] | None) -> EvidenceSt
         max_workers=_optional_int(data, "max_workers", 4),
         per_item_timeout_seconds=_optional_int(data, "per_item_timeout_seconds", 30),
         total_timeout_seconds=_optional_int(data, "total_timeout_seconds", 120),
-        max_agent_iterations=_optional_int(data, "max_agent_iterations", 4),
+        recursion_limit=_optional_int(
+            data,
+            "recursion_limit",
+            _optional_int(data, "max_agent_iterations", 8),
+        ),
+        max_tool_calls=_optional_int(data, "max_tool_calls", 1),
+        required_tool=_optional_string(data, "required_tool") or "build_evidence_bundle",
     )
 
 

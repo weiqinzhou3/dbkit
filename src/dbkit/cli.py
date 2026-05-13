@@ -315,7 +315,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         telemetry=collection_telemetry,
         repo_dir=config.runtime.repo_dir,
         artifact_root=artifact_root,
-        max_agent_iterations=config.evidence_structuring.max_agent_iterations,
+        recursion_limit=config.evidence_structuring.recursion_limit,
+        max_tool_calls=config.evidence_structuring.max_tool_calls,
+        required_tool=config.evidence_structuring.required_tool,
     ).run(
         request_id=evidence_result.request_id,
         raw_evidence_index=raw_evidence_index_path,

@@ -5,14 +5,17 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dbkit.cli import main as cli_main
 from dbkit.agents.mysql_analyzer import MySQLAnalyzerAgent
 from dbkit.runtime.deepagents_runtime import DeepAgentsRuntimeFactory
 from dbkit.runtime.artifacts import ArtifactStore
+from dbkit.runtime.evidence_delegation import EvidenceStructuringDelegator
 from dbkit.runtime.evidence_structuring import EvidenceStructuringPipeline
 from dbkit.runtime.observability import TelemetryRecorder
+from dbkit.schemas.evidence import EvidenceStructuringResult
 from dbkit.tools.evidence_deepagent import create_evidence_structuring_tools
 
 
@@ -341,6 +344,80 @@ class Phase03EvidenceStructuringTest(unittest.TestCase):
         self.assertIn("Call the build_evidence_bundle tool exactly once", mysql_skill)
         self.assertIn("Do not call read_file for raw evidence artifacts", delegator_source)
         self.assertNotIn("paths for read_file", delegator_source)
+
+    def test_delegation_returns_tool_result_when_graph_hits_recursion_after_success(self) -> None:
+        result_sink: list[EvidenceStructuringResult] = []
+
+        class GraphRecursionError(Exception):
+            pass
+
+        class FakeRuntime:
+            def invoke(self, payload, config=None):
+                self.payload = payload
+                self.config = config
+                result_sink.append(_fake_structuring_result("req_phase03"))
+                raise GraphRecursionError("Recursion limit of 8 reached")
+
+        runtime = FakeRuntime()
+        telemetry = TelemetryRecorder()
+        result = EvidenceStructuringDelegator(
+            mysql_analyzer_runtime=runtime,
+            telemetry=telemetry,
+            repo_dir=Path("."),
+            artifact_root=Path(".dbkit/artifacts"),
+            recursion_limit=8,
+            max_tool_calls=1,
+            required_tool="build_evidence_bundle",
+        ).run(
+            request_id="req_phase03",
+            raw_evidence_index=".dbkit/artifacts/req_phase03.raw-evidence-index.json",
+            result_sink=result_sink,
+        )
+
+        self.assertIs(result, result_sink[0])
+        self.assertEqual(runtime.config["recursion_limit"], 8)
+        event_types = [event.event_type for event in telemetry.events]
+        self.assertIn("evidence_subagent_recursion_limit", event_types)
+        self.assertIn("evidence_subagent_completed_from_tool_result", event_types)
+        self.assertIn("evidence_subagent_completed", event_types)
+        completed = [
+            event for event in telemetry.events
+            if event.event_type == "evidence_subagent_completed_from_tool_result"
+        ][0]
+        self.assertTrue(completed.attributes["subagent_completed_from_tool_result"])
+        self.assertEqual(completed.attributes["build_evidence_bundle_call_count"], 1)
+
+    def test_delegation_blocks_if_build_evidence_bundle_called_more_than_once(self) -> None:
+        result_sink = []
+
+        class FakeRuntime:
+            def invoke(self, payload, config=None):
+                result_sink.append(_fake_structuring_result("req_phase03"))
+                result_sink.append(_fake_structuring_result("req_phase03"))
+                return {"messages": [{"role": "assistant", "content": "{}"}]}
+
+        telemetry = TelemetryRecorder()
+        result = EvidenceStructuringDelegator(
+            mysql_analyzer_runtime=FakeRuntime(),
+            telemetry=telemetry,
+            repo_dir=Path("."),
+            artifact_root=Path(".dbkit/artifacts"),
+            recursion_limit=8,
+            max_tool_calls=1,
+            required_tool="build_evidence_bundle",
+        ).run(
+            request_id="req_phase03",
+            raw_evidence_index=".dbkit/artifacts/req_phase03.raw-evidence-index.json",
+            result_sink=result_sink,
+        )
+
+        self.assertIsNone(result)
+        blocked = [
+            event for event in telemetry.events
+            if event.event_type == "evidence_subagent_blocked"
+        ][0]
+        self.assertEqual(blocked.attributes["reason"], "evidence_bundle_tool_called_more_than_once")
+        self.assertEqual(blocked.attributes["build_evidence_bundle_call_count"], 2)
 
     def test_mysql_analyzer_skill_requires_evidence_structuring_delegation(self) -> None:
         skill = Path("skills/mysql-analyzer/SKILL.md").read_text(encoding="utf-8")
@@ -704,6 +781,20 @@ def _raw_index_item(
         "payload": {"content_ref": str(content_ref) if content_ref else None, "bytes": bytes_count, "line_count": line_count},
         "metadata": {"time_window": {"start": "2026-05-09T11:00:00+08:00", "end": "2026-05-09T18:00:00+08:00", "source": "skill_default_from_event_time"}},
     }
+
+
+def _fake_structuring_result(request_id: str) -> EvidenceStructuringResult:
+    return EvidenceStructuringResult(
+        request_id=request_id,
+        phase="phase-03",
+        status="evidence_bundle_created",
+        bundle=None,
+        bundle_artifact=SimpleNamespace(
+            path=Path(f".dbkit/artifacts/{request_id}.evidence-bundle.json")
+        ),
+        artifacts=(),
+        telemetry=(),
+    )
 
 
 def _write_config(root: Path) -> Path:

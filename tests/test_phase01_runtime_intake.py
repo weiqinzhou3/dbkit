@@ -98,6 +98,9 @@ evidence_structuring:
   max_workers: 3
   per_item_timeout_seconds: 7
   total_timeout_seconds: 25
+  recursion_limit: 9
+  max_tool_calls: 1
+  required_tool: build_evidence_bundle
 phase04:
   findings_generation_timeout_seconds: 9
   validation_timeout_seconds: 5
@@ -115,10 +118,36 @@ phase04:
         self.assertEqual(config.evidence_structuring.max_workers, 3)
         self.assertEqual(config.evidence_structuring.per_item_timeout_seconds, 7)
         self.assertEqual(config.evidence_structuring.total_timeout_seconds, 25)
+        self.assertEqual(config.evidence_structuring.recursion_limit, 9)
+        self.assertEqual(config.evidence_structuring.max_tool_calls, 1)
+        self.assertEqual(config.evidence_structuring.required_tool, "build_evidence_bundle")
         self.assertEqual(config.phase04.findings_generation_timeout_seconds, 9)
         self.assertEqual(config.phase04.validation_timeout_seconds, 5)
         self.assertEqual(config.phase04.max_findings, 4)
         self.assertEqual(config.phase04.max_prompt_chars, 12345)
+
+    def test_evidence_structuring_recursion_limit_defaults_to_bounded_non_four_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                """
+model:
+  provider_kind: openai_compatible
+  model_name: test-model
+  base_url: https://example.invalid
+  api_key: test-key
+runtime:
+  artifact_dir: .dbkit/artifacts
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = load_app_config(config_path)
+
+        self.assertEqual(config.evidence_structuring.recursion_limit, 8)
+        self.assertEqual(config.evidence_structuring.max_tool_calls, 1)
+        self.assertEqual(config.evidence_structuring.required_tool, "build_evidence_bundle")
 
     def test_build_model_uses_openai_compatible_config(self) -> None:
         config = load_app_config(_write_config_file())
